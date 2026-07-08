@@ -1,0 +1,21 @@
+manifestVersion: 1
+name: "@dmc/unifi-networks"
+version: "2026.07.07.1"
+description: >-
+  Query UniFi Network sites via the official integration API — VLANs, firewall
+  zones/policies, connected clients, and WiFi SSIDs, all mapped together — with
+  firewall-summary and zone-matrix reports. Supports local (per-console key) and
+  cloud (unifi.ui.com key, multi-console fan-out) modes.
+repository: "https://github.com/danmcclain/swamp-extensions"
+models:
+  - unifi_networks.ts
+reports:
+  - unifi_firewall_summary.ts
+  - unifi_zone_matrix.ts
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - networking
+  - unifi
+  - security
