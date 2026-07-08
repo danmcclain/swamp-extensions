@@ -7,7 +7,13 @@
  */
 
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
-import { buildCurlArgs, finalizeResponse, parseCurlOutput } from "./unifi_networks.ts";
+import {
+  buildCurlArgs,
+  finalizeResponse,
+  ipv4InSubnet,
+  ipv4ToInt,
+  parseCurlOutput,
+} from "./unifi_networks.ts";
 
 // ── parseCurlOutput ───────────────────────────────────────────────────────────
 
@@ -90,4 +96,42 @@ Deno.test("buildCurlArgs: secret is passed as a header arg, never inline in url"
   const args = buildCurlArgs("GET", "https://udm/x", "s3cr3t");
   // key travels only in the X-API-KEY header, not smuggled into the URL
   assertEquals(args[args.length - 1].includes("s3cr3t"), false);
+});
+
+// ── ipv4ToInt ─────────────────────────────────────────────────────────────────
+
+Deno.test("ipv4ToInt: parses dotted quads to uint32", () => {
+  assertEquals(ipv4ToInt("0.0.0.0"), 0);
+  assertEquals(ipv4ToInt("10.0.0.1"), 0x0A000001);
+  assertEquals(ipv4ToInt("255.255.255.255"), 0xFFFFFFFF); // stays unsigned
+  assertEquals(ipv4ToInt("192.168.1.1"), 0xC0A80101);
+});
+
+Deno.test("ipv4ToInt: rejects malformed input", () => {
+  assertEquals(ipv4ToInt("10.0.0"), null); // too few octets
+  assertEquals(ipv4ToInt("10.0.0.1.2"), null); // too many
+  assertEquals(ipv4ToInt("10.0.0.256"), null); // octet out of range
+  assertEquals(ipv4ToInt("10.0.0.x"), null); // non-numeric
+  assertEquals(ipv4ToInt(""), null);
+});
+
+// ── ipv4InSubnet ──────────────────────────────────────────────────────────────
+
+Deno.test("ipv4InSubnet: matches inside and rejects outside a /24", () => {
+  assertEquals(ipv4InSubnet("10.0.10.51", "10.0.10.1", 24), true);
+  assertEquals(ipv4InSubnet("10.0.10.255", "10.0.10.1", 24), true);
+  assertEquals(ipv4InSubnet("10.0.11.5", "10.0.10.1", 24), false); // next subnet
+  assertEquals(ipv4InSubnet("10.0.0.5", "10.0.10.1", 24), false);
+});
+
+Deno.test("ipv4InSubnet: boundary prefixes /32 and /0", () => {
+  assertEquals(ipv4InSubnet("10.0.0.1", "10.0.0.1", 32), true); // exact host
+  assertEquals(ipv4InSubnet("10.0.0.2", "10.0.0.1", 32), false);
+  assertEquals(ipv4InSubnet("8.8.8.8", "10.0.0.1", 0), true); // /0 matches all
+});
+
+Deno.test("ipv4InSubnet: malformed IP or bad prefix is a non-match, not a throw", () => {
+  assertEquals(ipv4InSubnet("not-an-ip", "10.0.0.1", 24), false);
+  assertEquals(ipv4InSubnet("10.0.0.1", "10.0.0.1", 33), false);
+  assertEquals(ipv4InSubnet("10.0.0.1", "10.0.0.1", -1), false);
 });

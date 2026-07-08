@@ -1111,4 +1111,35 @@ export const model = {
       },
     },
   },
+  checks: {
+    "console-reachable": {
+      description:
+        "Confirm the target console is reachable and the API key authenticates " +
+        "before a destructive change. Labelled 'live' (makes an API call) so it " +
+        "can be skipped with --skip-check-label live.",
+      labels: ["live"],
+      appliesTo: ["deletePolicy"],
+      // Checks receive globalArgs but not the per-call method arguments, so this
+      // verifies connectivity/auth to the resolved target(s); the policy-specific
+      // USER_DEFINED guard stays inline in deletePolicy where policyId is known.
+      execute: async (context: { globalArgs: GlobalArgs }) => {
+        const g = context.globalArgs;
+        try {
+          const targets = await resolveTargets(g);
+          const t = targets[0];
+          await apiGet(`${t.base}/v1/info`, g.apiKey, t.insecure);
+          return { pass: true };
+        } catch (e) {
+          return {
+            pass: false,
+            errors: [
+              `Console not reachable or API key rejected: ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            ],
+          };
+        }
+      },
+    },
+  },
 };
