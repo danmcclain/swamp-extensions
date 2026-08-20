@@ -1,0 +1,16 @@
+manifestVersion: 1
+name: "@dmc/proxmox"
+version: "2026.07.18.1"
+description: "Proxmox VE extensions — VM/LXC lifecycle operations and cloud image storage management"
+repository: "https://github.com/danmcclain/swamp_proxmox"
+labels:
+  - proxmox
+  - infrastructure
+dependencies:
+  - "@keeb/proxmox"
+models:
+  - proxmox_vm_extras.ts
+  - proxmox_storage.ts
+additionalFiles:
+  - README.md
+  - LICENSE.md
