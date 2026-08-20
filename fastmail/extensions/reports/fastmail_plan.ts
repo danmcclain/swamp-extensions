@@ -22,6 +22,11 @@ interface PlanData {
   moves: PlanMove[];
 }
 
+/**
+ * `@dmc/fastmail-plan` — method-scoped report that renders the message-id →
+ * destination plan from an `email_plan` run, grouped by target folder, so the
+ * moves can be reviewed before `email_move` applies them.
+ */
 export const report = {
   name: "@dmc/fastmail-plan",
   description:

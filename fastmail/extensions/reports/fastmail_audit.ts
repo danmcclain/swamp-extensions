@@ -151,6 +151,12 @@ function scopeSection(
   };
 }
 
+/**
+ * `@dmc/fastmail-audit` — method-scoped report that reads the `senders`
+ * artifacts from a run and audits the sender inventory (bulk vs. personal,
+ * message concentration, and coverage gaps). No-ops on runs that produce no
+ * `senders` data.
+ */
 export const report = {
   name: "@dmc/fastmail-audit",
   description:

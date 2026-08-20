@@ -72,6 +72,12 @@ function setupSection(
   };
 }
 
+/**
+ * `@dmc/fastmail-coverage` — method-scoped report that reads the `sieve`
+ * artifacts from a `sieve_generate` run and reports rule coverage: how much
+ * categorizable mail matched a specific rule versus fell through to the bulk
+ * fallback or was left in the inbox.
+ */
 export const report = {
   name: "@dmc/fastmail-coverage",
   description:

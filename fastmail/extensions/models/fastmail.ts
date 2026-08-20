@@ -900,6 +900,14 @@ type Ctx = {
 // Extension
 // ---------------------------------------------------------------------------
 
+/**
+ * `@dmc/fastmail` — a Fastmail email-organization model over JMAP.
+ *
+ * Methods: `email_senders` (fan-out sender scan with bulk detection),
+ * `sieve_generate` (config-driven Sieve script generation into nested folders),
+ * `email_plan` (dry-run message-id → destination plan), and `email_move`
+ * (apply the plan; requires a write-scoped token and `execute: true`).
+ */
 export const model = {
   type: "@dmc/fastmail",
   version: "2026.08.19.1",
