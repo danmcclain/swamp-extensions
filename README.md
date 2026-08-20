@@ -14,6 +14,7 @@ loads independently.
 | ---------------------- | ------------- | --------------------------------------------------------------------------------------------- |
 | `@dmc/unifi-networks`  | model + reports | Query UniFi Network sites (VLANs, firewall zones/policies, clients, WiFi) via the official integration API, mapped together, with firewall-summary and zone-matrix reports. See [unifi-networks/README.md](unifi-networks/README.md). |
 | `@dmc/proxmox`         | models        | Proxmox VE VM/LXC lifecycle operations and cloud-image storage management, extending the `@keeb/proxmox` family. See [proxmox/README.md](proxmox/README.md). |
+| `@dmc/fastmail`        | model + reports | Fastmail email-organization pipeline over JMAP — scan senders (flagging bulk/newsletter mail), generate Sieve scripts sorting senders into folders, and plan/apply moves, with audit, coverage, and plan reports. See [fastmail/README.md](fastmail/README.md). |
 
 ## Layout
 
@@ -33,6 +34,13 @@ swamp-extensions/            # this repo (umbrella container)
     README.md  LICENSE.md  deno.json
     extensions/
       models/                # proxmox_storage.ts, proxmox_vm_extras.ts, lib/
+  fastmail/                  # model + reports (JMAP email organization)
+    .swamp.yaml
+    manifest.yaml
+    README.md  LICENSE.txt
+    extensions/
+      models/                # fastmail.ts
+      reports/               # fastmail_audit.ts, fastmail_coverage.ts, fastmail_plan.ts
   <next-extension>/          # add more extensions the same way
 ```
 

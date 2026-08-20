@@ -1,0 +1,22 @@
+manifestVersion: 1
+name: "@dmc/fastmail"
+version: "2026.08.19.1"
+description: >-
+  Fastmail email-organization pipeline over JMAP — scan every sender (flagging
+  bulk/newsletter mail via RFC 2369/8058 List-* headers), generate ready-to-paste
+  Sieve scripts that sort senders into nested folders, and plan/apply message
+  moves — with audit, rule-coverage, and apply-plan reports.
+repository: "https://github.com/danmcclain/swamp-extensions"
+models:
+  - fastmail.ts
+reports:
+  - fastmail_audit.ts
+  - fastmail_coverage.ts
+  - fastmail_plan.ts
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - email
+  - fastmail
+  - jmap
