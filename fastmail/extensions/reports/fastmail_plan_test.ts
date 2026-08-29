@@ -76,15 +76,45 @@ Deno.test("fastmail-plan: renders destinations (by volume) and sample messages",
   );
   assertStringIncludes(markdown, "# Apply-Sieve Plan");
   assertStringIncludes(markdown, "**Scanned:** 100 messages");
-  assertStringIncludes(markdown, "**Would move:** 3");
-  // Newsletters (2) sorts above Receipts (1).
-  assertStringIncludes(markdown, "| 2 | Newsletters |");
-  assertStringIncludes(markdown, "| 1 | Receipts |");
+  // All three moves leave the Inbox (no keepInbox), none are label-only.
+  assertStringIncludes(markdown, "**Would move out of Inbox:** 3");
+  assertStringIncludes(markdown, "**Would label but keep in Inbox:** 0");
+  // Newsletters (2) sorts above Receipts (1); both move out of the Inbox.
+  assertStringIncludes(markdown, "| 2 | Newsletters | moves out |");
+  assertStringIncludes(markdown, "| 1 | Receipts | moves out |");
   // Empty subject renders the (no subject) placeholder.
   assertStringIncludes(markdown, "(no subject)");
   const j = json as { applicable: boolean; moveCount: number };
   assertEquals(j.applicable, true);
   assertEquals(j.moveCount, 3);
+});
+
+Deno.test("fastmail-plan: keepInbox destinations render as label-and-keep", async () => {
+  const labelPlan = {
+    ...PLAN,
+    moveCount: 1,
+    byDestination: { Receipts: 1 },
+    moves: [
+      {
+        messageId: "m4",
+        from: "billing@shop.example",
+        subject: "Your receipt",
+        category: "Receipts",
+        sievePath: "INBOX/Receipts",
+        mailboxId: "mb2",
+        matchedBy: "rule from:billing",
+        keepInbox: true,
+      },
+    ],
+  };
+  const { markdown } = await report.execute(
+    ctx([{ specName: "plan", name: "apply-plan", version: 1 }], {
+      "apply-plan": labelPlan,
+    }),
+  );
+  assertStringIncludes(markdown, "**Would move out of Inbox:** 0");
+  assertStringIncludes(markdown, "**Would label but keep in Inbox:** 1");
+  assertStringIncludes(markdown, "| 1 | Receipts | label — stays in Inbox |");
 });
 
 Deno.test("fastmail-plan: no plan handle short-circuits (not an email_plan run)", async () => {

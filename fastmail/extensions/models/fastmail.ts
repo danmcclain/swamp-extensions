@@ -143,6 +143,60 @@ function buildPathIndex(mailboxes: Mailbox[]): Map<string, string> {
   return idx;
 }
 
+/**
+ * Resolve a category path ("Finance/Statements") to a mailbox id, creating any
+ * missing segments (nested) via Mailbox/set — mirrors the sieve's `:create`.
+ * Mutates `mailboxes` so later lookups in the same run see newly-created ids.
+ * Returns { id, created } where `created` lists the paths it had to make.
+ */
+async function ensureMailbox(
+  apiUrl: string,
+  apiToken: string,
+  accountId: string,
+  category: string,
+  mailboxes: Mailbox[],
+): Promise<{ id: string; created: string[] }> {
+  const idx = buildPathIndex(mailboxes);
+  const created: string[] = [];
+  let parentId: string | null = null;
+  let path = "";
+  let leafId = "";
+  for (const seg of category.split("/")) {
+    path = path ? `${path}/${seg}` : seg;
+    const existing = idx.get(path.toLowerCase());
+    if (existing) {
+      parentId = existing;
+      leafId = existing;
+      continue;
+    }
+    const resp = await jmapRequest(apiUrl, apiToken, [
+      [
+        "Mailbox/set",
+        { accountId, create: { new: { name: seg, parentId } } },
+        "0",
+      ],
+    ]);
+    const r = unwrapMethodResponse(resp, "Mailbox/set") as {
+      created?: Record<string, { id: string }>;
+      notCreated?: Record<string, unknown>;
+    };
+    const newId = r.created?.new?.id;
+    if (!newId) {
+      throw new Error(
+        `Failed to create mailbox "${path}": ${
+          JSON.stringify(r.notCreated ?? r)
+        }`,
+      );
+    }
+    mailboxes.push({ id: newId, role: null, name: seg, parentId });
+    idx.set(path.toLowerCase(), newId);
+    created.push(path);
+    parentId = newId;
+    leafId = newId;
+  }
+  return { id: leafId, created };
+}
+
 /** Fetch pages of an Email/query result, stopping once `cap` ids are collected. */
 async function queryIds(
   apiUrl: string,
@@ -310,6 +364,7 @@ const PlanMoveSchema = z.object({
   sievePath: z.string(),
   mailboxId: z.string().nullable(),
   matchedBy: z.string(),
+  keepInbox: z.boolean().default(false), // true = add label, leave in Inbox
 });
 const PlanResourceSchema = z.object({
   generatedAt: z.string(),
@@ -319,6 +374,37 @@ const PlanResourceSchema = z.object({
   leftInInbox: z.number(),
   byDestination: z.record(z.string(), z.number()),
   moves: z.array(PlanMoveSchema),
+});
+
+// A sender the current rules leave in the inbox, with why it stayed.
+const AnalysisSenderSchema = z.object({
+  token: z.string(), // the rule-pattern unit (registrable domain / full addr / subdomain)
+  count: z.number(),
+  bulk: z.number(),
+  unread: z.number(),
+  reason: z.enum(["protected", "excluded", "flagged", "unmatched"]),
+  sampleFroms: z.array(z.string()),
+  sampleSubjects: z.array(z.string()),
+});
+
+const AnalysisResourceSchema = z.object({
+  generatedAt: z.string(),
+  sourceMailbox: z.string(),
+  scannedMessages: z.number(),
+  covered: z.number(), // matched by current rules (would leave the inbox)
+  coveredByCategory: z.record(z.string(), z.number()),
+  remaining: z.object({
+    total: z.number(),
+    bulk: z.number(),
+    personal: z.number(),
+    unread: z.number(),
+    distinctSenders: z.number(),
+    // Message counts by why-kept: unmatched = real rule candidate; the rest are
+    // kept by design (exclude list / finance-protect stop / flag-only rule).
+    byReason: z.record(z.string(), z.number()),
+    candidates: z.array(AnalysisSenderSchema), // reason === "unmatched"
+    keptByDesign: z.array(AnalysisSenderSchema), // excluded / protected / flagged
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -565,9 +651,11 @@ function emitRule(spec: RuleSpec): string {
       : " :create";
     effects.push(`  fileinto${copy}${target} "${spec.sievePath}";`);
   }
+  // Any category rule stops — including label-and-keep (skipInbox:false), so a
+  // labeled message doesn't also fall through to the Newsletters bulk fallback.
+  // With :copy the implicit Inbox keep survives the stop, so it stays in the Inbox.
   const doStop = spec.stop ??
-    (spec.markSpam === true ||
-      (spec.category !== undefined && spec.skipInbox !== false));
+    (spec.markSpam === true || spec.category !== undefined);
   if (doStop) effects.push(`  stop;`);
   const query = `  jmapquery text:\n${
     JSON.stringify(jmapQueryObj(spec), null, 3)
@@ -627,6 +715,7 @@ interface SetupLike {
   separator: string;
   bulkFallback: string | null;
   exclude: string[];
+  skipInbox?: boolean; // file-setup default: false = label + keep in inbox
   rules: Array<{
     category?: string;
     pattern?: string;
@@ -634,6 +723,10 @@ interface SetupLike {
     all?: Array<{ match: MatchField; pattern: string }>;
     markSpam?: boolean;
     stop?: boolean;
+    skipInbox?: boolean; // false = label + keep in inbox (:copy)
+    flag?: string;
+    markRead?: boolean;
+    redirectTo?: string;
   }>;
 }
 
@@ -673,49 +766,74 @@ interface Destination {
   sievePath: string;
   mailboxId: string | null;
   matchedBy: string;
+  keepInbox: boolean; // true = add the label but leave the message in the Inbox
 }
 
-/** Classify one message to a destination folder, or null to leave in Inbox. */
+// Why a message stays in the inbox (dest === null). "unmatched" = no rule
+// touched it = a genuine rule candidate; the others are kept by design.
+type KeptReason = "protected" | "excluded" | "flagged" | "unmatched";
+interface Classification {
+  dest: Destination | null;
+  keptReason: KeptReason | null; // set iff dest === null
+}
+
+/** Classify one message: a destination folder, or null (with a reason) to leave in Inbox. */
 function classifyMessage(
   msg: PlanMsg,
   setups: SetupLike[],
   pathIndex: Map<string, string>,
-): Destination | null {
-  const resolve = (cat: string, s: SetupLike): Destination => ({
+): Classification {
+  const resolve = (
+    cat: string,
+    s: SetupLike,
+    keepInbox: boolean,
+  ): Destination => ({
     category: cat,
     sievePath: [s.rootPrefix, ...cat.split("/")].filter(Boolean).join(
       s.separator,
     ),
     mailboxId: pathIndex.get(cat.toLowerCase()) ?? null,
     matchedBy: "",
+    keepInbox,
   });
+  let sawFlag = false; // matched a flag/markRead/redirect rule but no file/stop
+  let sawExclude = false; // sender is in a file setup's exclude list
   for (const s of setups) {
     if (s.dialect !== "fastmail") continue;
     if (s.action === "rules") {
       for (const r of s.rules) {
         if (!ruleMatches(msg, r)) continue;
         if (r.category) {
-          const d = resolve(r.category, s);
+          const d = resolve(r.category, s, r.skipInbox === false);
           d.matchedBy = `rule ${r.match ?? "from"}:${
             (r.pattern ?? "").slice(0, 30)
           }`;
-          return d;
+          return { dest: d, keptReason: null };
         }
         // Spam rules move to Junk; other stopping/flag rules don't move.
         if (r.markSpam) {
           return {
-            category: "Spam",
-            sievePath: "INBOX.Spam",
-            mailboxId: null,
-            matchedBy: "spam rule",
+            dest: {
+              category: "Spam",
+              sievePath: "INBOX.Spam",
+              mailboxId: null,
+              matchedBy: "spam rule",
+              keepInbox: false,
+            },
+            keptReason: null,
           };
         }
-        if (r.stop) return null;
+        if (r.stop) return { dest: null, keptReason: "protected" };
+        if (r.flag || r.markRead || r.redirectTo) sawFlag = true;
       }
     } else if (s.action === "file") {
       const exclude = new Set(s.exclude.map((d) => d.toLowerCase()));
       const reg = registrableDomain(msg.from);
-      if (!reg || exclude.has(reg)) continue;
+      if (!reg) continue;
+      if (exclude.has(reg)) {
+        sawExclude = true;
+        continue;
+      }
       const compiled = compileRules(
         s.rules.filter((r) => r.category && r.pattern).map((r) => ({
           category: r.category!,
@@ -729,13 +847,18 @@ function classifyMessage(
       let category = hit?.category ?? null;
       if (!category && s.bulkFallback && msg.isBulk) category = s.bulkFallback;
       if (category) {
-        const d = resolve(category, s);
+        const d = resolve(category, s, s.skipInbox === false);
         d.matchedBy = hit ? `file:${hit.category}` : "bulkFallback";
-        return d;
+        return { dest: d, keptReason: null };
       }
     }
   }
-  return null;
+  const keptReason: KeptReason = sawFlag
+    ? "flagged"
+    : sawExclude
+    ? "excluded"
+    : "unmatched";
+  return { dest: null, keptReason };
 }
 
 // ---------------------------------------------------------------------------
@@ -868,12 +991,40 @@ const PlanArgsSchema = z.object({
   ),
 });
 
+const AnalyzeArgsSchema = z.object({
+  setups: z.array(SetupSchema).min(1).describe(
+    "Same setups as sieve_generate — analysis applies the identical rules to see what's covered vs left behind.",
+  ),
+  mailboxRole: z.string().default("inbox").describe(
+    "Mailbox to analyze (default 'inbox').",
+  ),
+  inMailbox: z.string().optional().describe(
+    "Explicit mailbox id (overrides role).",
+  ),
+  maxMessages: z.number().int().positive().optional().describe(
+    "Cap of newest messages to analyze (default: all).",
+  ),
+  name: z.string().default("analysis").describe(
+    "Analysis resource instance name.",
+  ),
+  // Ignored passthrough: lets `--input-file config/email-config.yaml` (which also
+  // carries `scopes` for the scan stage) drive analyze without a trimmed copy.
+  scopes: z.any().optional().describe(
+    "Ignored; present so the shared config file is accepted by strict input validation.",
+  ),
+});
+
 const MoveArgsSchema = z.object({
   source: z.string().default("apply-plan").describe(
     "Plan resource name to execute (from email_plan).",
   ),
   execute: z.boolean().default(false).describe(
     "false = dry-run (moves nothing, just reports). true = perform the moves — REQUIRES a write-scoped token.",
+  ),
+  forceMove: z.boolean().default(false).describe(
+    "Remove the source mailbox even for keep (skipInbox:false) rules. Use when " +
+      "cleaning a NON-inbox folder (e.g. Newsletters) where 'keep in inbox' doesn't " +
+      "apply — everything with a home leaves the source folder.",
   ),
   batchSize: z.number().int().positive().default(50),
 });
@@ -905,12 +1056,13 @@ type Ctx = {
  *
  * Methods: `email_senders` (fan-out sender scan with bulk detection),
  * `sieve_generate` (config-driven Sieve script generation into nested folders),
- * `email_plan` (dry-run message-id → destination plan), and `email_move`
- * (apply the plan; requires a write-scoped token and `execute: true`).
+ * `email_plan` (dry-run message-id → destination plan), `email_analyze`
+ * (post-hoc analysis of a scan), and `email_move` (apply the plan; requires a
+ * write-scoped token and `execute: true`).
  */
 export const model = {
   type: "@dmc/fastmail",
-  version: "2026.08.19.1",
+  version: "2026.08.29.1",
   globalArguments: GlobalArgsSchema,
   checks: {
     "valid-api-token": {
@@ -974,6 +1126,13 @@ export const model = {
       description:
         "Apply-sieve plan: message id → destination folder for existing mail, per the same rules",
       schema: PlanResourceSchema,
+      lifetime: "7d" as const,
+      garbageCollection: 5,
+    },
+    analysis: {
+      description:
+        "Standalone inbox analysis: what current rules cover vs the senders left behind (the rule-candidate to-do list)",
+      schema: AnalysisResourceSchema,
       lifetime: "7d" as const,
       garbageCollection: 5,
     },
@@ -1523,7 +1682,7 @@ export const model = {
           const listId = cleanListId(e["header:List-Id:asText"]);
           const listUnsub = typeof e["header:List-Unsubscribe"] === "string" &&
             (e["header:List-Unsubscribe"] as string).trim() !== "";
-          const dest = classifyMessage(
+          const { dest } = classifyMessage(
             {
               from: addr,
               fromName: from0?.name ?? null,
@@ -1549,6 +1708,7 @@ export const model = {
             sievePath: dest.sievePath,
             mailboxId: dest.mailboxId,
             matchedBy: dest.matchedBy,
+            keepInbox: dest.keepInbox,
           });
         }
 
@@ -1575,6 +1735,210 @@ export const model = {
       },
     },
 
+    email_analyze: {
+      description:
+        "Analyze a mailbox against the CURRENT rules (read-only): report overall composition and the senders that would still be LEFT in the inbox — the rule-candidate list that drives the pre-build tuning loop. Writes an 'analysis' resource. Moves nothing.",
+      arguments: AnalyzeArgsSchema,
+      execute: async (
+        args: z.infer<typeof AnalyzeArgsSchema>,
+        context: Ctx,
+      ) => {
+        const apiToken = context.globalArgs.apiToken;
+        const sessionUrl = context.globalArgs.sessionUrl ?? DEFAULT_SESSION_URL;
+        const session = await fetchSession(apiToken, sessionUrl);
+        const accountId = session.primaryAccounts[JMAP_MAIL_URN];
+        const mailboxes = await fetchMailboxes(
+          session.apiUrl,
+          apiToken,
+          accountId,
+        );
+        const pathIndex = buildPathIndex(mailboxes);
+        const roleToId: Record<string, string> = {};
+        for (const mb of mailboxes) {
+          if (mb.role) roleToId[mb.role.toLowerCase()] = mb.id;
+        }
+        const explicit = args.inMailbox && args.inMailbox.trim()
+          ? args.inMailbox.trim()
+          : null;
+        const inMailbox = explicit ?? roleToId[args.mailboxRole.toLowerCase()];
+        if (!inMailbox) {
+          throw new Error(`No mailbox found for role "${args.mailboxRole}".`);
+        }
+
+        const cap = args.maxMessages ?? Infinity;
+        const ids = await queryIds(
+          session.apiUrl,
+          apiToken,
+          accountId,
+          { inMailbox },
+          cap,
+        );
+        const emails = await getEmailBatch(
+          session.apiUrl,
+          apiToken,
+          accountId,
+          ids,
+          [
+            "id",
+            "from",
+            "to",
+            "cc",
+            "bcc",
+            "subject",
+            "receivedAt",
+            "keywords",
+            "header:List-Id:asText",
+            "header:List-Unsubscribe",
+          ],
+        );
+
+        const setups = args.setups as unknown as SetupLike[];
+        const coveredByCategory: Record<string, number> = {};
+        let covered = 0;
+        // Senders left in the inbox — aggregated by rule-pattern token, with the
+        // reason they stayed so candidates (unmatched) split from kept-by-design.
+        const remBy = new Map<string, {
+          token: string;
+          count: number;
+          bulk: number;
+          unread: number;
+          reasons: Record<KeptReason, number>;
+          sampleFroms: string[];
+          sampleSubjects: string[];
+        }>();
+        let remBulk = 0;
+        let remUnread = 0;
+        const byReason: Record<KeptReason, number> = {
+          unmatched: 0,
+          excluded: 0,
+          protected: 0,
+          flagged: 0,
+        };
+
+        for (const e of emails) {
+          const kw = (e.keywords ?? {}) as Record<string, boolean>;
+          const isUnread = !kw["$seen"];
+          const from0 = (e.from as Array<{ name?: string; email?: string }>)
+            ?.[0];
+          const addr = from0?.email?.toLowerCase() ?? "(no from address)";
+          const listId = cleanListId(e["header:List-Id:asText"]);
+          const listUnsub = typeof e["header:List-Unsubscribe"] === "string" &&
+            (e["header:List-Unsubscribe"] as string).trim() !== "";
+          const isBulk = !!listId || listUnsub;
+          const recipients: string[] = [];
+          for (const k of ["to", "cc", "bcc"]) {
+            for (const x of (e[k] as Array<{ email?: string }>) ?? []) {
+              if (x.email) recipients.push(x.email.toLowerCase());
+            }
+          }
+          const cls: Classification = from0?.email
+            ? classifyMessage(
+              {
+                from: addr,
+                fromName: from0?.name ?? null,
+                recipients,
+                listId,
+                isBulk,
+              },
+              setups,
+              pathIndex,
+            )
+            : { dest: null, keptReason: "unmatched" };
+          if (cls.dest) {
+            covered++;
+            coveredByCategory[cls.dest.category] =
+              (coveredByCategory[cls.dest.category] ?? 0) + 1;
+            continue;
+          }
+          // Left in the inbox — group by sender token (the unit a rule targets).
+          const reason = cls.keptReason ?? "unmatched";
+          byReason[reason]++;
+          const reg = registrableDomain(addr);
+          const token = reg ? senderToken(addr, reg, {}) : addr;
+          if (isBulk) remBulk++;
+          if (isUnread) remUnread++;
+          const row = remBy.get(token) ?? {
+            token,
+            count: 0,
+            bulk: 0,
+            unread: 0,
+            reasons: { unmatched: 0, excluded: 0, protected: 0, flagged: 0 },
+            sampleFroms: [],
+            sampleSubjects: [],
+          };
+          row.count++;
+          if (isBulk) row.bulk++;
+          if (isUnread) row.unread++;
+          row.reasons[reason]++;
+          if (!row.sampleFroms.includes(addr) && row.sampleFroms.length < 3) {
+            row.sampleFroms.push(addr);
+          }
+          const subj = typeof e.subject === "string" ? e.subject : "";
+          if (subj && row.sampleSubjects.length < 3) {
+            row.sampleSubjects.push(subj);
+          }
+          remBy.set(token, row);
+        }
+
+        const rows = [...remBy.values()]
+          .map((r) => {
+            const dominant =
+              (Object.entries(r.reasons) as Array<[KeptReason, number]>)
+                .sort((a, b) => b[1] - a[1])[0][0];
+            return {
+              token: r.token,
+              count: r.count,
+              bulk: r.bulk,
+              unread: r.unread,
+              reason: dominant,
+              sampleFroms: r.sampleFroms,
+              sampleSubjects: r.sampleSubjects,
+            };
+          })
+          .sort((a, b) => b.count - a.count || a.token.localeCompare(b.token));
+        const remainingTotal = rows.reduce((n, r) => n + r.count, 0);
+        const candidates = rows.filter((r) => r.reason === "unmatched").slice(
+          0,
+          40,
+        );
+        const keptByDesign = rows.filter((r) => r.reason !== "unmatched").slice(
+          0,
+          25,
+        );
+        const remaining = {
+          total: remainingTotal,
+          bulk: remBulk,
+          personal: remainingTotal - remBulk,
+          unread: remUnread,
+          distinctSenders: rows.length,
+          byReason,
+          candidates,
+          keptByDesign,
+        };
+
+        context.logger?.info("Inbox analysis built", {
+          scanned: ids.length,
+          covered,
+          remaining: remainingTotal,
+          candidates: candidates.length,
+        });
+        const handle = await context.writeResource("analysis", args.name, {
+          generatedAt: new Date().toISOString(),
+          sourceMailbox: inMailbox,
+          scannedMessages: ids.length,
+          covered,
+          coveredByCategory,
+          remaining,
+        });
+        return {
+          dataHandles: [handle],
+          scannedMessages: ids.length,
+          covered,
+          remaining,
+        };
+      },
+    },
+
     email_move: {
       description:
         "Apply the sieve plan by moving messages to their destination folders (JMAP Email/set mailboxIds). DEFAULT DRY-RUN — moves nothing and just reports. `execute: true` performs the moves and REQUIRES a write-scoped token. Always gate behind a manual-approval step.",
@@ -1586,22 +1950,47 @@ export const model = {
             `No plan named "${args.source}" — run email_plan first.`,
           );
         }
-        const moves = (plan.moves as Array<
-          { messageId: string; mailboxId: string | null; category: string }
-        >) ??
-          [];
-        const movable = moves.filter((m) => m.mailboxId);
-        const newFolders = moves.filter((m) => !m.mailboxId);
+        const allMoves = (plan.moves as Array<
+          {
+            messageId: string;
+            mailboxId: string | null;
+            category: string;
+            keepInbox?: boolean;
+          }
+        >) ?? [];
+        const sourceMailbox = plan.sourceMailbox as string | undefined;
+        // A message already in its target mailbox is a no-op — and a naive move
+        // patch would add AND remove the same id and strip it into limbo (e.g.
+        // re-filing the Newsletters bulk-fallback against the Newsletters folder
+        // itself). Drop those.
+        const alreadyThere =
+          allMoves.filter((m) => !!m.mailboxId && m.mailboxId === sourceMailbox)
+            .length;
+        const moves = allMoves.filter((m) => m.mailboxId !== sourceMailbox);
+        // Every remaining move is fileable — the target label is created if missing.
+        // keepInbox = add the label but leave it in the source; otherwise it moves
+        // out. forceMove removes the source even for keep rules (folder cleanup).
+        const wouldLabel = args.forceMove
+          ? 0
+          : moves.filter((m) => m.keepInbox).length;
+        const wouldMove = moves.length - wouldLabel;
+        const foldersToCreate = [
+          ...new Set(moves.filter((m) => !m.mailboxId).map((m) => m.category)),
+        ];
 
         if (!args.execute) {
           context.logger?.info("email_move DRY-RUN (nothing moved)", {
-            wouldMove: movable.length,
-            needFolderCreate: newFolders.length,
+            wouldMove,
+            wouldLabel,
+            alreadyThere,
+            foldersToCreate: foldersToCreate.length,
           });
           return {
             dryRun: true,
-            wouldMove: movable.length,
-            skippedNeedFolderCreate: newFolders.length,
+            wouldMove,
+            wouldLabel,
+            alreadyThere,
+            foldersToCreate,
             byDestination: plan.byDestination,
           };
         }
@@ -1621,14 +2010,49 @@ export const model = {
         const sessionUrl = context.globalArgs.sessionUrl ?? DEFAULT_SESSION_URL;
         const session = await fetchSession(writeToken, sessionUrl);
         const accountId = session.primaryAccounts[JMAP_MAIL_URN];
+
+        // Resolve every category to a target mailbox id, creating missing (nested)
+        // labels first — the plan leaves mailboxId null for labels that don't exist.
+        const mailboxes = await fetchMailboxes(
+          session.apiUrl,
+          writeToken,
+          accountId,
+        );
+        const idByCat = new Map<string, string>();
+        for (const m of moves) {
+          if (m.mailboxId) idByCat.set(m.category, m.mailboxId);
+        }
+        const createdFolders: string[] = [];
+        for (const cat of new Set(moves.map((m) => m.category))) {
+          if (idByCat.has(cat)) continue;
+          const { id, created } = await ensureMailbox(
+            session.apiUrl,
+            writeToken,
+            accountId,
+            cat,
+            mailboxes,
+          );
+          idByCat.set(cat, id);
+          createdFolders.push(...created);
+        }
+
         let updated = 0;
         const notUpdated: Record<string, unknown> = {};
-        for (let i = 0; i < movable.length; i += args.batchSize) {
-          const batch = movable.slice(i, i + args.batchSize);
+        for (let i = 0; i < moves.length; i += args.batchSize) {
+          const batch = moves.slice(i, i + args.batchSize);
+          // JMAP PatchObject: add the target label; for a real move also drop the
+          // source (Inbox) mailbox. keepInbox leaves the Inbox in place, and this
+          // never touches other labels the message already carries.
           const update = Object.fromEntries(
-            batch.map((
-              m,
-            ) => [m.messageId, { mailboxIds: { [m.mailboxId!]: true } }]),
+            batch.map((m) => {
+              const patch: Record<string, boolean | null> = {
+                [`mailboxIds/${idByCat.get(m.category)!}`]: true,
+              };
+              if ((!m.keepInbox || args.forceMove) && sourceMailbox) {
+                patch[`mailboxIds/${sourceMailbox}`] = null;
+              }
+              return [m.messageId, patch];
+            }),
           );
           const resp = await jmapRequest(session.apiUrl, writeToken, [
             ["Email/set", { accountId, update }, "0"],
@@ -1640,12 +2064,24 @@ export const model = {
           updated += Object.keys(r.updated ?? {}).length;
           Object.assign(notUpdated, r.notUpdated ?? {});
         }
-        context.logger?.info("email_move executed", { updated });
+        const notUpdatedCount = Object.keys(notUpdated).length;
+        context.logger?.info("email_move executed", {
+          updated,
+          labeled: wouldLabel,
+          moved: wouldMove,
+          alreadyThere,
+          createdFolders: createdFolders.length,
+          notUpdated: notUpdatedCount,
+        });
         return {
           executed: true,
           updated,
+          labeled: wouldLabel,
+          moved: wouldMove,
+          alreadyThere,
+          createdFolders,
+          notUpdatedCount,
           notUpdated,
-          skippedNeedFolderCreate: newFolders.length,
         };
       },
     },

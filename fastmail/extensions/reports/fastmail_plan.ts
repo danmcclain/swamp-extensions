@@ -12,6 +12,7 @@ interface PlanMove {
   sievePath: string;
   mailboxId: string | null;
   matchedBy: string;
+  keepInbox?: boolean; // true = add label, stays in Inbox
 }
 interface PlanData {
   sourceMailbox: string;
@@ -24,8 +25,9 @@ interface PlanData {
 
 /**
  * `@dmc/fastmail-plan` — method-scoped report that renders the message-id →
- * destination plan from an `email_plan` run, grouped by target folder, so the
- * moves can be reviewed before `email_move` applies them.
+ * destination plan from an `email_plan` run, grouped by target folder and
+ * marking whether each destination moves out of the Inbox or is a label that
+ * stays, so the moves can be reviewed before `email_move` applies them.
  */
 export const report = {
   name: "@dmc/fastmail-plan",
@@ -64,12 +66,25 @@ export const report = {
     if (!raw) return { markdown: "_Plan data not found._", json: {} };
     const d = JSON.parse(new TextDecoder().decode(raw)) as PlanData;
 
+    // Whether each category is label-and-keep (stays in Inbox) or a move.
+    const keepByCat = new Map<string, boolean>();
+    for (const m of d.moves ?? []) {
+      if (!keepByCat.has(m.category)) keepByCat.set(m.category, !!m.keepInbox);
+    }
+    let labelCount = 0;
+    let moveOutCount = 0;
+    for (const m of d.moves ?? []) m.keepInbox ? labelCount++ : moveOutCount++;
+
     // Destinations by volume.
     const dests = Object.entries(d.byDestination ?? {}).sort((a, b) =>
       b[1] - a[1]
     );
     const destRows = dests
-      .map(([cat, n]) => `| ${n} | ${cat} |`)
+      .map(([cat, n]) =>
+        `| ${n} | ${cat} | ${
+          keepByCat.get(cat) ? "label — stays in Inbox" : "moves out"
+        } |`
+      )
       .join("\n");
 
     // Up to 3 sample subjects per destination.
@@ -93,14 +108,15 @@ export const report = {
       "# Apply-Sieve Plan — review before moving",
       "",
       `- **Scanned:** ${d.scannedMessages} messages in \`${d.sourceMailbox}\``,
-      `- **Would move:** ${d.moveCount}`,
-      `- **Left in Inbox:** ${d.leftInInbox}`,
+      `- **Would move out of Inbox:** ${moveOutCount}`,
+      `- **Would label but keep in Inbox:** ${labelCount}`,
+      `- **Left untouched in Inbox:** ${d.leftInInbox}`,
       "",
       "## Destinations",
       "",
-      "| Msgs | Folder |",
-      "| ---: | :-- |",
-      destRows || "| — | (none) |",
+      "| Msgs | Folder / label | Effect |",
+      "| ---: | :-- | :-- |",
+      destRows || "| — | (none) | — |",
       "",
       "## Sample messages per destination",
       "",
