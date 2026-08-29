@@ -22,19 +22,40 @@ const DEFAULT_SESSION_URL = "https://api.fastmail.com/.well-known/jmap";
 const GlobalArgsSchema = z.object({
   apiToken: z.string()
     .meta({ sensitive: true })
+    .optional()
     .describe(
-      "Fastmail JMAP API token (Bearer). Read-only is enough for every method except email_move.",
+      "Read-only Fastmail JMAP API token (Bearer). Preferred for all read methods. Optional if writeToken is set — a write token also has read scope. At least one of apiToken/writeToken is required.",
     ),
   writeToken: z.string()
     .meta({ sensitive: true })
     .optional()
     .describe(
-      "Write-scoped Fastmail token used ONLY by email_move (execute:true). Leave unset to keep the model read-only.",
+      "Write-scoped Fastmail token. Required by email_move (execute:true), and used as the read token when apiToken is unset. Leave unset (with apiToken set) to keep the model read-only.",
     ),
   sessionUrl: z.string().url()
     .default(DEFAULT_SESSION_URL)
     .describe("JMAP session discovery URL (defaults to Fastmail)"),
 });
+
+/**
+ * Resolve the token used for READ operations: prefer the read-only `apiToken`,
+ * fall back to `writeToken` (which also carries read scope). So a read-only
+ * `apiToken` alone runs every read method, a `writeToken` alone runs everything,
+ * and setting both keeps reads on the least-privilege token. `email_move` does
+ * NOT use this — it requires `writeToken` explicitly.
+ */
+function resolveReadToken(
+  g: { apiToken?: string; writeToken?: string },
+): string {
+  const token = g.apiToken ?? g.writeToken;
+  if (!token) {
+    throw new Error(
+      "No Fastmail token configured — set globalArguments.apiToken (read-only) " +
+        "or writeToken on the model.",
+    );
+  }
+  return token;
+}
 
 interface JmapSession {
   apiUrl: string;
@@ -1034,7 +1055,7 @@ const MoveArgsSchema = z.object({
 // ---------------------------------------------------------------------------
 
 type Ctx = {
-  globalArgs: { apiToken: string; writeToken?: string; sessionUrl?: string };
+  globalArgs: { apiToken?: string; writeToken?: string; sessionUrl?: string };
   logger?: { info: (msg: string, props?: Record<string, unknown>) => void };
   writeResource: (
     spec: string,
@@ -1062,7 +1083,7 @@ type Ctx = {
  */
 export const model = {
   type: "@dmc/fastmail",
-  version: "2026.08.29.1",
+  version: "2026.08.29.2",
   globalArguments: GlobalArgsSchema,
   checks: {
     "valid-api-token": {
@@ -1076,8 +1097,9 @@ export const model = {
         },
       ) => {
         const args = GlobalArgsSchema.parse(context.globalArgs);
+        const token = resolveReadToken(args);
         try {
-          const session = await fetchSession(args.apiToken, args.sessionUrl);
+          const session = await fetchSession(token, args.sessionUrl);
           const errors: string[] = [];
           if (!session.apiUrl) errors.push("JMAP session missing apiUrl");
           if (!session.primaryAccounts?.[JMAP_MAIL_URN]) {
@@ -1088,7 +1110,7 @@ export const model = {
           const msg = String(e);
           return {
             pass: false,
-            errors: [msg.includes(args.apiToken) ? "[token redacted]" : msg],
+            errors: [msg.includes(token) ? "[token redacted]" : msg],
           };
         }
       },
@@ -1146,7 +1168,7 @@ export const model = {
         args: z.infer<typeof SendersArgsSchema>,
         context: Ctx,
       ) => {
-        const apiToken = context.globalArgs.apiToken;
+        const apiToken = resolveReadToken(context.globalArgs);
         const sessionUrl = context.globalArgs.sessionUrl ?? DEFAULT_SESSION_URL;
         const session = await fetchSession(apiToken, sessionUrl);
         const accountId = session.primaryAccounts[JMAP_MAIL_URN];
@@ -1319,7 +1341,7 @@ export const model = {
         // Resolve the folder tree once if any setup uses the fastmail dialect.
         let pathIndex = new Map<string, string>();
         if (args.setups.some((s) => s.dialect === "fastmail")) {
-          const apiToken = context.globalArgs.apiToken;
+          const apiToken = resolveReadToken(context.globalArgs);
           const sessionUrl = context.globalArgs.sessionUrl ??
             DEFAULT_SESSION_URL;
           const session = await fetchSession(apiToken, sessionUrl);
@@ -1612,7 +1634,7 @@ export const model = {
         "Plan applying the sieve to existing mail: classify a mailbox's messages to destination folders using the SAME rules as sieve_generate, producing a message-id → destination mapping for manual review (executed later by email_move). Read-only — moves nothing.",
       arguments: PlanArgsSchema,
       execute: async (args: z.infer<typeof PlanArgsSchema>, context: Ctx) => {
-        const apiToken = context.globalArgs.apiToken;
+        const apiToken = resolveReadToken(context.globalArgs);
         const sessionUrl = context.globalArgs.sessionUrl ?? DEFAULT_SESSION_URL;
         const session = await fetchSession(apiToken, sessionUrl);
         const accountId = session.primaryAccounts[JMAP_MAIL_URN];
@@ -1743,7 +1765,7 @@ export const model = {
         args: z.infer<typeof AnalyzeArgsSchema>,
         context: Ctx,
       ) => {
-        const apiToken = context.globalArgs.apiToken;
+        const apiToken = resolveReadToken(context.globalArgs);
         const sessionUrl = context.globalArgs.sessionUrl ?? DEFAULT_SESSION_URL;
         const session = await fetchSession(apiToken, sessionUrl);
         const accountId = session.primaryAccounts[JMAP_MAIL_URN];

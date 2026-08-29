@@ -80,3 +80,50 @@ Deno.test("valid-api-token: redacts the token if it leaks into an error", async 
   assertEquals(result.pass, false);
   assertEquals(result.errors, ["[token redacted]"]);
 });
+
+/** Capture the Bearer token the JMAP session fetch is called with. */
+function captureBearer(): { stub: typeof fetch; seen: () => string } {
+  let auth = "";
+  const stub = ((_url: string | URL | Request, init?: RequestInit) => {
+    auth = ((init?.headers as Record<string, string>)?.Authorization) ?? "";
+    return Promise.resolve(
+      jsonResponse({
+        apiUrl: "https://api",
+        primaryAccounts: { [MAIL_URN]: "acct1" },
+      }),
+    );
+  }) as typeof fetch;
+  return { stub, seen: () => auth };
+}
+
+Deno.test("read token: falls back to writeToken when apiToken is unset", async () => {
+  const { stub, seen } = captureBearer();
+  const result = await withFetch(
+    stub,
+    () =>
+      check.execute({
+        globalArgs: {
+          writeToken: "write-token",
+          sessionUrl: globalArgs.sessionUrl,
+        },
+      }),
+  ) as CheckResult;
+  assertEquals(result.pass, true);
+  assertEquals(seen(), "Bearer write-token");
+});
+
+Deno.test("read token: prefers apiToken when both are set", async () => {
+  const { stub, seen } = captureBearer();
+  await withFetch(
+    stub,
+    () =>
+      check.execute({
+        globalArgs: {
+          apiToken: "read-token",
+          writeToken: "write-token",
+          sessionUrl: globalArgs.sessionUrl,
+        },
+      }),
+  );
+  assertEquals(seen(), "Bearer read-token");
+});

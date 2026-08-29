@@ -14,9 +14,13 @@ only on `zod`. It talks to Fastmail's JMAP session endpoint
 
 | Arg          | Required | Description                                                                                         |
 | ------------ | -------- | --------------------------------------------------------------------------------------------------- |
-| `apiToken`   | yes      | Fastmail JMAP API token (Bearer). Read-only scope is enough for every method except `email_move`.   |
-| `writeToken` | no       | Write-scoped token used **only** by `email_move` (`execute: true`). Omit to keep the model read-only. |
+| `apiToken`   | no\*     | Read-only Fastmail JMAP token (Bearer). Preferred for all read methods. Optional if `writeToken` is set. |
+| `writeToken` | no\*     | Write-scoped token. Required by `email_move`; also used as the read token when `apiToken` is unset.  |
 | `sessionUrl` | no       | JMAP session discovery URL. Defaults to Fastmail.                                                    |
+
+\* At least one of `apiToken` / `writeToken` is required. Read methods use
+`apiToken` when set and otherwise fall back to `writeToken` (a write token also
+has read scope); `email_move` always requires `writeToken`.
 
 Tokens are marked sensitive — supply them from a vault, e.g.
 `${{ vault.get(local-secrets, FASTMAIL_TOKEN) }}`.
@@ -37,22 +41,24 @@ fallback category rather than swallowing the whole mailbox.
 
 ## Tokens & trust
 
-The two tokens map to two privilege levels, and the model keeps them strictly
-separated — it never uses the write token for a read:
+The two tokens map to two privilege levels. **Read** methods (`email_senders`,
+`sieve_generate`, `email_plan`, `email_analyze`, and the `valid-api-token` check)
+resolve their token as **`apiToken` first, then `writeToken`**; `email_move`
+always uses `writeToken` and never falls back to `apiToken`. That gives three
+setups:
 
-- **`apiToken` (read-only) drives everything except moving mail.** `email_senders`,
-  `sieve_generate`, `email_plan`, and `email_analyze` all authenticate with
-  `apiToken` only. A read-only Fastmail token is enough to scan your mailbox,
-  generate Sieve scripts, plan moves, and iterate on your rules.
-- **`writeToken` is used only by `email_move`** (and only with `execute: true`).
-  It does **not** fall back to `apiToken`: a move with no write token fails loudly
-  up front rather than as an opaque JMAP 403 mid-batch.
+- **Read-only** — set `apiToken` only. Every read method works; `email_move`
+  refuses to run (no write token). The model cannot move a message.
+- **Single token** — set `writeToken` only. It drives everything, reads
+  included (a write token also has read scope) — the least-config setup.
+- **Separate permissions** — set both. Reads run on the least-privilege
+  `apiToken`, and only `email_move` uses `writeToken`.
 
-Because of this split, you don't have to trust the move workflows to get value:
-run with **only** a read-only `apiToken` and you can do all the analysis and
-Sieve generation you want — the model literally cannot move a message without a
-separate, explicitly supplied write-scoped token. Add `writeToken` only when
-you're ready to let `email_move` relocate mail.
+Because reads never require the write token, you don't have to trust the move
+workflows to get value: with a read-only `apiToken` you get all the scanning,
+Sieve generation, planning, and analysis, and mail can't move until you add a
+write-scoped token. A missing write token fails loudly up front in `email_move`
+rather than as an opaque JMAP 403 mid-batch.
 
 ## Reports
 
