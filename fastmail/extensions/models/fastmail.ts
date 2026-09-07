@@ -318,7 +318,7 @@ const FULL_ADDRESS = new Set([
 ]);
 
 // Shared platforms where the brand lives in the SUBDOMAIN
-// (e.g. info@newenglandforce.ccsend.com) — match the full domain.
+// (e.g. info@acme.ccsend.com) — match the full domain.
 const SHARED_HOST = new Set([
   "ccsend.com",
   "sendgrid.net",
