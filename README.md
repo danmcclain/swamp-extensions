@@ -5,16 +5,18 @@ Custom [swamp](https://github.com/swamp-club/swamp) extensions by
 
 ## Extensions
 
-| Name                   | Kind          | Description                                                                                   |
-| ---------------------- | ------------- | --------------------------------------------------------------------------------------------- |
-| `@dmc/unifi-networks`  | model + reports | Query UniFi Network sites (VLANs, firewall zones/policies, clients, WiFi) via the official integration API, mapped together, with firewall-summary and zone-matrix reports. See [extensions/models/README.md](extensions/models/README.md). |
+| Name                  | Kind            | Description                                                                                                                                                                                                                                 |
+| --------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@dmc/unifi-networks` | model + reports | Query UniFi Network sites (VLANs, firewall zones/policies, clients, WiFi) via the official integration API, mapped together, with firewall-summary and zone-matrix reports. See [extensions/models/README.md](extensions/models/README.md). |
+| `@dmc/proxmox`        | models          | Proxmox VE VM/LXC lifecycle, cloud-image storage, and snapshot-guarded updates + headless install for community-scripts LXCs. See [extensions/models/proxmox/README.md](extensions/models/proxmox/README.md).                               |
 
 ## Layout
 
 ```
 extensions/
-  models/     # TypeScript model definitions + their manifest, README, LICENSE
-  reports/    # TypeScript report definitions
+  models/           # @dmc/unifi-networks (manifest, README, LICENSE) + models
+  models/proxmox/   # @dmc/proxmox — self-contained (manifest, README, LICENSE, lib, models)
+  reports/          # TypeScript report definitions
 ```
 
 ## Using these locally
