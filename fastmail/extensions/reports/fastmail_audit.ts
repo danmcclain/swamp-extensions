@@ -31,6 +31,7 @@ interface SendersData {
   senderCount: number;
   bulkSenders: number;
   senders: Sender[];
+  headerStats?: Record<string, Array<{ value: string; count: number }>>;
 }
 
 function pct(n: number, d: number): string {
@@ -89,6 +90,27 @@ function scopeSection(
   const c50 = concentration(senders, d.scannedMessages, 0.5);
   const c80 = concentration(senders, d.scannedMessages, 0.8);
 
+  // Header value frequency (a rule-discovery aid): value → count per header.
+  const headerStats = d.headerStats ?? {};
+  const headerSections = Object.entries(headerStats)
+    .filter(([, vals]) => vals.length)
+    .map(([name, vals]) => {
+      const rows = vals
+        .map((v) =>
+          `| ${v.count} | ${v.value.replace(/\|/g, "\\|").slice(0, 60)} |`
+        )
+        .join("\n");
+      return [
+        `### Header \`${name}\` — value distribution`,
+        "",
+        "| Msgs | Value |",
+        "| ---: | :-- |",
+        rows,
+        "",
+      ].join("\n");
+    })
+    .join("\n");
+
   const md = [
     `## Scope: \`${d.scope.name}\` (${d.scope.mode})`,
     "",
@@ -116,6 +138,7 @@ function scopeSection(
     "| ---: | ---: | :-- | :-- | :-- |",
     unreadRows || "| — | — | — | (none) | |",
     "",
+    headerSections,
   ].join("\n");
 
   return {
@@ -147,6 +170,7 @@ function scopeSection(
         count: s.count,
         oneClickUnsubscribe: s.oneClickUnsubscribe,
       })),
+      headerStats,
     },
   };
 }

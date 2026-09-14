@@ -50,8 +50,7 @@ function resolveReadToken(
   const token = g.apiToken ?? g.writeToken;
   if (!token) {
     throw new Error(
-      "No Fastmail token configured — set globalArguments.apiToken (read-only) " +
-        "or writeToken on the model.",
+      "No Fastmail token: set apiToken (read) or writeToken (read+write) in globalArguments.",
     );
   }
   return token;
@@ -318,7 +317,7 @@ const FULL_ADDRESS = new Set([
 ]);
 
 // Shared platforms where the brand lives in the SUBDOMAIN
-// (e.g. info@acme.ccsend.com) — match the full domain.
+// (e.g. info@newenglandforce.ccsend.com) — match the full domain.
 const SHARED_HOST = new Set([
   "ccsend.com",
   "sendgrid.net",
@@ -594,13 +593,14 @@ function emitAllowlist(
 // variable pipeline / finalize). Each rule acts and stops in place.
 // ---------------------------------------------------------------------------
 
-type MatchField = "from" | "to" | "list" | "with";
+type MatchField = "from" | "to" | "list" | "with" | "subject" | "header";
 
 interface RuleSpec {
   label: string;
   match?: MatchField;
   pattern?: string; // "|"-separated OR values
-  all?: Array<{ match: MatchField; pattern: string }>;
+  header?: string; // header name, when match === "header"
+  all?: Array<{ match: MatchField; pattern: string; header?: string }>;
   category?: string;
   sievePath?: string;
   mailboxId?: string | null;
@@ -613,7 +613,7 @@ interface RuleSpec {
 }
 
 /** One jmapquery condition object for a match field + value. */
-function condFor(field: MatchField, value: string): unknown {
+function condFor(field: MatchField, value: string, header?: string): unknown {
   switch (field) {
     case "from":
       return { from: value };
@@ -633,13 +633,17 @@ function condFor(field: MatchField, value: string): unknown {
         }, { deliveredTo: value }],
         operator: "OR",
       };
+    case "subject":
+      return { subject: value };
+    case "header":
+      return { header: [header ?? "", value] };
   }
 }
 
 /** OR several "|"-separated patterns for one match field. */
-function orFor(field: MatchField, pattern: string): unknown {
+function orFor(field: MatchField, pattern: string, header?: string): unknown {
   const conds = pattern.split("|").filter(Boolean).map((p) =>
-    condFor(field, p)
+    condFor(field, p, header)
   );
   return conds.length === 1 ? conds[0] : { conditions: conds, operator: "OR" };
 }
@@ -647,11 +651,11 @@ function orFor(field: MatchField, pattern: string): unknown {
 function jmapQueryObj(spec: RuleSpec): unknown {
   if (spec.all && spec.all.length) {
     return {
-      conditions: spec.all.map((c) => orFor(c.match, c.pattern)),
+      conditions: spec.all.map((c) => orFor(c.match, c.pattern, c.header)),
       operator: "AND",
     };
   }
-  return orFor(spec.match ?? "from", spec.pattern ?? "");
+  return orFor(spec.match ?? "from", spec.pattern ?? "", spec.header);
 }
 
 /** A self-contained rule block: `if allof(not stop, jmapquery) { effects }`. */
@@ -726,6 +730,8 @@ interface PlanMsg {
   recipients: string[]; // to/cc/bcc/deliveredTo
   listId: string | null;
   isBulk: boolean;
+  subject?: string | null;
+  headers?: Record<string, string>; // lowercased header name → value
 }
 
 /** A setup as consumed by the classifier (a superset of SetupSchema fields). */
@@ -741,7 +747,8 @@ interface SetupLike {
     category?: string;
     pattern?: string;
     match?: MatchField;
-    all?: Array<{ match: MatchField; pattern: string }>;
+    header?: string; // header name when match === "header"
+    all?: Array<{ match: MatchField; pattern: string; header?: string }>;
     markSpam?: boolean;
     stop?: boolean;
     skipInbox?: boolean; // false = label + keep in inbox (:copy)
@@ -755,6 +762,7 @@ function fieldMatches(
   msg: PlanMsg,
   field: MatchField,
   pattern: string,
+  header?: string,
 ): boolean {
   let re: RegExp;
   try {
@@ -772,14 +780,41 @@ function fieldMatches(
       return msg.recipients.some((r) => re.test(r));
     case "with":
       return re.test(fromStr) || msg.recipients.some((r) => re.test(r));
+    case "subject":
+      return msg.subject ? re.test(msg.subject) : false;
+    case "header": {
+      const v = msg.headers?.[(header ?? "").toLowerCase()];
+      return v ? re.test(v) : false;
+    }
   }
 }
 
 function ruleMatches(msg: PlanMsg, rule: SetupLike["rules"][number]): boolean {
   if (rule.all && rule.all.length) {
-    return rule.all.every((c) => fieldMatches(msg, c.match, c.pattern));
+    return rule.all.every((c) =>
+      fieldMatches(msg, c.match, c.pattern, c.header)
+    );
   }
-  return fieldMatches(msg, rule.match ?? "from", rule.pattern ?? "");
+  return fieldMatches(
+    msg,
+    rule.match ?? "from",
+    rule.pattern ?? "",
+    rule.header,
+  );
+}
+
+/** Distinct header names referenced by any `match: header` rule across setups. */
+function neededHeaders(setups: SetupLike[]): string[] {
+  const names = new Set<string>();
+  for (const s of setups) {
+    for (const r of s.rules ?? []) {
+      if (r.match === "header" && r.header) names.add(r.header);
+      for (const c of r.all ?? []) {
+        if (c.match === "header" && c.header) names.add(c.header);
+      }
+    }
+  }
+  return [...names];
 }
 
 interface Destination {
@@ -905,6 +940,10 @@ const ScopeSchema = z.object({
   minCount: z.number().int().positive().default(1),
   after: z.string().optional().describe("ISO date; JMAP filter.after."),
   before: z.string().optional().describe("ISO date; JMAP filter.before."),
+  headers: z.array(z.string()).default([]).describe(
+    "Header names to tally a value→count frequency for (e.g. ['X-Business-Group', " +
+      "'Auto-Submitted']) — surfaces header-based rule opportunities in the audit report.",
+  ),
 });
 
 const SendersArgsSchema = z.object({
@@ -913,7 +952,7 @@ const SendersArgsSchema = z.object({
   ),
 });
 
-const MatchSchema = z.enum(["from", "to", "list", "with"]);
+const MatchSchema = z.enum(["from", "to", "list", "with", "subject", "header"]);
 
 const RuleSchema = z.object({
   // Scan-driven categorization: {category, pattern} with no `match`.
@@ -923,10 +962,17 @@ const RuleSchema = z.object({
     "Scan-driven: regex vs 'email name'. Direct: literal jmapquery value (| = OR).",
   ),
   match: MatchSchema.optional().describe(
-    "Direct rule: match field. from | to (→to/cc/bcc/deliveredTo) | list (listId) | with (from+recipients).",
+    "Direct rule: match field. from | to (→to/cc/bcc/deliveredTo) | list (listId) | with (from+recipients) | subject | header (needs `header`).",
   ),
-  all: z.array(z.object({ match: MatchSchema, pattern: z.string() })).optional()
-    .describe("Compound AND of conditions (e.g. from X AND to Y)."),
+  header: z.string().optional().describe(
+    "Header name to match when match: header (e.g. 'X-Business-Group'). `pattern` is the value.",
+  ),
+  all: z.array(z.object({
+    match: MatchSchema,
+    pattern: z.string(),
+    header: z.string().optional(),
+  })).optional()
+    .describe("Compound AND of conditions (e.g. from X AND header Y)."),
   markRead: z.boolean().optional().describe(
     "Direct: mark read (addflag \\Seen).",
   ),
@@ -999,10 +1045,18 @@ const PlanArgsSchema = z.object({
     "Same setups as sieve_generate — the plan applies the identical rules.",
   ),
   mailboxRole: z.string().default("inbox").describe(
-    "Mailbox to apply the sieve to (default 'inbox'; e.g. 'archive' to fix old classifications).",
+    "Mailbox to apply the sieve to (default 'inbox'; 'archive' to fix old " +
+      "classifications; 'all' to scan ALL mail, e.g. with `after` — pair with " +
+      "email_move labelOnly since all-mail has no single source to move from).",
   ),
   inMailbox: z.string().optional().describe(
     "Explicit mailbox id (overrides role).",
+  ),
+  after: z.string().optional().describe(
+    "ISO date; only plan mail received after this.",
+  ),
+  before: z.string().optional().describe(
+    "ISO date; only plan mail received before this.",
   ),
   maxMessages: z.number().int().positive().optional().describe(
     "Cap of newest messages to plan (default: all).",
@@ -1047,6 +1101,11 @@ const MoveArgsSchema = z.object({
       "cleaning a NON-inbox folder (e.g. Newsletters) where 'keep in inbox' doesn't " +
       "apply — everything with a home leaves the source folder.",
   ),
+  labelOnly: z.boolean().default(false).describe(
+    "Only ADD the target label; never remove any mailbox. Use for an all-mail " +
+      "backfill (mailboxRole=all) where messages live in many folders — tag them " +
+      "with their category label in place, moving nothing.",
+  ),
   batchSize: z.number().int().positive().default(50),
 });
 
@@ -1055,7 +1114,7 @@ const MoveArgsSchema = z.object({
 // ---------------------------------------------------------------------------
 
 type Ctx = {
-  globalArgs: { apiToken?: string; writeToken?: string; sessionUrl?: string };
+  globalArgs: { apiToken: string; writeToken?: string; sessionUrl?: string };
   logger?: { info: (msg: string, props?: Record<string, unknown>) => void };
   writeResource: (
     spec: string,
@@ -1078,12 +1137,13 @@ type Ctx = {
  * Methods: `email_senders` (fan-out sender scan with bulk detection),
  * `sieve_generate` (config-driven Sieve script generation into nested folders),
  * `email_plan` (dry-run message-id → destination plan), `email_analyze`
- * (post-hoc analysis of a scan), and `email_move` (apply the plan; requires a
- * write-scoped token and `execute: true`).
+ * (post-hoc analysis of a scan against the rules), `email_headers` (dump raw
+ * headers of sample messages for rule discovery), and `email_move` (apply the
+ * plan; requires a write-scoped token and `execute: true`).
  */
 export const model = {
   type: "@dmc/fastmail",
-  version: "2026.08.29.2",
+  version: "2026.09.14.1",
   globalArguments: GlobalArgsSchema,
   checks: {
     "valid-api-token": {
@@ -1133,6 +1193,11 @@ export const model = {
         senderCount: z.number(),
         bulkSenders: z.number(),
         senders: z.array(SenderSchema),
+        // value→count frequency for each requested header name (top values).
+        headerStats: z.record(
+          z.string(),
+          z.array(z.object({ value: z.string(), count: z.number() })),
+        ).default({}),
       }),
       lifetime: "30d" as const,
       garbageCollection: 10,
@@ -1157,6 +1222,20 @@ export const model = {
       schema: AnalysisResourceSchema,
       lifetime: "7d" as const,
       garbageCollection: 5,
+    },
+    headers: {
+      description:
+        "Diagnostic: full header lists of sample messages, for designing header-based rules",
+      schema: z.object({
+        query: z.string(),
+        messages: z.array(z.object({
+          subject: z.string().nullable(),
+          from: z.string().nullable(),
+          headers: z.array(z.object({ name: z.string(), value: z.string() })),
+        })),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 3,
     },
   },
   methods: {
@@ -1237,10 +1316,14 @@ export const model = {
               "header:List-Id:asText",
               "header:List-Unsubscribe",
               "header:List-Unsubscribe-Post",
+              ...scope.headers.map((n) => `header:${n}:asText`),
             ],
           );
 
           const byEmail = new Map<string, Sender>();
+          // value→count frequency for each requested header name.
+          const headerTally: Record<string, Map<string, number>> = {};
+          for (const n of scope.headers) headerTally[n] = new Map();
           for (const e of emails) {
             const from = (e.from as Array<{ name?: string; email?: string }>) ??
               [];
@@ -1288,6 +1371,13 @@ export const model = {
             if (subject && s.sampleSubjects.length < 3) {
               s.sampleSubjects.push(subject);
             }
+            for (const n of scope.headers) {
+              const v = e[`header:${n}:asText`];
+              if (typeof v === "string" && v.trim()) {
+                const key = v.trim();
+                headerTally[n].set(key, (headerTally[n].get(key) ?? 0) + 1);
+              }
+            }
           }
 
           const senders = [...byEmail.values()]
@@ -1295,6 +1385,16 @@ export const model = {
             .sort((a, b) => b.count - a.count);
           const bulkSenders = senders.filter((s) => s.bulkCount > 0).length;
           const unreadMessages = senders.reduce((a, s) => a + s.unreadCount, 0);
+          const headerStats: Record<
+            string,
+            Array<{ value: string; count: number }>
+          > = {};
+          for (const n of scope.headers) {
+            headerStats[n] = [...headerTally[n].entries()]
+              .map(([value, count]) => ({ value, count }))
+              .sort((a, b) => b.count - a.count)
+              .slice(0, 20);
+          }
 
           context.logger?.info("Scope {name} complete", {
             name: scope.name,
@@ -1316,6 +1416,7 @@ export const model = {
             senderCount: senders.length,
             bulkSenders,
             senders,
+            headerStats,
           });
           handles.push(handle);
           summary.push({
@@ -1408,6 +1509,7 @@ export const model = {
                 label,
                 match: r.match,
                 pattern: r.pattern,
+                header: r.header,
                 all: r.all,
                 category: r.category,
                 sievePath,
@@ -1651,19 +1753,30 @@ export const model = {
         const explicit = args.inMailbox && args.inMailbox.trim()
           ? args.inMailbox.trim()
           : null;
-        const inMailbox = explicit ?? roleToId[args.mailboxRole.toLowerCase()];
-        if (!inMailbox) {
+        // mailboxRole "all" (no explicit inMailbox) scans ALL mail — no mailbox
+        // restriction, just the optional date window.
+        const allMail = !explicit && args.mailboxRole.toLowerCase() === "all";
+        const inMailbox = allMail
+          ? undefined
+          : (explicit ?? roleToId[args.mailboxRole.toLowerCase()]);
+        if (!allMail && !inMailbox) {
           throw new Error(`No mailbox found for role "${args.mailboxRole}".`);
         }
 
         const cap = args.maxMessages ?? Infinity;
+        const filter: Record<string, unknown> = {};
+        if (inMailbox) filter.inMailbox = inMailbox;
+        if (args.after) filter.after = args.after;
+        if (args.before) filter.before = args.before;
         const ids = await queryIds(
           session.apiUrl,
           apiToken,
           accountId,
-          { inMailbox },
+          filter,
           cap,
         );
+        const setups = args.setups as unknown as SetupLike[];
+        const hdrNames = neededHeaders(setups);
         const emails = await getEmailBatch(
           session.apiUrl,
           apiToken,
@@ -1679,10 +1792,10 @@ export const model = {
             "receivedAt",
             "header:List-Id:asText",
             "header:List-Unsubscribe",
+            ...hdrNames.map((n) => `header:${n}:asText`),
           ],
         );
 
-        const setups = args.setups as unknown as SetupLike[];
         const moves: Array<Record<string, unknown>> = [];
         const byDestination: Record<string, number> = {};
         let leftInInbox = 0;
@@ -1704,6 +1817,11 @@ export const model = {
           const listId = cleanListId(e["header:List-Id:asText"]);
           const listUnsub = typeof e["header:List-Unsubscribe"] === "string" &&
             (e["header:List-Unsubscribe"] as string).trim() !== "";
+          const headers: Record<string, string> = {};
+          for (const n of hdrNames) {
+            const v = e[`header:${n}:asText`];
+            if (typeof v === "string") headers[n.toLowerCase()] = v;
+          }
           const { dest } = classifyMessage(
             {
               from: addr,
@@ -1711,6 +1829,8 @@ export const model = {
               recipients,
               listId,
               isBulk: !!listId || listUnsub,
+              subject: typeof e.subject === "string" ? e.subject : null,
+              headers,
             },
             setups,
             pathIndex,
@@ -1741,7 +1861,7 @@ export const model = {
         });
         const handle = await context.writeResource("plan", args.name, {
           generatedAt: new Date().toISOString(),
-          sourceMailbox: inMailbox,
+          sourceMailbox: inMailbox ?? "", // "" = all-mail (no single source)
           scannedMessages: ids.length,
           moveCount: moves.length,
           leftInInbox,
@@ -1795,6 +1915,8 @@ export const model = {
           { inMailbox },
           cap,
         );
+        const setups = args.setups as unknown as SetupLike[];
+        const hdrNames = neededHeaders(setups);
         const emails = await getEmailBatch(
           session.apiUrl,
           apiToken,
@@ -1811,10 +1933,10 @@ export const model = {
             "keywords",
             "header:List-Id:asText",
             "header:List-Unsubscribe",
+            ...hdrNames.map((n) => `header:${n}:asText`),
           ],
         );
 
-        const setups = args.setups as unknown as SetupLike[];
         const coveredByCategory: Record<string, number> = {};
         let covered = 0;
         // Senders left in the inbox — aggregated by rule-pattern token, with the
@@ -1853,6 +1975,11 @@ export const model = {
               if (x.email) recipients.push(x.email.toLowerCase());
             }
           }
+          const headers: Record<string, string> = {};
+          for (const n of hdrNames) {
+            const v = e[`header:${n}:asText`];
+            if (typeof v === "string") headers[n.toLowerCase()] = v;
+          }
           const cls: Classification = from0?.email
             ? classifyMessage(
               {
@@ -1861,6 +1988,8 @@ export const model = {
                 recipients,
                 listId,
                 isBulk,
+                subject: typeof e.subject === "string" ? e.subject : null,
+                headers,
               },
               setups,
               pathIndex,
@@ -1961,6 +2090,54 @@ export const model = {
       },
     },
 
+    email_headers: {
+      description:
+        "Diagnostic (read-only): dump the full header list of sample messages matching a `from` filter to a 'headers' resource — for discovering a robust header to build a rule on.",
+      arguments: z.object({
+        from: z.string().describe(
+          "Sender substring to sample (JMAP from filter).",
+        ),
+        inMailbox: z.string().optional().describe("Restrict to a mailbox id."),
+        limit: z.number().int().positive().default(3),
+        name: z.string().default("headers").describe("Resource instance name."),
+      }),
+      execute: async (
+        args: { from: string; inMailbox?: string; limit: number; name: string },
+        context: Ctx,
+      ) => {
+        const apiToken = resolveReadToken(context.globalArgs);
+        const sessionUrl = context.globalArgs.sessionUrl ?? DEFAULT_SESSION_URL;
+        const session = await fetchSession(apiToken, sessionUrl);
+        const accountId = session.primaryAccounts[JMAP_MAIL_URN];
+        const filter: Record<string, unknown> = { from: args.from };
+        if (args.inMailbox) filter.inMailbox = args.inMailbox;
+        const ids = await queryIds(
+          session.apiUrl,
+          apiToken,
+          accountId,
+          filter,
+          args.limit,
+        );
+        const emails = await getEmailBatch(
+          session.apiUrl,
+          apiToken,
+          accountId,
+          ids,
+          ["subject", "from", "headers"],
+        );
+        const messages = emails.map((e) => ({
+          subject: typeof e.subject === "string" ? e.subject : null,
+          from: (e.from as Array<{ email?: string }>)?.[0]?.email ?? null,
+          headers: (e.headers as Array<{ name: string; value: string }>) ?? [],
+        }));
+        const handle = await context.writeResource("headers", args.name, {
+          query: args.from,
+          messages,
+        });
+        return { dataHandles: [handle], count: messages.length };
+      },
+    },
+
     email_move: {
       description:
         "Apply the sieve plan by moving messages to their destination folders (JMAP Email/set mailboxIds). DEFAULT DRY-RUN — moves nothing and just reports. `execute: true` performs the moves and REQUIRES a write-scoped token. Always gate behind a manual-approval step.",
@@ -1992,9 +2169,9 @@ export const model = {
         // Every remaining move is fileable — the target label is created if missing.
         // keepInbox = add the label but leave it in the source; otherwise it moves
         // out. forceMove removes the source even for keep rules (folder cleanup).
-        const wouldLabel = args.forceMove
-          ? 0
-          : moves.filter((m) => m.keepInbox).length;
+        const wouldLabel = args.labelOnly
+          ? moves.length
+          : (args.forceMove ? 0 : moves.filter((m) => m.keepInbox).length);
         const wouldMove = moves.length - wouldLabel;
         const foldersToCreate = [
           ...new Set(moves.filter((m) => !m.mailboxId).map((m) => m.category)),
@@ -2070,7 +2247,10 @@ export const model = {
               const patch: Record<string, boolean | null> = {
                 [`mailboxIds/${idByCat.get(m.category)!}`]: true,
               };
-              if ((!m.keepInbox || args.forceMove) && sourceMailbox) {
+              if (
+                !args.labelOnly && (!m.keepInbox || args.forceMove) &&
+                sourceMailbox
+              ) {
                 patch[`mailboxIds/${sourceMailbox}`] = null;
               }
               return [m.messageId, patch];

@@ -33,6 +33,7 @@ Tokens are marked sensitive — supply them from a vault, e.g.
 | `sieve_generate` | Config-driven fan-out that categorizes senders into (nested) folders and writes ready-to-paste Sieve scripts. |
 | `email_plan`     | Builds a message-id → destination plan (dry run) from the generated rules.                            |
 | `email_analyze`  | Read-only: analyzes a mailbox against the **current** rules and reports what would still be left in the inbox — the rule-candidate list that drives tuning. Moves nothing. |
+| `email_headers`  | Read-only diagnostic: dumps the raw headers of sample messages from a sender so you can find robust rule fields (e.g. `X-Business-Group` for receipts) instead of fuzzy subject matching. Moves nothing. |
 | `email_move`     | Applies the plan, moving messages into their target folders. Requires `writeToken` and `execute: true`. |
 
 Bulk detection uses the RFC 2369 / 8058 `List-*` headers, fetched via JMAP's
@@ -42,8 +43,9 @@ fallback category rather than swallowing the whole mailbox.
 ## Tokens & trust
 
 The two tokens map to two privilege levels. **Read** methods (`email_senders`,
-`sieve_generate`, `email_plan`, `email_analyze`, and the `valid-api-token` check)
-resolve their token as **`apiToken` first, then `writeToken`**; `email_move`
+`sieve_generate`, `email_plan`, `email_analyze`, `email_headers`, and the
+`valid-api-token` check) resolve their token as **`apiToken` first, then
+`writeToken`**; `email_move`
 always uses `writeToken` and never falls back to `apiToken`. That gives three
 setups:
 
@@ -62,7 +64,7 @@ rather than as an opaque JMAP 403 mid-batch.
 
 ## Reports
 
-All three are `scope: method` and render automatically after the run that
+All four are `scope: method` and render automatically after the run that
 produces their data:
 
 - **`@dmc/fastmail-audit`** — reads the `senders` artifacts from a run and
@@ -71,6 +73,9 @@ produces their data:
   `sieve_generate` run and reports rule coverage.
 - **`@dmc/fastmail-plan`** — renders the message-id → destination plan grouped
   by folder so you can review it before `email_move`.
+- **`@dmc/fastmail-analyze`** — reads the `analysis` artifact from an
+  `email_analyze` run and splits what's left in the inbox into rule candidates
+  vs. kept-by-design (exclude list / finance-protect / flag-only).
 
 ## Example
 
