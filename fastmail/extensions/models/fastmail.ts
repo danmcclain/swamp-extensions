@@ -663,7 +663,15 @@ function emitRule(spec: RuleSpec): string {
   const effects: string[] = [];
   // Flags first so they apply to the filed/kept copy.
   if (spec.markRead) effects.push(`  addflag "\\\\Seen";`);
-  if (spec.flag) effects.push(`  addflag "${spec.flag}";`);
+  if (spec.flag) {
+    // `$notify` is Fastmail-reserved: its push-notification engine fires off the
+    // `notify` VARIABLE (set "notify" "Y"), which Fastmail's own "Execute rule
+    // actions" stage converts into the `$notify` keyword + a push (and suppresses
+    // it on spam). Stamping the keyword directly with `addflag "$notify"` labels
+    // the message but doesn't trigger the push — so route through the variable.
+    if (spec.flag === "$notify") effects.push(`  set "notify" "Y";`);
+    else effects.push(`  addflag "${spec.flag}";`);
+  }
   if (spec.redirectTo) effects.push(`  redirect :copy "${spec.redirectTo}";`);
   if (spec.markSpam) {
     // This block runs AFTER Fastmail's spam-filing stage, so `set spam Y` would
@@ -1143,7 +1151,7 @@ type Ctx = {
  */
 export const model = {
   type: "@dmc/fastmail",
-  version: "2026.09.14.1",
+  version: "2026.09.15.1",
   globalArguments: GlobalArgsSchema,
   checks: {
     "valid-api-token": {
