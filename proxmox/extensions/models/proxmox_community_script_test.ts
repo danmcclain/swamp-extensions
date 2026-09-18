@@ -317,6 +317,31 @@ Deno.test("discoverApp parses app defaults from the ct script and recognized var
   assertEquals(vars.find((v) => v.name === "var_cpu")?.group, "Resources");
 });
 
+Deno.test("status uses serviceActiveCommand for non-systemd (Alpine/OpenRC)", async () => {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: {
+      ...baseArgs,
+      service: "valkey",
+      serviceActiveCommand: "rc-service valkey status",
+      versionCommand: "/usr/bin/valkey-server --version",
+    },
+  });
+
+  await withMockedCommand((_cmd, args) => {
+    const c = remoteCommand(args);
+    if (c.includes("pct status")) return sshOut("status: running");
+    if (c.includes("rc-service valkey status")) return sshOut("started", 0);
+    if (c.includes("systemctl")) return sshOut("not found", 127); // must NOT be used
+    if (c.includes("--version")) return sshOut("Valkey server v=9.0.4 sha=0:1");
+    return sshOut("");
+  }, () => model.methods.status.execute({}, asCtx(context)));
+
+  const data = getWrittenResources()[0].data;
+  assertEquals(data.serviceActive, true);
+  assertEquals(data.healthy, true);
+  assertEquals(data.installedVersion, "9.0.4");
+});
+
 // ---- previewInstall ---------------------------------------------------------
 
 Deno.test("previewInstall summarizes provisioning, steps, packages, downloads, and services", async () => {

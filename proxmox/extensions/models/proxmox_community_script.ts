@@ -43,6 +43,9 @@ const GlobalArgsSchema = z.object({
   service: z.string().min(1).optional().describe(
     'systemd unit inside the container to health-check, e.g. "forgejo". Required for every method except discoverApp/previewInstall.',
   ),
+  serviceActiveCommand: z.string().optional().describe(
+    'Command run inside the container (via `sh -c`) whose exit 0 means the service is up. Overrides the default `systemctl is-active <service>` — set this for non-systemd containers, e.g. Alpine/OpenRC: "rc-service <service> status".',
+  ),
   updateCommand: z.string().default("PHS_SILENT=1 /usr/bin/update").describe(
     "Command run inside the container (via `bash -lc`) to perform the update. Default runs the community-scripts helper in forced-silent mode (PHS_SILENT=1) so it never prompts. Add `var_ignore_os_mismatch=1` here to bypass the OS-version guard.",
   ),
@@ -300,11 +303,25 @@ async function isRunning(ga: ManageArgs, repoDir: string): Promise<boolean> {
   return /status:\s*running/i.test(r.out);
 }
 
-/** True when the configured systemd unit reports `active` inside the container. */
+/**
+ * True when the service is active inside the container. Uses
+ * `serviceActiveCommand` (exit 0 == active) when set — for non-systemd
+ * containers such as Alpine/OpenRC (`rc-service <svc> status`) — otherwise
+ * defaults to `systemctl is-active <service>`.
+ */
 async function isServiceActive(
   ga: ManageArgs,
   repoDir: string,
 ): Promise<boolean> {
+  if (ga.serviceActiveCommand) {
+    const r = await nodeExec(
+      ga,
+      repoDir,
+      `pct exec ${ga.ctid} -- sh -c ${shSingleQuote(ga.serviceActiveCommand)}`,
+      30,
+    );
+    return r.rc === 0;
+  }
   const r = await nodeExec(
     ga,
     repoDir,

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@dmc/proxmox"
-version: "2026.09.13.1"
+version: "2026.09.14.1"
 description: "Proxmox VE extensions — VM/LXC lifecycle operations, cloud image storage, and safe snapshot-guarded updates for community-scripts LXCs"
 repository: "https://github.com/danmcclain/swamp-extensions"
 labels:
