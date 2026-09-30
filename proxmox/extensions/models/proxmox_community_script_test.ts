@@ -47,8 +47,8 @@ type Ctx = Parameters<typeof model.methods.checkUpdate.execute>[1];
 const asCtx = (c: unknown): Ctx => c as unknown as Ctx;
 
 const baseArgs = {
-  sshModel: "infra-ssh",
-  node: "fort",
+  sshModel: "my-ssh",
+  node: "pve1",
   ctid: 601,
   appName: "TestApp",
   service: "testapp",
@@ -378,7 +378,7 @@ Deno.test("previewInstall summarizes provisioning, steps, packages, downloads, a
 Deno.test("discoverApp works with only `app` set (no node/ctid/service)", async () => {
   const { context, getWrittenResources } = createModelTestContext({
     globalArgs: {
-      sshModel: "infra-ssh",
+      sshModel: "my-ssh",
       appName: "TestApp",
       app: "testapp",
       ctScriptBaseUrl:
@@ -402,7 +402,7 @@ Deno.test("discoverApp works with only `app` set (no node/ctid/service)", async 
 
 Deno.test("manage methods require node/ctid/service", async () => {
   const { context } = createModelTestContext({
-    globalArgs: { sshModel: "infra-ssh", appName: "TestApp", app: "testapp" },
+    globalArgs: { sshModel: "my-ssh", appName: "TestApp", app: "testapp" },
   });
   await assertRejects(
     () => model.methods.status.execute({}, asCtx(context)),

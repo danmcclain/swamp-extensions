@@ -3,10 +3,10 @@ import { fetchWithCurl, resolveAuth, waitForTask } from "./lib/proxmox.ts";
 
 const GlobalArgs = z.object({
   apiUrl: z.string().describe(
-    "Proxmox API base URL (e.g., https://10.0.0.4:8006)",
+    "Proxmox API base URL (e.g., https://192.0.2.10:8006)",
   ),
   node: z.string().describe("Proxmox node name"),
-  storage: z.string().describe("Storage name to download into (e.g., mrrobot)"),
+  storage: z.string().describe("Storage name to download into (e.g., local)"),
   skipTlsVerify: z.boolean().default(true).describe(
     "Skip TLS certificate verification",
   ),
@@ -25,7 +25,7 @@ const ImageSchema = z.object({
   storage: z.string(),
   filename: z.string(),
   storageRef: z.string().describe(
-    "Storage reference for use in import-from (e.g., mrrobot:import/Rocky-9.qcow2)",
+    "Storage reference for use in import-from (e.g., local:import/Rocky-9.qcow2)",
   ),
   timestamp: z.string(),
 });
@@ -118,6 +118,10 @@ export const model = {
         const logs = [];
         const log = (msg) => logs.push(msg);
 
+        context.logger.info(
+          "Downloading image {filename} into storage {storage} on {node}",
+          { filename, storage, node },
+        );
         log(`Authenticating with Proxmox at ${apiUrl}`);
         const auth = await resolveAuth(context.globalArgs, context, {
           modelType: "@dmc/proxmox/storage",
@@ -148,6 +152,10 @@ export const model = {
             storageRef: existing.volid,
             timestamp: new Date().toISOString(),
           });
+          context.logger.info(
+            "Image {filename} already in storage {storage} at {storageRef}; download skipped",
+            { filename, storage, storageRef: existing.volid },
+          );
           return { dataHandles: [handle] };
         }
 
@@ -244,6 +252,10 @@ export const model = {
           storageRef,
           timestamp: new Date().toISOString(),
         });
+        context.logger.info(
+          "Downloaded image {filename} into storage {storage} at {storageRef}",
+          { filename, storage, storageRef },
+        );
         return { dataHandles: [handle] };
       },
     },

@@ -171,6 +171,10 @@ export const extension = {
           sshKeys,
           ipConfig,
         } = args;
+        context.logger.info(
+          "Creating VM {vmName} on {node} from image {importFrom}",
+          { vmName, node, importFrom },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -297,6 +301,11 @@ export const extension = {
           logs: logs.join("\n"),
           timestamp: new Date().toISOString(),
         });
+        context.logger.info("Created VM {vmName} with vmid {vmid} on {node}", {
+          vmName,
+          vmid,
+          node,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -317,6 +326,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, ciUser, sshKeys, ipConfig } = args;
+        context.logger.info("Updating cloud-init on VM {vmName} on {node}", {
+          vmName,
+          node,
+        });
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -370,6 +383,10 @@ export const extension = {
           logs: logs.join("\n"),
           timestamp: new Date().toISOString(),
         });
+        context.logger.info("Updated cloud-init on VM {vmName} (vmid {vmid})", {
+          vmName,
+          vmid: vm.vmid,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -386,6 +403,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, snapname, description } = args;
+        context.logger.info(
+          "Creating snapshot {snapname} of VM {vmName} on {node}",
+          { snapname, vmName, node },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -442,6 +463,10 @@ export const extension = {
           throw new Error(`Snapshot creation failed: ${taskResult.exitstatus}`);
         }
         log(`Snapshot "${snapname}" created (${taskResult.pollCount} polls)`);
+        context.logger.info(
+          "Created snapshot {snapname} of VM {vmName} (vmid {vmid})",
+          { snapname, vmName, vmid: vm.vmid },
+        );
 
         const handle = await context.writeResource("vm", `${vmName}-ops`, {
           vmid: vm.vmid,
@@ -463,6 +488,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, snapname } = args;
+        context.logger.info(
+          "Deleting snapshot {snapname} of VM {vmName} on {node}",
+          { snapname, vmName, node },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -514,6 +543,10 @@ export const extension = {
           throw new Error(`Snapshot deletion failed: ${taskResult.exitstatus}`);
         }
         log(`Snapshot "${snapname}" deleted (${taskResult.pollCount} polls)`);
+        context.logger.info(
+          "Deleted snapshot {snapname} of VM {vmName} (vmid {vmid})",
+          { snapname, vmName, vmid: vm.vmid },
+        );
 
         const handle = await context.writeResource("vm", `${vmName}-ops`, {
           vmid: vm.vmid,
@@ -542,6 +575,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, disk, targetStorage, deleteSource } = args;
+        context.logger.info(
+          "Moving disk {disk} of VM {vmName} to storage {targetStorage}",
+          { disk, vmName, targetStorage },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -607,6 +644,10 @@ export const extension = {
         log(
           `Disk "${disk}" moved to "${targetStorage}" (${taskResult.pollCount} polls)`,
         );
+        context.logger.info(
+          "Moved disk {disk} of VM {vmName} (vmid {vmid}) to storage {targetStorage}",
+          { disk, vmName, vmid: vm.vmid, targetStorage },
+        );
 
         const handle = await context.writeResource("vm", `${vmName}-ops`, {
           vmid: vm.vmid,
@@ -627,6 +668,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName } = args;
+        context.logger.info("Listing snapshots of VM {vmName} on {node}", {
+          vmName,
+          node,
+        });
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
         const { ticket, csrfToken } = auth;
@@ -669,6 +714,10 @@ export const extension = {
           logs: `Snapshots: ${names.join(", ") || "(none)"}`,
           timestamp: new Date().toISOString(),
         });
+        context.logger.info("Listed {count} snapshots of VM {vmName}", {
+          count: names.length,
+          vmName,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -681,6 +730,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { ctName } = args;
+        context.logger.info("Stopping LXC {ctName} on {node}", {
+          ctName,
+          node,
+        });
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -731,6 +784,10 @@ export const extension = {
           }
           log(`LXC ${ct.vmid} stopped (${taskResult.pollCount} polls)`);
         }
+        context.logger.info("LXC {ctName} (vmid {vmid}) is stopped", {
+          ctName,
+          vmid: ct.vmid,
+        });
 
         const handle = await context.writeResource("vm", `${ctName}-ops`, {
           vmid: ct.vmid,
@@ -751,6 +808,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { ctName } = args;
+        context.logger.info("Starting LXC {ctName} on {node}", {
+          ctName,
+          node,
+        });
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -802,6 +863,10 @@ export const extension = {
           }
           log(`LXC ${ct.vmid} started (${taskResult.pollCount} polls)`);
         }
+        context.logger.info("LXC {ctName} (vmid {vmid}) is running", {
+          ctName,
+          vmid: ct.vmid,
+        });
 
         const handle = await context.writeResource("vm", `${ctName}-ops`, {
           vmid: ct.vmid,
@@ -830,6 +895,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { ctName, volume, targetStorage, deleteSource } = args;
+        context.logger.info(
+          "Moving volume {volume} of LXC {ctName} to storage {targetStorage}",
+          { volume, ctName, targetStorage },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -896,6 +965,10 @@ export const extension = {
         log(
           `Volume "${volume}" moved to "${targetStorage}" (${taskResult.pollCount} polls)`,
         );
+        context.logger.info(
+          "Moved volume {volume} of LXC {ctName} (vmid {vmid}) to storage {targetStorage}",
+          { volume, ctName, vmid: ct.vmid, targetStorage },
+        );
 
         const handle = await context.writeResource("vm", `${ctName}-ops`, {
           vmid: ct.vmid,
@@ -919,6 +992,11 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, kind } = args;
+        context.logger.info("Reading {kind} config of {vmName} on {node}", {
+          kind,
+          vmName,
+          node,
+        });
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
         const { ticket, csrfToken } = auth;
@@ -966,6 +1044,15 @@ export const extension = {
           logs: JSON.stringify(config, null, 2),
           timestamp: new Date().toISOString(),
         });
+        context.logger.info(
+          "Read {kind} config of {vmName} (vmid {vmid}): {keyCount} keys",
+          {
+            kind,
+            vmName,
+            vmid: entity.vmid,
+            keyCount: Object.keys(config ?? {}).length,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -991,6 +1078,10 @@ export const extension = {
         const node = sourceNode ?? defaultNode;
         const logs: string[] = [];
         const log = (msg: string) => logs.push(msg);
+        context.logger.info(
+          "Migrating VM {vmName} from {sourceNode} to {target} (online={online})",
+          { vmName, sourceNode: node, target, online },
+        );
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
         const { ticket, csrfToken } = auth;
@@ -1069,6 +1160,10 @@ export const extension = {
           logs: logs.join("\n"),
           timestamp: new Date().toISOString(),
         });
+        context.logger.info(
+          "Migrated VM {vmName} (vmid {vmid}) from {sourceNode} to {target}",
+          { vmName, vmid: vm.vmid, sourceNode: node, target },
+        );
         return { dataHandles: [handle] };
       },
     },

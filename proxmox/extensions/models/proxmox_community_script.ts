@@ -8,7 +8,7 @@
  * rollback). Because the PVE API cannot run a command *inside* an LXC, shell
  * access to the node is required. Rather than opening its own SSH connection,
  * this model delegates to a `@swamp/ssh` model instance (named by `sshModel`,
- * default `infra-ssh`): it shells out to `swamp model method run <sshModel> exec`
+ * required): it shells out to `swamp model method run <sshModel> exec`
  * so SSH transport, auth, and host-key handling live in one place.
  *
  * Prerequisites for the consumer:
@@ -24,15 +24,23 @@
  */
 import { z } from "npm:zod@4";
 
+/** Minimal LogTape-style logger supplied by swamp as `context.logger`. */
+type Logger = {
+  debug(message: string, props?: Record<string, unknown>): void;
+  info(message: string, props?: Record<string, unknown>): void;
+  warn(message: string, props?: Record<string, unknown>): void;
+  error(message: string, props?: Record<string, unknown>): void;
+};
+
 const SWAMP_BIN = Deno.env.get("SWAMP_BIN") ?? "swamp";
 const RC_SENTINEL = "__SWAMP_RC__";
 
 const GlobalArgsSchema = z.object({
-  sshModel: z.string().default("infra-ssh").describe(
-    "Name of the @swamp/ssh model instance used to reach the PVE node",
+  sshModel: z.string().min(1).describe(
+    "Name of the @swamp/ssh model instance used to reach the PVE node (required, no default)",
   ),
   node: z.string().min(1).optional().describe(
-    'Fleet host name (a host in the sshModel) of the PVE hypervisor running the container, e.g. "fort". Required for every method except discoverApp/previewInstall (which only read the community-scripts sources).',
+    'Fleet host name (a host in the sshModel) of the PVE hypervisor running the container, e.g. "pve1". Required for every method except discoverApp/previewInstall (which only read the community-scripts sources).',
   ),
   ctid: z.number().int().positive().optional().describe(
     "LXC container ID, e.g. 601. Required for every method except discoverApp/previewInstall.",
@@ -890,7 +898,15 @@ function snapshotName(): string {
 /** Model definition: manage a PVE community-scripts LXC with safe updates. */
 export const model = {
   type: "@dmc/proxmox/community-script",
-  version: "2026.09.13.1",
+  version: "2026.09.30.1",
+  upgrades: [
+    {
+      toVersion: "2026.09.30.1",
+      description:
+        "Add osManaged and packageName (defaulted); sshModel is now required (no default)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     "state": {
@@ -940,6 +956,7 @@ export const model = {
       execute: async (_args: unknown, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -947,6 +964,10 @@ export const model = {
         ) => Promise<unknown>;
       }) => {
         const ga = requireManage(context.globalArgs);
+        context.logger.info("Checking status of container {ctid} on {node}", {
+          ctid: ga.ctid,
+          node: ga.node,
+        });
         const health = await checkHealth(ga, context.repoDir);
         const version = await readVersion(ga, context.repoDir);
         const upd = await computeUpdate(ga, version, context.repoDir);
@@ -969,6 +990,16 @@ export const model = {
           snapshots,
           checkedAt: new Date().toISOString(),
         });
+        context.logger.info(
+          "Status of container {ctid} on {node}: healthy={healthy} running={running} version={version}",
+          {
+            ctid: ga.ctid,
+            node: ga.node,
+            healthy: health.healthy,
+            running: health.running,
+            version,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -979,6 +1010,7 @@ export const model = {
       execute: async (_args: unknown, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -989,6 +1021,9 @@ export const model = {
         if (!ga.app) {
           throw new Error("`app` global arg is required for discoverApp");
         }
+        context.logger.info("Discovering variables for app {app}", {
+          app: ga.app,
+        });
         const { appDefaults, recognizedVars, varDocs } = await discoverVars(
           ga.ctScriptBaseUrl,
           ga.app,
@@ -1008,6 +1043,10 @@ export const model = {
           vars,
           checkedAt: new Date().toISOString(),
         });
+        context.logger.info(
+          "Discovered {varCount} recognized variables for app {app}",
+          { varCount: recognizedVars.length, app: ga.app },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1018,6 +1057,7 @@ export const model = {
       execute: async (_args: unknown, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -1028,6 +1068,7 @@ export const model = {
         if (!ga.app) {
           throw new Error("`app` global arg is required for previewInstall");
         }
+        context.logger.info("Previewing install of app {app}", { app: ga.app });
         const s = await summarizeInstall(ga.ctScriptBaseUrl, ga.app);
         const handle = await context.writeResource("preview", "preview", {
           name: ga.appName,
@@ -1035,6 +1076,14 @@ export const model = {
           ...s,
           checkedAt: new Date().toISOString(),
         });
+        context.logger.info(
+          "Previewed install of app {app}: {stepCount} steps, {packageCount} packages",
+          {
+            app: ga.app,
+            stepCount: s.steps.length,
+            packageCount: s.packages.length,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1049,6 +1098,7 @@ export const model = {
       execute: async (args: { force: boolean }, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -1063,9 +1113,15 @@ export const model = {
           );
         }
         const logs: string[] = [];
-        const log = (m: string) =>
+        const log = (m: string) => {
           logs.push(`[${new Date().toISOString()}] ${m}`);
+          context.logger.info("{message}", { message: m });
+        };
         const scriptUrl = `${ga.ctScriptBaseUrl}/ct/${ga.app}.sh`;
+        context.logger.info(
+          "Installing app {app} as container {ctid} on {node}",
+          { app: ga.app, ctid: ga.ctid, node: ga.node },
+        );
 
         // 1. Refuse to touch an existing container.
         const pre = await nodeExec(ga, repoDir, `pct status ${ga.ctid}`, 30);
@@ -1153,6 +1209,10 @@ export const model = {
         });
 
         if (!created || res.rc !== 0) {
+          context.logger.error(
+            "Install of {app} did not produce container {ctid} (install rc {rc}, created={created})",
+            { app: ga.app, ctid: ga.ctid, rc: res.rc, created },
+          );
           throw new Error(
             `Install of ${ga.app} did not produce a container at ctid ${ga.ctid} (install rc ${res.rc}, created=${created}). Output tail: ${
               res.out.slice(-800)
@@ -1160,6 +1220,10 @@ export const model = {
           );
         }
         if (!health.healthy) {
+          context.logger.error(
+            "Installed {app} as container {ctid} but it is not healthy",
+            { app: ga.app, ctid: ga.ctid },
+          );
           throw new Error(
             `Installed ${ga.app} at ctid ${ga.ctid} but it is not healthy (running=${health.running} service=${health.serviceActive} http=${
               health.httpStatus ?? "n/a"
@@ -1168,6 +1232,16 @@ export const model = {
             }]`,
           );
         }
+        context.logger.info(
+          "Installed app {app} as container {ctid} on {node}: healthy={healthy} version={version}",
+          {
+            app: ga.app,
+            ctid: ga.ctid,
+            node: ga.node,
+            healthy: health.healthy,
+            version,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1178,6 +1252,7 @@ export const model = {
       execute: async (_args: unknown, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -1185,6 +1260,10 @@ export const model = {
         ) => Promise<unknown>;
       }) => {
         const ga = requireManage(context.globalArgs);
+        context.logger.info(
+          "Checking for updates to container {ctid} on {node}",
+          { ctid: ga.ctid, node: ga.node },
+        );
         const version = await readVersion(ga, context.repoDir);
         const upd = await computeUpdate(ga, version, context.repoDir);
         const handle = await context.writeResource(
@@ -1200,6 +1279,16 @@ export const model = {
             updateAvailable: upd.updateAvailable,
             osManaged: upd.osManaged,
             checkedAt: new Date().toISOString(),
+          },
+        );
+        context.logger.info(
+          "Update check for container {ctid} on {node}: installed={installed} latest={latest} updateAvailable={updateAvailable}",
+          {
+            ctid: ga.ctid,
+            node: ga.node,
+            installed: upd.installedVersion,
+            latest: upd.latestVersion,
+            updateAvailable: upd.updateAvailable,
           },
         );
         return { dataHandles: [handle] };
@@ -1221,6 +1310,7 @@ export const model = {
         context: {
           globalArgs: GlobalArgs;
           repoDir: string;
+          logger: Logger;
           writeResource: (
             spec: string,
             instance: string,
@@ -1233,7 +1323,12 @@ export const model = {
         const logs: string[] = [];
         const log = (m: string) => {
           logs.push(`[${new Date().toISOString()}] ${m}`);
+          context.logger.info("{message}", { message: m });
         };
+        context.logger.info(
+          "Starting safe update of {appName} (container {ctid} on {node})",
+          { appName: ga.appName, ctid: ga.ctid, node: ga.node },
+        );
 
         const writeResult = (data: z.infer<typeof UpdateResultSchema>) =>
           context.writeResource("update", "update", data);
@@ -1266,6 +1361,10 @@ export const model = {
             logs: logs.join("\n"),
             timestamp: new Date().toISOString(),
           });
+          context.logger.error(
+            "Refusing to update {appName}: not healthy before the update",
+            { appName: ga.appName },
+          );
           throw new Error(
             `Refusing to update: ${ga.appName} is not healthy before the update (running=${before.running} service=${before.serviceActive} http=${
               before.httpStatus ?? "n/a"
@@ -1287,6 +1386,10 @@ export const model = {
           120,
         );
         if (snapRes.rc !== 0) {
+          context.logger.error(
+            "Snapshot {snapshot} of container {ctid} failed (rc {rc})",
+            { snapshot: snap, ctid: ga.ctid, rc: snapRes.rc },
+          );
           throw new Error(
             `Snapshot failed (rc ${snapRes.rc}): ${snapRes.out.slice(-800)}`,
           );
@@ -1373,6 +1476,15 @@ export const model = {
             logs: logs.join("\n"),
             timestamp: new Date().toISOString(),
           });
+          context.logger.info(
+            "Safe update of {appName} finished: outcome={outcome} version={beforeVersion} -> {afterVersion}",
+            {
+              appName: ga.appName,
+              outcome: versionChanged ? "updated" : "no-change",
+              beforeVersion,
+              afterVersion,
+            },
+          );
           return { dataHandles: [handle] };
         }
 
@@ -1405,12 +1517,20 @@ export const model = {
           timestamp: new Date().toISOString(),
         });
         if (!rolledBack) {
+          context.logger.error(
+            "Update of {appName} failed and rollback to {snapshot} failed; manual intervention needed",
+            { appName: ga.appName, snapshot: snap },
+          );
           throw new Error(
             `Update failed AND rollback failed. Container ${ga.ctid} may be stopped — MANUAL INTERVENTION NEEDED. Snapshot ${snap} is intact. Detail: ${
               failure ?? "unknown"
             } [data: ${(handle as { name?: string })?.name}]`,
           );
         }
+        context.logger.warn(
+          "Update of {appName} failed validation; rolled back to {snapshot} (healthy after rollback: {healthy})",
+          { appName: ga.appName, snapshot: snap, healthy: restored.healthy },
+        );
         throw new Error(
           `${ga.appName} update failed validation and was rolled back to snapshot ${snap} (post-rollback healthy=${restored.healthy}). [data: ${
             (handle as { name?: string })?.name
@@ -1429,6 +1549,7 @@ export const model = {
       execute: async (args: { snapshot?: string }, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -1438,8 +1559,14 @@ export const model = {
         const ga = requireManage(context.globalArgs);
         const repoDir = context.repoDir;
         const logs: string[] = [];
-        const log = (m: string) =>
+        const log = (m: string) => {
           logs.push(`[${new Date().toISOString()}] ${m}`);
+          context.logger.info("{message}", { message: m });
+        };
+        context.logger.info(
+          "Rolling back container {ctid} on {node}",
+          { ctid: ga.ctid, node: ga.node },
+        );
 
         let target = args.snapshot;
         if (!target) {
@@ -1447,6 +1574,10 @@ export const model = {
           const pre = snaps.filter((s) => s.name.startsWith("preupdate-"))
             .sort();
           if (pre.length === 0) {
+            context.logger.error(
+              "No preupdate-* snapshot found for container {ctid}",
+              { ctid: ga.ctid },
+            );
             throw new Error(
               `No preupdate-* snapshot found for ctid ${ga.ctid}; pass an explicit snapshot name`,
             );
@@ -1461,6 +1592,10 @@ export const model = {
           log,
         );
         if (!rolledBack) {
+          context.logger.error(
+            "Rollback of container {ctid} to {snapshot} failed",
+            { ctid: ga.ctid, snapshot: target },
+          );
           throw new Error(
             `Rollback to ${target} failed: ${failure ?? "unknown"}`,
           );
@@ -1485,6 +1620,10 @@ export const model = {
           snapshots: await listSnapshots(ga, repoDir),
           checkedAt: new Date().toISOString(),
         });
+        context.logger.info(
+          "Rolled back container {ctid} to {snapshot}: healthy={healthy}",
+          { ctid: ga.ctid, snapshot: target, healthy: health.healthy },
+        );
         return { dataHandles: [handle] };
       },
     },

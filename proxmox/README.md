@@ -40,7 +40,7 @@ instance == one container.
 Because the Proxmox API cannot run a command _inside_ an LXC, this model reaches
 the hypervisor node's shell through a
 [`@swamp/ssh`](https://swamp.club/extensions/@swamp/ssh) instance (named by
-`sshModel`, default `infra-ssh`) rather than opening its own connection — it
+`sshModel`, required) rather than opening its own connection — it
 shells out to `swamp model method run <sshModel> exec`. This requires the
 `swamp` binary on PATH (override with `SWAMP_BIN`) and a configured `@swamp/ssh`
 instance whose host list includes the PVE node.
@@ -182,7 +182,7 @@ swamp model method run forgejo safeUpdate
 ```bash
 # Configure the instance: app slug + the ctid you want + provisioning vars
 swamp model create @dmc/proxmox/community-script my-forgejo \
-  --global-arg node=fort --global-arg ctid=610 \
+  --global-arg sshModel=my-ssh --global-arg node=pve1 --global-arg ctid=610 \
   --global-arg app=forgejo --global-arg service=forgejo \
   --global-arg 'installVars={"var_cpu":"2","var_ram":"2048","var_disk":"10"}'
 
