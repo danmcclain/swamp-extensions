@@ -20,7 +20,8 @@ required. The resulting `storageRef` can be passed directly to
 **Checks:**
 
 - `storage-target-exists` (`live`) — verifies the target storage exists and is
-  active on the node before `downloadImage` runs
+  active on the node before `downloadImage` runs (skip with
+  `--skip-check storage-target-exists`)
 
 **Methods:**
 
@@ -40,10 +41,10 @@ instance == one container.
 Because the Proxmox API cannot run a command _inside_ an LXC, this model reaches
 the hypervisor node's shell through a
 [`@swamp/ssh`](https://swamp.club/extensions/@swamp/ssh) instance (named by
-`sshModel`, default `infra-ssh`) rather than opening its own connection — it
-shells out to `swamp model method run <sshModel> exec`. This requires the
-`swamp` binary on PATH (override with `SWAMP_BIN`) and a configured `@swamp/ssh`
-instance whose host list includes the PVE node.
+`sshModel`, required) rather than opening its own connection — it shells out to
+`swamp model method run <sshModel> exec`. This requires the `swamp` binary on
+PATH (override with `SWAMP_BIN`) and a configured `@swamp/ssh` instance whose
+host list includes the PVE node.
 
 **Key global arguments:** `node` (PVE host), `ctid` (LXC id), `service` (systemd
 unit to health-check), optional `versionCommand` /`releaseApiUrl` (enable update
@@ -75,6 +76,29 @@ detection), optional `healthUrl` (end-to-end HTTP readiness probe).
 - `rollback` — roll back to a named snapshot, or the most recent `preupdate-*`
   one
 
+**Pre-flight checks** (run before the mutating methods; `status`, `discoverApp`,
+`previewInstall` and `checkUpdate` have none):
+
+| Check                 | Label    | Methods                             | Verifies                                                                   |
+| --------------------- | -------- | ----------------------------------- | -------------------------------------------------------------------------- |
+| `manage-args-present` | `policy` | `install`, `safeUpdate`, `rollback` | `node`, `ctid` and `service` are set                                       |
+| `install-app-present` | `policy` | `install`                           | `app` is set                                                               |
+| `node-reachable`      | `live`   | `install`, `safeUpdate`, `rollback` | the node answers over the ssh model and has `pct`                          |
+| `ctid-free`           | `live`   | `install`                           | no container or VM uses the ctid in the cluster (passes with `force=true`) |
+| `container-exists`    | `live`   | `safeUpdate`                        | `pct status` answers for the ctid (the app need not be healthy)            |
+| `snapshot-available`  | `live`   | `rollback`                          | the named snapshot, or at least one `preupdate-*` snapshot, exists         |
+
+The `rollback` checks never need the container to be running or healthy: a
+broken container is the reason to roll back. Skip checks with
+`--skip-check <name>`, `--skip-check-label <policy|live>` or `--skip-checks`.
+
+`install-app-present`, `ctid-free` and `snapshot-available` test a precondition
+of one specific method that a managed container normally fails (its ctid is
+taken, it has no `app`, it may have no retained snapshot). They are evaluated
+only when their method is selected — a real run, or
+`swamp model validate <name> --method <method>` — and pass under a plain
+`swamp model validate <name>`.
+
 ### `@keeb/proxmox/vm` extension
 
 Extends `@keeb/proxmox/vm`, the base QEMU VM model from `@keeb/proxmox`, with
@@ -104,8 +128,7 @@ provisioning, snapshot, disk/node migration, and LXC container control.
   (state transfer only, no disk copy); accepts an optional `sourceNode` override
   when the VM has already moved off the model's default node
   - pre-flight check `cluster-has-migration-target` (`live`) — verifies the node
-    is part of a multi-node cluster before migrating. Checks only see global
-    connection args, not per-call arguments, so this cannot validate the
+    is part of a multi-node cluster before migrating. It does not validate the
     specific `target` node name or that it shares storage with the VM — those
     failures still surface from the Proxmox API call itself.
 
@@ -117,6 +140,27 @@ provisioning, snapshot, disk/node migration, and LXC container control.
 **Inspection:**
 
 - `getConfig` — read raw config for a QEMU VM or LXC container
+
+**Pre-flight checks** (`listSnapshots` and `getConfig` are read-only and have
+none). Checks read the raw per-call args from swamp's `unresolvedMethodArgs`; if
+an arg is absent or still an unresolved expression, the check passes and the
+method's own validation decides.
+
+| Check                          | Label    | Methods                                                                                                           | Verifies                                                      |
+| ------------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `guest-exists`                 | `live`   | `configureCloudInit`, `snapshot`, `deleteSnapshot`, `moveDisk`, `migrate`, `lxcStop`, `lxcStart`, `lxcMoveVolume` | the VM or LXC exists on the node (`sourceNode` for `migrate`) |
+| `vmid-free`                    | `live`   | `createFromImage`                                                                                                 | an explicit `vmid` is unused in the cluster                   |
+| `target-storage-exists`        | `live`   | `createFromImage`, `moveDisk`, `lxcMoveVolume`                                                                    | the target storage exists and is active on the node           |
+| `snapshot-name-valid`          | `policy` | `snapshot`                                                                                                        | the name follows the Proxmox rule and is not `current`        |
+| `snapshot-name-free`           | `live`   | `snapshot`                                                                                                        | the VM has no snapshot with this name                         |
+| `snapshot-exists`              | `live`   | `deleteSnapshot`                                                                                                  | the snapshot to delete exists                                 |
+| `cluster-has-migration-target` | `live`   | `migrate`                                                                                                         | the node is in a multi-node cluster                           |
+
+Skip checks with `--skip-check <name>`, `--skip-check-label <policy|live>` or
+`--skip-checks`. `vmid-free` and `cluster-has-migration-target` are evaluated
+only when their method is selected (a real run or `validate --method`); a plain
+`swamp model validate <name>` passes them, since an existing VM's own vmid is
+taken and a standalone node has no migration target.
 
 ## Usage
 
@@ -182,7 +226,7 @@ swamp model method run forgejo safeUpdate
 ```bash
 # Configure the instance: app slug + the ctid you want + provisioning vars
 swamp model create @dmc/proxmox/community-script my-forgejo \
-  --global-arg node=fort --global-arg ctid=610 \
+  --global-arg sshModel=my-ssh --global-arg node=pve1 --global-arg ctid=610 \
   --global-arg app=forgejo --global-arg service=forgejo \
   --global-arg 'installVars={"var_cpu":"2","var_ram":"2048","var_disk":"10"}'
 

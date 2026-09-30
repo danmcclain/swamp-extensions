@@ -2,13 +2,13 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   createModelTestContext,
   withMockedCommand,
-} from "jsr:@systeminit/swamp-testing";
+} from "jsr:@systeminit/swamp-testing@0.20260604.20";
 import { model } from "./proxmox_storage.ts";
 
 const globalArgs = {
   apiUrl: "https://proxmox.test:8006",
   node: "pve",
-  storage: "mrrobot",
+  storage: "local",
   skipTlsVerify: true,
   ticket: "test-ticket",
   csrfToken: "test-csrf",
@@ -28,7 +28,7 @@ Deno.test("downloadImage skips the download when the file already exists", async
   });
 
   const { calls } = await withMockedCommand(
-    [httpOutput(200, { data: [{ volid: "mrrobot:import/rocky10.qcow2" }] })],
+    [httpOutput(200, { data: [{ volid: "local:import/rocky10.qcow2" }] })],
     () =>
       model.methods.downloadImage.execute(
         {
@@ -42,7 +42,7 @@ Deno.test("downloadImage skips the download when the file already exists", async
   assertEquals(calls.length, 1, "should only check content, never download");
   assertEquals(
     getWrittenResources()[0].data.storageRef,
-    "mrrobot:import/rocky10.qcow2",
+    "local:import/rocky10.qcow2",
   );
 });
 
@@ -56,7 +56,7 @@ Deno.test("downloadImage downloads and records the volid when the file is new", 
       httpOutput(200, { data: [] }), // initial existence check: not found
       httpOutput(200, { data: "UPID:pve:00000001:qmdownload:" }), // start download
       httpOutput(200, { data: { status: "stopped", exitstatus: "OK" } }), // task poll
-      httpOutput(200, { data: [{ volid: "mrrobot:import/new.qcow2" }] }), // final content list
+      httpOutput(200, { data: [{ volid: "local:import/new.qcow2" }] }), // final content list
     ],
     () =>
       model.methods.downloadImage.execute(
@@ -67,7 +67,7 @@ Deno.test("downloadImage downloads and records the volid when the file is new", 
 
   assertEquals(
     getWrittenResources()[0].data.storageRef,
-    "mrrobot:import/new.qcow2",
+    "local:import/new.qcow2",
   );
 });
 
@@ -86,7 +86,7 @@ Deno.test("downloadImage treats Proxmox's 'refusing to override existing file' a
           exitstatus: "refusing to override existing file",
         },
       }),
-      httpOutput(200, { data: [{ volid: "mrrobot:import/race.qcow2" }] }),
+      httpOutput(200, { data: [{ volid: "local:import/race.qcow2" }] }),
     ],
     () =>
       model.methods.downloadImage.execute(
@@ -97,7 +97,7 @@ Deno.test("downloadImage treats Proxmox's 'refusing to override existing file' a
 
   assertEquals(
     getWrittenResources()[0].data.storageRef,
-    "mrrobot:import/race.qcow2",
+    "local:import/race.qcow2",
   );
 });
 
@@ -156,4 +156,13 @@ Deno.test("storage-target-exists check fails when the storage is inactive", asyn
   );
 
   assertEquals(result.pass, false);
+});
+
+Deno.test("every method is covered by a check", () => {
+  for (const method of Object.keys(model.methods)) {
+    const covering = Object.values(model.checks).filter((c) =>
+      c.appliesTo.includes(method)
+    );
+    assertEquals(covering.length > 0, true, `${method} has no check`);
+  }
 });

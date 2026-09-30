@@ -73,16 +73,337 @@ async function resolveLxcId(
   return ct;
 }
 
+// ---- Pre-flight checks ------------------------------------------------------
+//
+// swamp runs these before the mutating methods they list in `appliesTo`. They
+// are cheap, read-only API probes. Labels: `policy` = static rule about the
+// inputs (no network); `live` = asks the Proxmox API. A user skips them with
+// `--skip-check <name>`, `--skip-check-label <label>` or `--skip-checks`.
+//
+// Checks cannot see the parsed method args. They read the raw ones from
+// `context.unresolvedMethodArgs`. When an arg is absent or is still an
+// unresolved ${{ }} expression, the check passes and leaves the decision to
+// the method's own validation.
+
+/** The part of swamp's check context these checks read. */
+interface VmCheckContext {
+  globalArgs: {
+    apiUrl: string;
+    node: string;
+    skipTlsVerify?: boolean;
+    ticket?: string;
+    csrfToken?: string;
+  };
+  methodName: string;
+  /** Method args merged over global args (raw, before expression resolution). */
+  unresolvedMethodArgs?: Record<string, unknown>;
+}
+
+/**
+ * True only when `method` is the method being run (or validated with
+ * `--method`). A plain `swamp model validate <name>` runs every check with an
+ * empty methodName; method-specific preconditions that contradict an existing
+ * guest's normal state (its vmid is taken, a standalone node) must pass there.
+ */
+function selected(ctx: { methodName?: string }, method: string): boolean {
+  return ctx.methodName === method;
+}
+
+/** Result shape swamp expects from a check. */
+interface CheckResult {
+  pass: boolean;
+  errors?: string[];
+}
+
+type ApiGet =
+  | { ok: true; data: unknown }
+  | { ok: false; errors: string[] };
+
+const SKIP_LIVE_HINT = "Fix the cause, or skip with --skip-check-label live.";
+
+/** A string method arg, or undefined when absent or an unresolved expression. */
+function stringArg(ctx: VmCheckContext, name: string): string | undefined {
+  const v = ctx.unresolvedMethodArgs?.[name];
+  return typeof v === "string" && v.length > 0 && !v.includes("${{")
+    ? v
+    : undefined;
+}
+
+/** GET a Proxmox API path for a check. Never throws; failures come back as `ok: false`. */
+async function checkApiGet(
+  ctx: VmCheckContext,
+  path: string,
+  what: string,
+): Promise<ApiGet> {
+  try {
+    const { apiUrl, skipTlsVerify } = ctx.globalArgs;
+    const auth = await resolveAuth(ctx.globalArgs, ctx, authOpts());
+    const response = await fetchWithCurl(`${apiUrl}/api2/json${path}`, {
+      method: "GET",
+      headers: {
+        "Cookie": `PVEAuthCookie=${auth.ticket}`,
+        "CSRFPreventionToken": auth.csrfToken,
+      },
+      skipTlsVerify,
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        errors: [
+          `Could not read ${what}: ${response.status} ${await response
+            .text()}. ${SKIP_LIVE_HINT}`,
+        ],
+      };
+    }
+    return { ok: true, data: (await response.json()).data };
+  } catch (err) {
+    return {
+      ok: false,
+      errors: [
+        `Could not read ${what}: ${(err as Error).message}. ${SKIP_LIVE_HINT}`,
+      ],
+    };
+  }
+}
+
+type GuestKind = "qemu" | "lxc";
+type Guest = { vmid: number; name?: string; status?: string };
+
+/** The guest-taking methods: what kind of guest, and which arg holds its name. */
+const GUEST_METHODS: Record<string, { kind: GuestKind; nameArg: string }> = {
+  configureCloudInit: { kind: "qemu", nameArg: "vmName" },
+  snapshot: { kind: "qemu", nameArg: "vmName" },
+  deleteSnapshot: { kind: "qemu", nameArg: "vmName" },
+  moveDisk: { kind: "qemu", nameArg: "vmName" },
+  migrate: { kind: "qemu", nameArg: "vmName" },
+  lxcStop: { kind: "lxc", nameArg: "ctName" },
+  lxcStart: { kind: "lxc", nameArg: "ctName" },
+  lxcMoveVolume: { kind: "lxc", nameArg: "ctName" },
+};
+
+type FindGuest =
+  | { ok: true; guest: Guest }
+  | { ok: false; errors: string[] };
+
+/** Find a VM or LXC by name on a node through the API. */
+async function findGuest(
+  ctx: VmCheckContext,
+  kind: GuestKind,
+  name: string,
+  node: string,
+): Promise<FindGuest> {
+  const res = await checkApiGet(
+    ctx,
+    `/nodes/${node}/${kind}`,
+    `the ${kind === "qemu" ? "VM" : "LXC"} list of node "${node}"`,
+  );
+  if (!res.ok) return res;
+  const guests = (Array.isArray(res.data) ? res.data : []) as Guest[];
+  const guest = guests.find((g) => g.name === name);
+  if (!guest) {
+    const names = guests.map((g) => g.name).filter(Boolean).slice(0, 10);
+    return {
+      ok: false,
+      errors: [
+        `${
+          kind === "qemu" ? "VM" : "LXC"
+        } "${name}" not found on node "${node}" (found: ${
+          names.join(", ") || "none"
+        }). Fix the name or node, or skip with --skip-check guest-exists.`,
+      ],
+    };
+  }
+  return { ok: true, guest };
+}
+
+type SnapshotNames =
+  | { ok: true; names: string[] }
+  | { ok: false; errors: string[] };
+
+/** Snapshot names of a VM, found by name on the model's node. */
+async function vmSnapshotNames(
+  ctx: VmCheckContext,
+  vmName: string,
+): Promise<SnapshotNames> {
+  const node = ctx.globalArgs.node;
+  const found = await findGuest(ctx, "qemu", vmName, node);
+  if (!found.ok) return found;
+  const res = await checkApiGet(
+    ctx,
+    `/nodes/${node}/qemu/${found.guest.vmid}/snapshot`,
+    `the snapshots of VM "${vmName}"`,
+  );
+  if (!res.ok) return res;
+  const rows = (Array.isArray(res.data) ? res.data : []) as Array<
+    { name?: string }
+  >;
+  return {
+    ok: true,
+    names: rows.map((r) => r.name).filter((n): n is string => !!n),
+  };
+}
+
+/** Proxmox snapshot names: a letter first, then letters, digits, _ or -; 2-40 chars. */
+const SNAPNAME_RE = /^[A-Za-z][A-Za-z0-9_-]{1,39}$/;
+
+const preflightChecks = {
+  "guest-exists": {
+    description:
+      "Verify the VM or LXC named in the method args exists on the node (the source node for migrate) before the method changes it",
+    labels: ["live"],
+    appliesTo: Object.keys(GUEST_METHODS),
+    execute: async (ctx: VmCheckContext): Promise<CheckResult> => {
+      const spec = GUEST_METHODS[ctx.methodName];
+      const name = spec && stringArg(ctx, spec.nameArg);
+      if (!spec || !name) return { pass: true };
+      const node =
+        (ctx.methodName === "migrate"
+          ? stringArg(ctx, "sourceNode")
+          : undefined) ?? ctx.globalArgs.node;
+      const found = await findGuest(ctx, spec.kind, name, node);
+      return found.ok ? { pass: true } : { pass: false, errors: found.errors };
+    },
+  },
+  "vmid-free": {
+    description:
+      "Verify the explicit vmid is not already used by any VM or container in the cluster. Passes when no vmid is given (Proxmox picks one). Only evaluated when createFromImage is the selected method.",
+    labels: ["live"],
+    appliesTo: ["createFromImage"],
+    execute: async (ctx: VmCheckContext): Promise<CheckResult> => {
+      if (!selected(ctx, "createFromImage")) return { pass: true };
+      const vmid = ctx.unresolvedMethodArgs?.vmid;
+      if (typeof vmid !== "number") return { pass: true };
+      const res = await checkApiGet(
+        ctx,
+        "/cluster/resources?type=vm",
+        "the cluster VM list",
+      );
+      if (!res.ok) return { pass: false, errors: res.errors };
+      const rows = (Array.isArray(res.data) ? res.data : []) as Guest[];
+      const used = rows.find((r) => r.vmid === vmid);
+      if (used) {
+        return {
+          pass: false,
+          errors: [
+            `vmid ${vmid} is already used by "${
+              used.name ?? "unnamed"
+            }". Pick another vmid or leave it unset, or skip with --skip-check vmid-free.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "target-storage-exists": {
+    description:
+      "Verify the target storage pool exists and is active on the node before a disk is imported or moved to it",
+    labels: ["live"],
+    appliesTo: ["createFromImage", "moveDisk", "lxcMoveVolume"],
+    execute: async (ctx: VmCheckContext): Promise<CheckResult> => {
+      const storage = stringArg(
+        ctx,
+        ctx.methodName === "createFromImage" ? "diskStorage" : "targetStorage",
+      );
+      if (!storage) return { pass: true };
+      const node = ctx.globalArgs.node;
+      const res = await checkApiGet(
+        ctx,
+        `/nodes/${node}/storage/${encodeURIComponent(storage)}/status`,
+        `storage "${storage}" on node "${node}"`,
+      );
+      if (!res.ok) return { pass: false, errors: res.errors };
+      const status = res.data as { active?: number } | null;
+      if (status?.active !== 1) {
+        return {
+          pass: false,
+          errors: [
+            `Storage "${storage}" on node "${node}" is not active. Activate it, or skip with --skip-check target-storage-exists.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "snapshot-name-valid": {
+    description:
+      'Verify the snapshot name follows the Proxmox rule (a letter first, then letters, digits, "_" or "-", 2 to 40 characters) and is not "current"',
+    labels: ["policy"],
+    appliesTo: ["snapshot"],
+    execute: (ctx: VmCheckContext): Promise<CheckResult> => {
+      const snapname = stringArg(ctx, "snapname");
+      const bad = snapname !== undefined &&
+        (!SNAPNAME_RE.test(snapname) || snapname === "current");
+      return Promise.resolve(
+        bad
+          ? {
+            pass: false,
+            errors: [
+              `Snapshot name "${snapname}" is not valid. Use a letter first, then letters, digits, "_" or "-" (2 to 40 characters), and not "current". Or skip with --skip-check snapshot-name-valid.`,
+            ],
+          }
+          : { pass: true },
+      );
+    },
+  },
+  "snapshot-name-free": {
+    description:
+      "Verify the VM has no snapshot with this name yet, so snapshot does not collide",
+    labels: ["live"],
+    appliesTo: ["snapshot"],
+    execute: async (ctx: VmCheckContext): Promise<CheckResult> => {
+      const vmName = stringArg(ctx, "vmName");
+      const snapname = stringArg(ctx, "snapname");
+      if (!vmName || !snapname) return { pass: true };
+      const res = await vmSnapshotNames(ctx, vmName);
+      if (!res.ok) return { pass: false, errors: res.errors };
+      if (res.names.includes(snapname)) {
+        return {
+          pass: false,
+          errors: [
+            `VM "${vmName}" already has a snapshot named "${snapname}". Pick another name, or skip with --skip-check snapshot-name-free.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "snapshot-exists": {
+    description:
+      "Verify the snapshot to delete exists on the VM, so deleteSnapshot does not fail late",
+    labels: ["live"],
+    appliesTo: ["deleteSnapshot"],
+    execute: async (ctx: VmCheckContext): Promise<CheckResult> => {
+      const vmName = stringArg(ctx, "vmName");
+      const snapname = stringArg(ctx, "snapname");
+      if (!vmName || !snapname) return { pass: true };
+      const res = await vmSnapshotNames(ctx, vmName);
+      if (!res.ok) return { pass: false, errors: res.errors };
+      if (!res.names.includes(snapname)) {
+        return {
+          pass: false,
+          errors: [
+            `VM "${vmName}" has no snapshot named "${snapname}" (found: ${
+              res.names.filter((n) => n !== "current").join(", ") || "none"
+            }). Fix the name, or skip with --skip-check snapshot-exists.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+};
+
 /** VM and LXC lifecycle extensions for `@keeb/proxmox/vm` — provisioning, snapshots, disk/node migration, and container control. */
 export const extension = {
   type: "@keeb/proxmox/vm",
   checks: [{
     "cluster-has-migration-target": {
       description:
-        "Verify the node is part of a multi-node Proxmox cluster — migration has nowhere to go on a standalone node",
+        "Verify the node is part of a multi-node Proxmox cluster — migration has nowhere to go on a standalone node. Only evaluated when migrate is the selected method.",
       labels: ["live"],
       appliesTo: ["migrate"],
       execute: async (context) => {
+        if (!selected(context, "migrate")) return { pass: true };
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
 
@@ -129,6 +450,7 @@ export const extension = {
         return { pass: true };
       },
     },
+    ...preflightChecks,
   }],
   methods: [{
     createFromImage: {
@@ -171,6 +493,10 @@ export const extension = {
           sshKeys,
           ipConfig,
         } = args;
+        context.logger.info(
+          "Creating VM {vmName} on {node} from image {importFrom}",
+          { vmName, node, importFrom },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -297,6 +623,11 @@ export const extension = {
           logs: logs.join("\n"),
           timestamp: new Date().toISOString(),
         });
+        context.logger.info("Created VM {vmName} with vmid {vmid} on {node}", {
+          vmName,
+          vmid,
+          node,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -317,6 +648,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, ciUser, sshKeys, ipConfig } = args;
+        context.logger.info("Updating cloud-init on VM {vmName} on {node}", {
+          vmName,
+          node,
+        });
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -370,6 +705,10 @@ export const extension = {
           logs: logs.join("\n"),
           timestamp: new Date().toISOString(),
         });
+        context.logger.info("Updated cloud-init on VM {vmName} (vmid {vmid})", {
+          vmName,
+          vmid: vm.vmid,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -386,6 +725,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, snapname, description } = args;
+        context.logger.info(
+          "Creating snapshot {snapname} of VM {vmName} on {node}",
+          { snapname, vmName, node },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -442,6 +785,10 @@ export const extension = {
           throw new Error(`Snapshot creation failed: ${taskResult.exitstatus}`);
         }
         log(`Snapshot "${snapname}" created (${taskResult.pollCount} polls)`);
+        context.logger.info(
+          "Created snapshot {snapname} of VM {vmName} (vmid {vmid})",
+          { snapname, vmName, vmid: vm.vmid },
+        );
 
         const handle = await context.writeResource("vm", `${vmName}-ops`, {
           vmid: vm.vmid,
@@ -463,6 +810,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, snapname } = args;
+        context.logger.info(
+          "Deleting snapshot {snapname} of VM {vmName} on {node}",
+          { snapname, vmName, node },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -514,6 +865,10 @@ export const extension = {
           throw new Error(`Snapshot deletion failed: ${taskResult.exitstatus}`);
         }
         log(`Snapshot "${snapname}" deleted (${taskResult.pollCount} polls)`);
+        context.logger.info(
+          "Deleted snapshot {snapname} of VM {vmName} (vmid {vmid})",
+          { snapname, vmName, vmid: vm.vmid },
+        );
 
         const handle = await context.writeResource("vm", `${vmName}-ops`, {
           vmid: vm.vmid,
@@ -542,6 +897,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, disk, targetStorage, deleteSource } = args;
+        context.logger.info(
+          "Moving disk {disk} of VM {vmName} to storage {targetStorage}",
+          { disk, vmName, targetStorage },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -607,6 +966,10 @@ export const extension = {
         log(
           `Disk "${disk}" moved to "${targetStorage}" (${taskResult.pollCount} polls)`,
         );
+        context.logger.info(
+          "Moved disk {disk} of VM {vmName} (vmid {vmid}) to storage {targetStorage}",
+          { disk, vmName, vmid: vm.vmid, targetStorage },
+        );
 
         const handle = await context.writeResource("vm", `${vmName}-ops`, {
           vmid: vm.vmid,
@@ -627,6 +990,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName } = args;
+        context.logger.info("Listing snapshots of VM {vmName} on {node}", {
+          vmName,
+          node,
+        });
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
         const { ticket, csrfToken } = auth;
@@ -669,6 +1036,10 @@ export const extension = {
           logs: `Snapshots: ${names.join(", ") || "(none)"}`,
           timestamp: new Date().toISOString(),
         });
+        context.logger.info("Listed {count} snapshots of VM {vmName}", {
+          count: names.length,
+          vmName,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -681,6 +1052,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { ctName } = args;
+        context.logger.info("Stopping LXC {ctName} on {node}", {
+          ctName,
+          node,
+        });
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -731,6 +1106,10 @@ export const extension = {
           }
           log(`LXC ${ct.vmid} stopped (${taskResult.pollCount} polls)`);
         }
+        context.logger.info("LXC {ctName} (vmid {vmid}) is stopped", {
+          ctName,
+          vmid: ct.vmid,
+        });
 
         const handle = await context.writeResource("vm", `${ctName}-ops`, {
           vmid: ct.vmid,
@@ -751,6 +1130,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { ctName } = args;
+        context.logger.info("Starting LXC {ctName} on {node}", {
+          ctName,
+          node,
+        });
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -802,6 +1185,10 @@ export const extension = {
           }
           log(`LXC ${ct.vmid} started (${taskResult.pollCount} polls)`);
         }
+        context.logger.info("LXC {ctName} (vmid {vmid}) is running", {
+          ctName,
+          vmid: ct.vmid,
+        });
 
         const handle = await context.writeResource("vm", `${ctName}-ops`, {
           vmid: ct.vmid,
@@ -830,6 +1217,10 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { ctName, volume, targetStorage, deleteSource } = args;
+        context.logger.info(
+          "Moving volume {volume} of LXC {ctName} to storage {targetStorage}",
+          { volume, ctName, targetStorage },
+        );
         const logs = [];
         const log = (msg) => logs.push(msg);
 
@@ -896,6 +1287,10 @@ export const extension = {
         log(
           `Volume "${volume}" moved to "${targetStorage}" (${taskResult.pollCount} polls)`,
         );
+        context.logger.info(
+          "Moved volume {volume} of LXC {ctName} (vmid {vmid}) to storage {targetStorage}",
+          { volume, ctName, vmid: ct.vmid, targetStorage },
+        );
 
         const handle = await context.writeResource("vm", `${ctName}-ops`, {
           vmid: ct.vmid,
@@ -919,6 +1314,11 @@ export const extension = {
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const { vmName, kind } = args;
+        context.logger.info("Reading {kind} config of {vmName} on {node}", {
+          kind,
+          vmName,
+          node,
+        });
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
         const { ticket, csrfToken } = auth;
@@ -966,6 +1366,15 @@ export const extension = {
           logs: JSON.stringify(config, null, 2),
           timestamp: new Date().toISOString(),
         });
+        context.logger.info(
+          "Read {kind} config of {vmName} (vmid {vmid}): {keyCount} keys",
+          {
+            kind,
+            vmName,
+            vmid: entity.vmid,
+            keyCount: Object.keys(config ?? {}).length,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -991,6 +1400,10 @@ export const extension = {
         const node = sourceNode ?? defaultNode;
         const logs: string[] = [];
         const log = (msg: string) => logs.push(msg);
+        context.logger.info(
+          "Migrating VM {vmName} from {sourceNode} to {target} (online={online})",
+          { vmName, sourceNode: node, target, online },
+        );
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
         const { ticket, csrfToken } = auth;
@@ -1069,6 +1482,10 @@ export const extension = {
           logs: logs.join("\n"),
           timestamp: new Date().toISOString(),
         });
+        context.logger.info(
+          "Migrated VM {vmName} (vmid {vmid}) from {sourceNode} to {target}",
+          { vmName, vmid: vm.vmid, sourceNode: node, target },
+        );
         return { dataHandles: [handle] };
       },
     },

@@ -1,0 +1,22 @@
+manifestVersion: 1
+name: "@dmc/patch"
+version: "2026.09.30.1"
+description: "Agentless fleet patch management — scan Proxmox VMs/CTs, bare-metal, and VPS hosts for pending updates, apply them safely (snapshot-guarded, health-checked, auto-rollback), and keep an auditable history over @swamp/ssh"
+repository: "https://github.com/danmcclain/swamp-extensions"
+labels:
+  - patch
+  - infrastructure
+  - proxmox
+dependencies:
+  - "@swamp/ssh"
+  - "@dmc/proxmox"
+  - "@keeb/proxmox"
+models:
+  - patch_fleet.ts
+reports:
+  - patch_status.ts
+  - patch_history.ts
+  - patch_prune_history.ts
+additionalFiles:
+  - README.md
+  - LICENSE.md

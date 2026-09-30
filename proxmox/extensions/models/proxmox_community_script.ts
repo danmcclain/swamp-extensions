@@ -8,7 +8,7 @@
  * rollback). Because the PVE API cannot run a command *inside* an LXC, shell
  * access to the node is required. Rather than opening its own SSH connection,
  * this model delegates to a `@swamp/ssh` model instance (named by `sshModel`,
- * default `infra-ssh`): it shells out to `swamp model method run <sshModel> exec`
+ * required): it shells out to `swamp model method run <sshModel> exec`
  * so SSH transport, auth, and host-key handling live in one place.
  *
  * Prerequisites for the consumer:
@@ -24,15 +24,23 @@
  */
 import { z } from "npm:zod@4";
 
+/** Minimal LogTape-style logger supplied by swamp as `context.logger`. */
+type Logger = {
+  debug(message: string, props?: Record<string, unknown>): void;
+  info(message: string, props?: Record<string, unknown>): void;
+  warn(message: string, props?: Record<string, unknown>): void;
+  error(message: string, props?: Record<string, unknown>): void;
+};
+
 const SWAMP_BIN = Deno.env.get("SWAMP_BIN") ?? "swamp";
 const RC_SENTINEL = "__SWAMP_RC__";
 
 const GlobalArgsSchema = z.object({
-  sshModel: z.string().default("infra-ssh").describe(
-    "Name of the @swamp/ssh model instance used to reach the PVE node",
+  sshModel: z.string().min(1).describe(
+    "Name of the @swamp/ssh model instance used to reach the PVE node (required, no default)",
   ),
   node: z.string().min(1).optional().describe(
-    'Fleet host name (a host in the sshModel) of the PVE hypervisor running the container, e.g. "fort". Required for every method except discoverApp/previewInstall (which only read the community-scripts sources).',
+    'Fleet host name (a host in the sshModel) of the PVE hypervisor running the container, e.g. "pve1". Required for every method except discoverApp/previewInstall (which only read the community-scripts sources).',
   ),
   ctid: z.number().int().positive().optional().describe(
     "LXC container ID, e.g. 601. Required for every method except discoverApp/previewInstall.",
@@ -57,6 +65,16 @@ const GlobalArgsSchema = z.object({
   ),
   releaseApiUrl: z.string().url().optional().describe(
     "Optional release API URL whose JSON `tag_name` is the latest upstream version, e.g. https://codeberg.org/api/v1/repos/forgejo/forgejo/releases/latest . When set, status/checkUpdate report whether an update is available.",
+  ),
+  osManaged: z.boolean().default(false).describe(
+    "True when the app binary is delivered by the container's OS package manager (apk/apt/dnf), " +
+      "not by this updater fetching an upstream release. When true, `latestVersion` is the package " +
+      "manager's available candidate (the actionable update), the releaseApiUrl version is reported " +
+      "separately as `upstreamVersion` (informational drift), and `updateAvailable` compares installed " +
+      "against the package candidate — so an upstream release the repo doesn't ship isn't flagged installable.",
+  ),
+  packageName: z.string().optional().describe(
+    "OS package to query for the available version when osManaged (apk/apt-cache/dnf). Defaults to `app` then `service`.",
   ),
   healthUrl: z.string().url().optional().describe(
     "Optional HTTP(S) URL probed from the swamp host after update to confirm the app is serving",
@@ -128,7 +146,9 @@ const StateSchema = z.object({
   version: z.string().nullable(),
   installedVersion: z.string().nullable(),
   latestVersion: z.string().nullable(),
+  upstreamVersion: z.string().nullable(),
   updateAvailable: z.boolean().nullable(),
+  osManaged: z.boolean(),
   healthy: z.boolean(),
   healthUrl: z.string().nullable(),
   httpStatus: z.number().nullable(),
@@ -159,7 +179,9 @@ const UpdateCheckSchema = z.object({
   ctid: z.number(),
   installedVersion: z.string().nullable(),
   latestVersion: z.string().nullable(),
+  upstreamVersion: z.string().nullable(),
   updateAvailable: z.boolean().nullable(),
+  osManaged: z.boolean(),
   checkedAt: z.iso.datetime(),
 });
 
@@ -419,27 +441,82 @@ async function fetchLatestVersion(ga: GlobalArgs): Promise<string | null> {
 }
 
 /**
- * Compute update availability: installed version (from versionCommand output)
- * vs latest upstream release. Returns nulls when the inputs aren't configured or
- * can't be determined — never guesses.
+ * The available candidate version of the app's OS package (apk / apt / dnf), or
+ * null. Used when osManaged so `latestVersion` reflects what the package manager
+ * can actually install, not an upstream release the repo doesn't ship.
+ */
+async function packageManagerVersion(
+  ga: ManageArgs,
+  repoDir: string,
+): Promise<string | null> {
+  const pkg = ga.packageName ?? ga.app ?? ga.service;
+  if (!pkg) return null;
+  const cmd = `if command -v apk >/dev/null 2>&1; then apk policy ${pkg}; ` +
+    `elif command -v apt-cache >/dev/null 2>&1; then apt-cache policy ${pkg}; ` +
+    `elif command -v dnf >/dev/null 2>&1; then dnf --quiet list ${pkg} 2>/dev/null; fi`;
+  try {
+    const r = await nodeExec(
+      ga,
+      repoDir,
+      `pct exec ${ga.ctid} -- sh -c ${shSingleQuote(cmd)}`,
+      60,
+    );
+    if (r.rc !== 0) return null;
+    // Return the highest semver in the output (the candidate the manager would install).
+    const versions = [...r.out.matchAll(/(\d+\.\d+\.\d+)/g)].map((m) => m[1]);
+    if (versions.length === 0) return null;
+    versions.sort(cmpSemver);
+    return versions[versions.length - 1];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compute update availability. For a fetch-managed app (default), `latestVersion`
+ * is the upstream release (releaseApiUrl) and drives `updateAvailable`. For an
+ * osManaged app, `latestVersion` is the OS package manager's candidate (the
+ * actionable update) and the upstream release is reported separately as
+ * `upstreamVersion` (informational drift). Never guesses — nulls when unknown.
  */
 async function computeUpdate(
-  ga: GlobalArgs,
+  ga: ManageArgs,
   rawVersion: string | null,
+  repoDir: string,
 ): Promise<
   {
     installedVersion: string | null;
     latestVersion: string | null;
+    upstreamVersion: string | null;
     updateAvailable: boolean | null;
+    osManaged: boolean;
   }
 > {
   const installedVersion = extractSemver(rawVersion, ga.versionRegex);
-  const latestVersion = await fetchLatestVersion(ga);
+  const upstream = await fetchLatestVersion(ga);
+  let latestVersion: string | null;
+  let upstreamVersion: string | null;
   let updateAvailable: boolean | null = null;
-  if (installedVersion && latestVersion) {
-    updateAvailable = cmpSemver(latestVersion, installedVersion) > 0;
+  if (ga.osManaged) {
+    latestVersion = await packageManagerVersion(ga, repoDir);
+    upstreamVersion = upstream; // informational drift
+    if (installedVersion && latestVersion) {
+      updateAvailable = cmpSemver(latestVersion, installedVersion) > 0;
+    }
+  } else {
+    latestVersion = upstream; // the upstream release IS what gets installed
+    upstreamVersion = null;
+    if (installedVersion && latestVersion) {
+      updateAvailable = cmpSemver(latestVersion, installedVersion) > 0;
+    }
   }
-  return { installedVersion, latestVersion, updateAvailable };
+  return {
+    installedVersion,
+    latestVersion,
+    upstreamVersion,
+    updateAvailable,
+    osManaged: ga.osManaged,
+  };
 }
 
 /** Best-effort fetch of a text resource (script, build.func). Null on any error. */
@@ -740,14 +817,10 @@ async function waitForHealth(
   return last;
 }
 
-/** List container snapshots via `pct listsnapshot`. */
-async function listSnapshots(
-  ga: ManageArgs,
-  repoDir: string,
-): Promise<Array<z.infer<typeof SnapshotSchema>>> {
-  const r = await nodeExec(ga, repoDir, `pct listsnapshot ${ga.ctid}`, 30);
+/** Parse `pct listsnapshot` output into snapshot entries (skips "current"). */
+function parseSnapshots(out: string): Array<z.infer<typeof SnapshotSchema>> {
   const snaps: Array<z.infer<typeof SnapshotSchema>> = [];
-  for (const line of r.out.split("\n")) {
+  for (const line of out.split("\n")) {
     // Lines look like: "`-> preupdate-20260913  2026-09-13 ...  description"
     const m = line.match(/([A-Za-z0-9_.-]+)\s+\d{4}-\d{2}-\d{2}/);
     if (m && m[1] !== "current") {
@@ -755,6 +828,15 @@ async function listSnapshots(
     }
   }
   return snaps;
+}
+
+/** List container snapshots via `pct listsnapshot`. */
+async function listSnapshots(
+  ga: ManageArgs,
+  repoDir: string,
+): Promise<Array<z.infer<typeof SnapshotSchema>>> {
+  const r = await nodeExec(ga, repoDir, `pct listsnapshot ${ga.ctid}`, 30);
+  return parseSnapshots(r.out);
 }
 
 type HealthResult = Awaited<ReturnType<typeof checkHealth>>;
@@ -818,10 +900,284 @@ function snapshotName(): string {
   return `preupdate-${iso}`;
 }
 
+// ---- Pre-flight checks ------------------------------------------------------
+//
+// swamp runs these before the mutating methods they list in `appliesTo`. They
+// are cheap, read-only probes. Labels: `policy` = static rule about the
+// definition (no network); `live` = asks the real node over ssh. A user skips
+// them with `--skip-check <name>`, `--skip-check-label <label>` or
+// `--skip-checks`.
+//
+// RECOVERY RULE: the checks for `rollback` must not need the container to be
+// running or healthy. A broken container is the reason to roll back.
+
+/** The part of swamp's check context these checks read. */
+interface CheckContext {
+  globalArgs: GlobalArgs;
+  repoDir: string;
+  /** The selected method; empty for a plain `swamp model validate <name>`. */
+  methodName?: string;
+  /** Method args merged over global args (raw, before expression resolution). */
+  unresolvedMethodArgs?: Record<string, unknown>;
+}
+
+/** Result shape swamp expects from a check. */
+interface CheckResult {
+  pass: boolean;
+  errors?: string[];
+}
+
+/** Seconds allowed for one check probe on the node. */
+const CHECK_PROBE_TIMEOUT_SEC = 30;
+
+const SKIP_LIVE_HINT = "Fix the cause, or skip with --skip-check-label live.";
+
+/** Names of the global args a live check needs but the definition lacks. */
+function missingNodeArgs(ga: GlobalArgs): string[] {
+  const missing: string[] = [];
+  if (!ga.node) missing.push("node");
+  if (ga.ctid === undefined) missing.push("ctid");
+  return missing;
+}
+
+type NodeProbe =
+  | { ok: true; res: NodeResult }
+  | { ok: false; errors: string[] };
+
+/**
+ * Run one read-only command on the node for a check. Never throws: a missing
+ * global arg or a failed ssh transport comes back as `ok: false` with an error
+ * that says what failed and how to skip the check.
+ */
+async function probeNode(
+  ctx: CheckContext,
+  command: string,
+): Promise<NodeProbe> {
+  const missing = missingNodeArgs(ctx.globalArgs);
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      errors: [
+        `Global arg(s) not set: ${
+          missing.join(", ")
+        }. Set them in the model definition (see check manage-args-present).`,
+      ],
+    };
+  }
+  try {
+    const res = await nodeExec(
+      ctx.globalArgs as ManageArgs,
+      ctx.repoDir,
+      command,
+      CHECK_PROBE_TIMEOUT_SEC,
+    );
+    return { ok: true, res };
+  } catch (err) {
+    return {
+      ok: false,
+      errors: [`${(err as Error).message} ${SKIP_LIVE_HINT}`],
+    };
+  }
+}
+
+/** A string method arg, or undefined when absent or still an unresolved expression. */
+function stringArg(
+  ctx: CheckContext,
+  name: string,
+): string | undefined {
+  const v = ctx.unresolvedMethodArgs?.[name];
+  return typeof v === "string" && v.length > 0 && !v.includes("${{")
+    ? v
+    : undefined;
+}
+
+/**
+ * True only when `method` is the method being run (or validated with
+ * `--method`). A plain `swamp model validate <name>` runs every check with an
+ * empty methodName; method-specific preconditions that contradict a managed
+ * instance's normal state (the container exists, no app slug, no retained
+ * snapshot) must pass there, or validation could never succeed.
+ */
+function selected(ctx: CheckContext, method: string): boolean {
+  return ctx.methodName === method;
+}
+
+const CHECK_METHODS = ["install", "safeUpdate", "rollback"];
+
+const checks = {
+  "manage-args-present": {
+    description:
+      "Verify the definition sets node, ctid and service — every mutating method needs them to reach the container",
+    labels: ["policy"],
+    appliesTo: CHECK_METHODS,
+    execute: (context: CheckContext): Promise<CheckResult> => {
+      const ga = context.globalArgs;
+      const missing: string[] = [];
+      if (!ga.node) missing.push("node");
+      if (ga.ctid === undefined) missing.push("ctid");
+      if (!ga.service) missing.push("service");
+      return Promise.resolve(
+        missing.length === 0 ? { pass: true } : {
+          pass: false,
+          errors: [
+            `Global arg(s) not set: ${
+              missing.join(", ")
+            }. Set them in the model definition, or skip with --skip-check manage-args-present.`,
+          ],
+        },
+      );
+    },
+  },
+  "install-app-present": {
+    description:
+      "Verify the definition sets the community-scripts app slug that install needs. Only evaluated when install is the selected method.",
+    labels: ["policy"],
+    appliesTo: ["install"],
+    execute: (context: CheckContext): Promise<CheckResult> =>
+      Promise.resolve(
+        !selected(context, "install") || context.globalArgs.app
+          ? { pass: true }
+          : {
+            pass: false,
+            errors: [
+              'Global arg "app" is not set. Set the community-scripts slug (for example "forgejo") in the model definition, or skip with --skip-check install-app-present.',
+            ],
+          },
+      ),
+  },
+  "node-reachable": {
+    description:
+      "Verify the PVE node answers over the ssh model and has the pct tool. Does not look at the container, so it is safe before a rollback.",
+    labels: ["live"],
+    appliesTo: CHECK_METHODS,
+    execute: async (context: CheckContext): Promise<CheckResult> => {
+      const probe = await probeNode(context, "command -v pct");
+      if (!probe.ok) return { pass: false, errors: probe.errors };
+      if (probe.res.rc !== 0) {
+        return {
+          pass: false,
+          errors: [
+            `Node "${context.globalArgs.node}" answered over ssh but the pct tool was not found. Check that the node is a Proxmox VE host. ${SKIP_LIVE_HINT}`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "ctid-free": {
+    description:
+      "Verify no container or VM already uses this ctid anywhere in the cluster, so install does not collide. Passes when install is run with force=true. Only evaluated when install is the selected method.",
+    labels: ["live"],
+    appliesTo: ["install"],
+    execute: async (context: CheckContext): Promise<CheckResult> => {
+      if (!selected(context, "install")) return { pass: true };
+      if (context.unresolvedMethodArgs?.force === true) return { pass: true };
+      const ctid = context.globalArgs.ctid;
+      const probe = await probeNode(
+        context,
+        `ls /etc/pve/nodes/*/lxc/${ctid}.conf /etc/pve/nodes/*/qemu-server/${ctid}.conf 2>/dev/null; true`,
+      );
+      if (!probe.ok) return { pass: false, errors: probe.errors };
+      const used = probe.res.out.split("\n").map((l) => l.trim()).filter((l) =>
+        l.endsWith(".conf")
+      );
+      if (used.length > 0) {
+        return {
+          pass: false,
+          errors: [
+            `ctid ${ctid} is already in use (${
+              used.join(", ")
+            }). Pick another ctid, run install with force=true, or skip with --skip-check ctid-free.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "container-exists": {
+    description:
+      "Verify the container answers to pct status on the node. Does not need the app or the container to be healthy: safeUpdate has its own baseline and rollback logic.",
+    labels: ["live"],
+    appliesTo: ["safeUpdate"],
+    execute: async (context: CheckContext): Promise<CheckResult> => {
+      const ctid = context.globalArgs.ctid;
+      const probe = await probeNode(context, `pct status ${ctid}`);
+      if (!probe.ok) return { pass: false, errors: probe.errors };
+      if (probe.res.rc !== 0) {
+        return {
+          pass: false,
+          errors: [
+            `Container ${ctid} was not found on node "${context.globalArgs.node}" (${
+              probe.res.out.slice(0, 200)
+            }). Fix node or ctid in the definition, or skip with --skip-check container-exists.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "snapshot-available": {
+    description:
+      "Verify the snapshot to roll back to exists for the ctid: the named snapshot, or at least one preupdate-* snapshot when none is named. Does not need the container to be running or healthy. Only evaluated when rollback is the selected method.",
+    labels: ["live"],
+    appliesTo: ["rollback"],
+    execute: async (context: CheckContext): Promise<CheckResult> => {
+      if (!selected(context, "rollback")) return { pass: true };
+      const ctid = context.globalArgs.ctid;
+      const probe = await probeNode(context, `pct listsnapshot ${ctid}`);
+      if (!probe.ok) return { pass: false, errors: probe.errors };
+      if (probe.res.rc !== 0) {
+        return {
+          pass: false,
+          errors: [
+            `Could not list snapshots of container ${ctid} on node "${context.globalArgs.node}" (${
+              probe.res.out.slice(0, 200)
+            }). Fix node or ctid, or skip with --skip-check snapshot-available.`,
+          ],
+        };
+      }
+      const names = parseSnapshots(probe.res.out).map((s) => s.name);
+      const requested = stringArg(context, "snapshot");
+      if (requested) {
+        if (!names.includes(requested)) {
+          return {
+            pass: false,
+            errors: [
+              `Snapshot "${requested}" does not exist for container ${ctid}. Existing snapshots: ${
+                names.join(", ") || "none"
+              }. Pass a snapshot that exists, or skip with --skip-check snapshot-available.`,
+            ],
+          };
+        }
+        return { pass: true };
+      }
+      if (!names.some((n) => n.startsWith("preupdate-"))) {
+        return {
+          pass: false,
+          errors: [
+            `No preupdate-* snapshot exists for container ${ctid} (snapshots: ${
+              names.join(", ") || "none"
+            }). Pass an explicit snapshot name, or skip with --skip-check snapshot-available.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+};
+
 /** Model definition: manage a PVE community-scripts LXC with safe updates. */
 export const model = {
   type: "@dmc/proxmox/community-script",
-  version: "2026.09.13.1",
+  version: "2026.09.30.1",
+  upgrades: [
+    {
+      toVersion: "2026.09.30.1",
+      description:
+        "Add osManaged and packageName (defaulted); sshModel is now required (no default)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     "state": {
@@ -863,6 +1219,7 @@ export const model = {
       garbageCollection: 5,
     },
   },
+  checks,
   methods: {
     status: {
       description:
@@ -871,6 +1228,7 @@ export const model = {
       execute: async (_args: unknown, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -878,9 +1236,13 @@ export const model = {
         ) => Promise<unknown>;
       }) => {
         const ga = requireManage(context.globalArgs);
+        context.logger.info("Checking status of container {ctid} on {node}", {
+          ctid: ga.ctid,
+          node: ga.node,
+        });
         const health = await checkHealth(ga, context.repoDir);
         const version = await readVersion(ga, context.repoDir);
-        const upd = await computeUpdate(ga, version);
+        const upd = await computeUpdate(ga, version, context.repoDir);
         const snapshots = await listSnapshots(ga, context.repoDir);
         const handle = await context.writeResource("state", "state", {
           name: ga.appName,
@@ -891,13 +1253,25 @@ export const model = {
           version,
           installedVersion: upd.installedVersion,
           latestVersion: upd.latestVersion,
+          upstreamVersion: upd.upstreamVersion,
           updateAvailable: upd.updateAvailable,
+          osManaged: upd.osManaged,
           healthy: health.healthy,
           healthUrl: ga.healthUrl ?? null,
           httpStatus: health.httpStatus,
           snapshots,
           checkedAt: new Date().toISOString(),
         });
+        context.logger.info(
+          "Status of container {ctid} on {node}: healthy={healthy} running={running} version={version}",
+          {
+            ctid: ga.ctid,
+            node: ga.node,
+            healthy: health.healthy,
+            running: health.running,
+            version,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -908,6 +1282,7 @@ export const model = {
       execute: async (_args: unknown, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -918,6 +1293,9 @@ export const model = {
         if (!ga.app) {
           throw new Error("`app` global arg is required for discoverApp");
         }
+        context.logger.info("Discovering variables for app {app}", {
+          app: ga.app,
+        });
         const { appDefaults, recognizedVars, varDocs } = await discoverVars(
           ga.ctScriptBaseUrl,
           ga.app,
@@ -937,6 +1315,10 @@ export const model = {
           vars,
           checkedAt: new Date().toISOString(),
         });
+        context.logger.info(
+          "Discovered {varCount} recognized variables for app {app}",
+          { varCount: recognizedVars.length, app: ga.app },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -947,6 +1329,7 @@ export const model = {
       execute: async (_args: unknown, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -957,6 +1340,7 @@ export const model = {
         if (!ga.app) {
           throw new Error("`app` global arg is required for previewInstall");
         }
+        context.logger.info("Previewing install of app {app}", { app: ga.app });
         const s = await summarizeInstall(ga.ctScriptBaseUrl, ga.app);
         const handle = await context.writeResource("preview", "preview", {
           name: ga.appName,
@@ -964,6 +1348,14 @@ export const model = {
           ...s,
           checkedAt: new Date().toISOString(),
         });
+        context.logger.info(
+          "Previewed install of app {app}: {stepCount} steps, {packageCount} packages",
+          {
+            app: ga.app,
+            stepCount: s.steps.length,
+            packageCount: s.packages.length,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -978,6 +1370,7 @@ export const model = {
       execute: async (args: { force: boolean }, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -992,9 +1385,15 @@ export const model = {
           );
         }
         const logs: string[] = [];
-        const log = (m: string) =>
+        const log = (m: string) => {
           logs.push(`[${new Date().toISOString()}] ${m}`);
+          context.logger.info("{message}", { message: m });
+        };
         const scriptUrl = `${ga.ctScriptBaseUrl}/ct/${ga.app}.sh`;
+        context.logger.info(
+          "Installing app {app} as container {ctid} on {node}",
+          { app: ga.app, ctid: ga.ctid, node: ga.node },
+        );
 
         // 1. Refuse to touch an existing container.
         const pre = await nodeExec(ga, repoDir, `pct status ${ga.ctid}`, 30);
@@ -1082,6 +1481,10 @@ export const model = {
         });
 
         if (!created || res.rc !== 0) {
+          context.logger.error(
+            "Install of {app} did not produce container {ctid} (install rc {rc}, created={created})",
+            { app: ga.app, ctid: ga.ctid, rc: res.rc, created },
+          );
           throw new Error(
             `Install of ${ga.app} did not produce a container at ctid ${ga.ctid} (install rc ${res.rc}, created=${created}). Output tail: ${
               res.out.slice(-800)
@@ -1089,6 +1492,10 @@ export const model = {
           );
         }
         if (!health.healthy) {
+          context.logger.error(
+            "Installed {app} as container {ctid} but it is not healthy",
+            { app: ga.app, ctid: ga.ctid },
+          );
           throw new Error(
             `Installed ${ga.app} at ctid ${ga.ctid} but it is not healthy (running=${health.running} service=${health.serviceActive} http=${
               health.httpStatus ?? "n/a"
@@ -1097,6 +1504,16 @@ export const model = {
             }]`,
           );
         }
+        context.logger.info(
+          "Installed app {app} as container {ctid} on {node}: healthy={healthy} version={version}",
+          {
+            app: ga.app,
+            ctid: ga.ctid,
+            node: ga.node,
+            healthy: health.healthy,
+            version,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1107,6 +1524,7 @@ export const model = {
       execute: async (_args: unknown, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -1114,8 +1532,12 @@ export const model = {
         ) => Promise<unknown>;
       }) => {
         const ga = requireManage(context.globalArgs);
+        context.logger.info(
+          "Checking for updates to container {ctid} on {node}",
+          { ctid: ga.ctid, node: ga.node },
+        );
         const version = await readVersion(ga, context.repoDir);
-        const upd = await computeUpdate(ga, version);
+        const upd = await computeUpdate(ga, version, context.repoDir);
         const handle = await context.writeResource(
           "updateCheck",
           "updateCheck",
@@ -1125,8 +1547,20 @@ export const model = {
             ctid: ga.ctid,
             installedVersion: upd.installedVersion,
             latestVersion: upd.latestVersion,
+            upstreamVersion: upd.upstreamVersion,
             updateAvailable: upd.updateAvailable,
+            osManaged: upd.osManaged,
             checkedAt: new Date().toISOString(),
+          },
+        );
+        context.logger.info(
+          "Update check for container {ctid} on {node}: installed={installed} latest={latest} updateAvailable={updateAvailable}",
+          {
+            ctid: ga.ctid,
+            node: ga.node,
+            installed: upd.installedVersion,
+            latest: upd.latestVersion,
+            updateAvailable: upd.updateAvailable,
           },
         );
         return { dataHandles: [handle] };
@@ -1148,6 +1582,7 @@ export const model = {
         context: {
           globalArgs: GlobalArgs;
           repoDir: string;
+          logger: Logger;
           writeResource: (
             spec: string,
             instance: string,
@@ -1160,7 +1595,12 @@ export const model = {
         const logs: string[] = [];
         const log = (m: string) => {
           logs.push(`[${new Date().toISOString()}] ${m}`);
+          context.logger.info("{message}", { message: m });
         };
+        context.logger.info(
+          "Starting safe update of {appName} (container {ctid} on {node})",
+          { appName: ga.appName, ctid: ga.ctid, node: ga.node },
+        );
 
         const writeResult = (data: z.infer<typeof UpdateResultSchema>) =>
           context.writeResource("update", "update", data);
@@ -1193,6 +1633,10 @@ export const model = {
             logs: logs.join("\n"),
             timestamp: new Date().toISOString(),
           });
+          context.logger.error(
+            "Refusing to update {appName}: not healthy before the update",
+            { appName: ga.appName },
+          );
           throw new Error(
             `Refusing to update: ${ga.appName} is not healthy before the update (running=${before.running} service=${before.serviceActive} http=${
               before.httpStatus ?? "n/a"
@@ -1214,6 +1658,10 @@ export const model = {
           120,
         );
         if (snapRes.rc !== 0) {
+          context.logger.error(
+            "Snapshot {snapshot} of container {ctid} failed (rc {rc})",
+            { snapshot: snap, ctid: ga.ctid, rc: snapRes.rc },
+          );
           throw new Error(
             `Snapshot failed (rc ${snapRes.rc}): ${snapRes.out.slice(-800)}`,
           );
@@ -1300,6 +1748,15 @@ export const model = {
             logs: logs.join("\n"),
             timestamp: new Date().toISOString(),
           });
+          context.logger.info(
+            "Safe update of {appName} finished: outcome={outcome} version={beforeVersion} -> {afterVersion}",
+            {
+              appName: ga.appName,
+              outcome: versionChanged ? "updated" : "no-change",
+              beforeVersion,
+              afterVersion,
+            },
+          );
           return { dataHandles: [handle] };
         }
 
@@ -1332,12 +1789,20 @@ export const model = {
           timestamp: new Date().toISOString(),
         });
         if (!rolledBack) {
+          context.logger.error(
+            "Update of {appName} failed and rollback to {snapshot} failed; manual intervention needed",
+            { appName: ga.appName, snapshot: snap },
+          );
           throw new Error(
             `Update failed AND rollback failed. Container ${ga.ctid} may be stopped — MANUAL INTERVENTION NEEDED. Snapshot ${snap} is intact. Detail: ${
               failure ?? "unknown"
             } [data: ${(handle as { name?: string })?.name}]`,
           );
         }
+        context.logger.warn(
+          "Update of {appName} failed validation; rolled back to {snapshot} (healthy after rollback: {healthy})",
+          { appName: ga.appName, snapshot: snap, healthy: restored.healthy },
+        );
         throw new Error(
           `${ga.appName} update failed validation and was rolled back to snapshot ${snap} (post-rollback healthy=${restored.healthy}). [data: ${
             (handle as { name?: string })?.name
@@ -1356,6 +1821,7 @@ export const model = {
       execute: async (args: { snapshot?: string }, context: {
         globalArgs: GlobalArgs;
         repoDir: string;
+        logger: Logger;
         writeResource: (
           spec: string,
           instance: string,
@@ -1365,8 +1831,14 @@ export const model = {
         const ga = requireManage(context.globalArgs);
         const repoDir = context.repoDir;
         const logs: string[] = [];
-        const log = (m: string) =>
+        const log = (m: string) => {
           logs.push(`[${new Date().toISOString()}] ${m}`);
+          context.logger.info("{message}", { message: m });
+        };
+        context.logger.info(
+          "Rolling back container {ctid} on {node}",
+          { ctid: ga.ctid, node: ga.node },
+        );
 
         let target = args.snapshot;
         if (!target) {
@@ -1374,6 +1846,10 @@ export const model = {
           const pre = snaps.filter((s) => s.name.startsWith("preupdate-"))
             .sort();
           if (pre.length === 0) {
+            context.logger.error(
+              "No preupdate-* snapshot found for container {ctid}",
+              { ctid: ga.ctid },
+            );
             throw new Error(
               `No preupdate-* snapshot found for ctid ${ga.ctid}; pass an explicit snapshot name`,
             );
@@ -1388,12 +1864,16 @@ export const model = {
           log,
         );
         if (!rolledBack) {
+          context.logger.error(
+            "Rollback of container {ctid} to {snapshot} failed",
+            { ctid: ga.ctid, snapshot: target },
+          );
           throw new Error(
             `Rollback to ${target} failed: ${failure ?? "unknown"}`,
           );
         }
         const rbVersion = await readVersion(ga, repoDir);
-        const rbUpd = await computeUpdate(ga, rbVersion);
+        const rbUpd = await computeUpdate(ga, rbVersion, context.repoDir);
         const handle = await context.writeResource("state", "state", {
           name: ga.appName,
           node: ga.node,
@@ -1403,13 +1883,19 @@ export const model = {
           version: rbVersion,
           installedVersion: rbUpd.installedVersion,
           latestVersion: rbUpd.latestVersion,
+          upstreamVersion: rbUpd.upstreamVersion,
           updateAvailable: rbUpd.updateAvailable,
+          osManaged: rbUpd.osManaged,
           healthy: health.healthy,
           healthUrl: ga.healthUrl ?? null,
           httpStatus: health.httpStatus,
           snapshots: await listSnapshots(ga, repoDir),
           checkedAt: new Date().toISOString(),
         });
+        context.logger.info(
+          "Rolled back container {ctid} to {snapshot}: healthy={healthy}",
+          { ctid: ga.ctid, snapshot: target, healthy: health.healthy },
+        );
         return { dataHandles: [handle] };
       },
     },
