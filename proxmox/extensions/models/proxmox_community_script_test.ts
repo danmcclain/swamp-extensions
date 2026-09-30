@@ -7,7 +7,7 @@ import {
   createModelTestContext,
   withMockedCommand,
   withMockedFetch,
-} from "jsr:@systeminit/swamp-testing";
+} from "jsr:@systeminit/swamp-testing@0.20260604.20";
 import { cmpSemver, extractSemver, model } from "./proxmox_community_script.ts";
 
 const CT_SCRIPT = [
@@ -474,4 +474,282 @@ Deno.test("install provisions a new container and reports it healthy", async () 
   assertEquals(data?.healthy, true);
   assertEquals(data?.app, "testapp");
   assertEquals(data?.unknownVars, []); // var_cpu is recognized
+});
+
+// ---- pre-flight checks ------------------------------------------------------
+
+type CheckName = keyof typeof model.checks;
+type CheckCtx = Parameters<typeof model.checks["node-reachable"]["execute"]>[0];
+
+const MUTATING_METHODS = ["install", "safeUpdate", "rollback"];
+const READ_ONLY_METHODS = [
+  "status",
+  "discoverApp",
+  "previewInstall",
+  "checkUpdate",
+];
+
+/** Run one check against stubbed ssh output; returns the result and the remote commands it ran. */
+async function runCheck(
+  name: CheckName,
+  opts: {
+    globalArgs?: Record<string, unknown>;
+    methodArgs?: Record<string, unknown>;
+    handler?: (remote: string) => { stdout: string; code: number };
+  } = {},
+) {
+  const { context } = createModelTestContext({
+    globalArgs: opts.globalArgs ?? { ...baseArgs, app: "testapp" },
+  });
+  const ctx = {
+    ...context,
+    unresolvedMethodArgs: opts.methodArgs,
+  } as unknown as CheckCtx;
+  const remotes: string[] = [];
+  const { result } = await withMockedCommand((_cmd, args) => {
+    const remote = remoteCommand(args);
+    remotes.push(remote);
+    return opts.handler ? opts.handler(remote) : sshOut("");
+  }, () => model.checks[name].execute(ctx));
+  return { result, remotes };
+}
+
+const SNAP_LIST = [
+  "`-> preupdate-20260913T120500Z 2026-09-13 12:05:00 pre-update",
+  " `-> current                                     You are here!",
+].join("\n");
+
+Deno.test("every mutating method is covered by at least one check", () => {
+  for (const method of MUTATING_METHODS) {
+    const covering = Object.values(model.checks).filter((c) =>
+      c.appliesTo.includes(method)
+    );
+    assertEquals(covering.length > 0, true, `${method} has no check`);
+    assertEquals(
+      covering.some((c) => c.labels.includes("live")),
+      true,
+      `${method} has no live check`,
+    );
+  }
+});
+
+Deno.test("read-only methods are not covered by any check", () => {
+  for (const method of READ_ONLY_METHODS) {
+    const covering = Object.values(model.checks).filter((c) =>
+      c.appliesTo.includes(method)
+    );
+    assertEquals(covering.length, 0, `${method} must have no check`);
+  }
+});
+
+Deno.test("every method is classified as mutating or read-only", () => {
+  const known = [...MUTATING_METHODS, ...READ_ONLY_METHODS].sort();
+  assertEquals(Object.keys(model.methods).sort(), known);
+});
+
+Deno.test("every check has a label and a description", () => {
+  for (const check of Object.values(model.checks)) {
+    assertEquals(check.labels.length > 0, true);
+    assertEquals(check.description.length > 0, true);
+  }
+});
+
+Deno.test("manage-args-present passes when node, ctid and service are set", async () => {
+  const { result, remotes } = await runCheck("manage-args-present");
+  assertEquals(result, { pass: true });
+  assertEquals(remotes.length, 0); // policy check: no network
+});
+
+Deno.test("manage-args-present fails and names the missing args", async () => {
+  const { result } = await runCheck("manage-args-present", {
+    globalArgs: { sshModel: "my-ssh", appName: "TestApp" },
+  });
+  assertEquals(result.pass, false);
+  assertStringIncludes(result.errors?.[0] ?? "", "node, ctid, service");
+  assertStringIncludes(result.errors?.[0] ?? "", "--skip-check");
+});
+
+Deno.test("install-app-present passes with app set and fails without", async () => {
+  const ok = await runCheck("install-app-present");
+  assertEquals(ok.result, { pass: true });
+  const bad = await runCheck("install-app-present", {
+    globalArgs: { ...baseArgs },
+  });
+  assertEquals(bad.result.pass, false);
+  assertStringIncludes(bad.result.errors?.[0] ?? "", "app");
+});
+
+Deno.test("node-reachable passes when pct is found on the node", async () => {
+  const { result, remotes } = await runCheck("node-reachable", {
+    handler: () => sshOut("/usr/sbin/pct"),
+  });
+  assertEquals(result, { pass: true });
+  assertStringIncludes(remotes[0], "command -v pct");
+});
+
+Deno.test("node-reachable fails when pct is missing", async () => {
+  const { result } = await runCheck("node-reachable", {
+    handler: () => sshOut("", 1),
+  });
+  assertEquals(result.pass, false);
+  assertStringIncludes(result.errors?.[0] ?? "", "pct");
+  assertStringIncludes(result.errors?.[0] ?? "", "--skip-check-label live");
+});
+
+Deno.test("node-reachable fails when the ssh transport fails", async () => {
+  const { result } = await runCheck("node-reachable", {
+    handler: () => ({ stdout: "", code: 1 }),
+  });
+  assertEquals(result.pass, false);
+  assertStringIncludes(result.errors?.[0] ?? "", "SSH transport");
+  assertStringIncludes(result.errors?.[0] ?? "", "--skip-check-label live");
+});
+
+Deno.test("node-reachable fails without running ssh when node is not set", async () => {
+  const { result, remotes } = await runCheck("node-reachable", {
+    globalArgs: { sshModel: "my-ssh" },
+  });
+  assertEquals(result.pass, false);
+  assertEquals(remotes.length, 0);
+});
+
+Deno.test("ctid-free passes when no config file uses the ctid", async () => {
+  const { result, remotes } = await runCheck("ctid-free", {
+    methodArgs: { force: false },
+    handler: () => sshOut(""),
+  });
+  assertEquals(result, { pass: true });
+  assertStringIncludes(remotes[0], "/lxc/601.conf");
+  assertStringIncludes(remotes[0], "/qemu-server/601.conf");
+});
+
+Deno.test("ctid-free fails when a container already uses the ctid", async () => {
+  const { result } = await runCheck("ctid-free", {
+    methodArgs: { force: false },
+    handler: () => sshOut("/etc/pve/nodes/pve2/lxc/601.conf"),
+  });
+  assertEquals(result.pass, false);
+  assertStringIncludes(result.errors?.[0] ?? "", "601");
+  assertStringIncludes(result.errors?.[0] ?? "", "pve2");
+  assertStringIncludes(result.errors?.[0] ?? "", "force=true");
+});
+
+Deno.test("ctid-free fails when a VM already uses the ctid", async () => {
+  const { result } = await runCheck("ctid-free", {
+    handler: () => sshOut("/etc/pve/nodes/pve1/qemu-server/601.conf"),
+  });
+  assertEquals(result.pass, false);
+});
+
+Deno.test("ctid-free passes without probing when force=true", async () => {
+  const { result, remotes } = await runCheck("ctid-free", {
+    methodArgs: { force: true },
+    handler: () => sshOut("/etc/pve/nodes/pve1/lxc/601.conf"),
+  });
+  assertEquals(result, { pass: true });
+  assertEquals(remotes.length, 0);
+});
+
+Deno.test("ctid-free fails when the ssh transport fails", async () => {
+  const { result } = await runCheck("ctid-free", {
+    handler: () => ({ stdout: "", code: 1 }),
+  });
+  assertEquals(result.pass, false);
+});
+
+Deno.test("container-exists passes when pct status answers, even for a stopped container", async () => {
+  const { result, remotes } = await runCheck("container-exists", {
+    handler: () => sshOut("status: stopped", 0),
+  });
+  assertEquals(result, { pass: true });
+  assertEquals(remotes.length, 1); // no service or http probe
+});
+
+Deno.test("container-exists fails when the container is not found", async () => {
+  const { result } = await runCheck("container-exists", {
+    handler: () =>
+      sshOut("Configuration file 'nodes/pve1/lxc/601.conf' does not exist", 2),
+  });
+  assertEquals(result.pass, false);
+  assertStringIncludes(result.errors?.[0] ?? "", "601");
+  assertStringIncludes(
+    result.errors?.[0] ?? "",
+    "--skip-check container-exists",
+  );
+});
+
+Deno.test("container-exists fails when the ssh transport fails", async () => {
+  const { result } = await runCheck("container-exists", {
+    handler: () => ({ stdout: "", code: 1 }),
+  });
+  assertEquals(result.pass, false);
+});
+
+Deno.test("snapshot-available passes for a named snapshot that exists", async () => {
+  const { result } = await runCheck("snapshot-available", {
+    methodArgs: { snapshot: "preupdate-20260913T120500Z" },
+    handler: () => sshOut(SNAP_LIST),
+  });
+  assertEquals(result, { pass: true });
+});
+
+Deno.test("snapshot-available fails for a named snapshot that does not exist", async () => {
+  const { result } = await runCheck("snapshot-available", {
+    methodArgs: { snapshot: "nope" },
+    handler: () => sshOut(SNAP_LIST),
+  });
+  assertEquals(result.pass, false);
+  assertStringIncludes(result.errors?.[0] ?? "", '"nope"');
+  assertStringIncludes(result.errors?.[0] ?? "", "preupdate-20260913T120500Z");
+});
+
+Deno.test("snapshot-available passes with no name when a preupdate-* snapshot exists", async () => {
+  const { result } = await runCheck("snapshot-available", {
+    methodArgs: {},
+    handler: () => sshOut(SNAP_LIST),
+  });
+  assertEquals(result, { pass: true });
+});
+
+Deno.test("snapshot-available fails with no name when no preupdate-* snapshot exists", async () => {
+  const { result } = await runCheck("snapshot-available", {
+    methodArgs: {},
+    handler: () => sshOut("`-> manual-1 2026-09-01 10:00:00 by hand"),
+  });
+  assertEquals(result.pass, false);
+  assertStringIncludes(result.errors?.[0] ?? "", "preupdate-*");
+});
+
+Deno.test("snapshot-available fails when pct listsnapshot fails", async () => {
+  const { result } = await runCheck("snapshot-available", {
+    handler: () => sshOut("Configuration file does not exist", 2),
+  });
+  assertEquals(result.pass, false);
+});
+
+Deno.test("rollback checks do not need a healthy or running container (recovery rule)", async () => {
+  // A stopped, unhealthy container: every probe says so. The rollback checks
+  // must still pass, and must not ask about container or service state.
+  const commands: string[] = [];
+  const handler = (remote: string) => {
+    commands.push(remote);
+    if (remote.includes("command -v pct")) return sshOut("/usr/sbin/pct");
+    if (remote.includes("pct listsnapshot")) return sshOut(SNAP_LIST);
+    return sshOut("status: stopped", 3); // anything else: dead container
+  };
+  for (const name of ["node-reachable", "snapshot-available"] as const) {
+    const { result } = await runCheck(name, { handler });
+    assertEquals(result, { pass: true }, name);
+  }
+  for (const c of commands) {
+    assertEquals(/pct status|systemctl|rc-service|curl/.test(c), false, c);
+  }
+  const rollbackChecks = Object.entries(model.checks).filter(([, c]) =>
+    c.appliesTo.includes("rollback")
+  ).map(([n]) => n).sort();
+  assertEquals(rollbackChecks, [
+    "manage-args-present",
+    "node-reachable",
+    "snapshot-available",
+  ]);
 });

@@ -817,14 +817,10 @@ async function waitForHealth(
   return last;
 }
 
-/** List container snapshots via `pct listsnapshot`. */
-async function listSnapshots(
-  ga: ManageArgs,
-  repoDir: string,
-): Promise<Array<z.infer<typeof SnapshotSchema>>> {
-  const r = await nodeExec(ga, repoDir, `pct listsnapshot ${ga.ctid}`, 30);
+/** Parse `pct listsnapshot` output into snapshot entries (skips "current"). */
+function parseSnapshots(out: string): Array<z.infer<typeof SnapshotSchema>> {
   const snaps: Array<z.infer<typeof SnapshotSchema>> = [];
-  for (const line of r.out.split("\n")) {
+  for (const line of out.split("\n")) {
     // Lines look like: "`-> preupdate-20260913  2026-09-13 ...  description"
     const m = line.match(/([A-Za-z0-9_.-]+)\s+\d{4}-\d{2}-\d{2}/);
     if (m && m[1] !== "current") {
@@ -832,6 +828,15 @@ async function listSnapshots(
     }
   }
   return snaps;
+}
+
+/** List container snapshots via `pct listsnapshot`. */
+async function listSnapshots(
+  ga: ManageArgs,
+  repoDir: string,
+): Promise<Array<z.infer<typeof SnapshotSchema>>> {
+  const r = await nodeExec(ga, repoDir, `pct listsnapshot ${ga.ctid}`, 30);
+  return parseSnapshots(r.out);
 }
 
 type HealthResult = Awaited<ReturnType<typeof checkHealth>>;
@@ -895,6 +900,255 @@ function snapshotName(): string {
   return `preupdate-${iso}`;
 }
 
+// ---- Pre-flight checks ------------------------------------------------------
+//
+// swamp runs these before the mutating methods they list in `appliesTo`. They
+// are cheap, read-only probes. Labels: `policy` = static rule about the
+// definition (no network); `live` = asks the real node over ssh. A user skips
+// them with `--skip-check <name>`, `--skip-check-label <label>` or
+// `--skip-checks`.
+//
+// RECOVERY RULE: the checks for `rollback` must not need the container to be
+// running or healthy. A broken container is the reason to roll back.
+
+/** The part of swamp's check context these checks read. */
+interface CheckContext {
+  globalArgs: GlobalArgs;
+  repoDir: string;
+  /** Method args merged over global args (raw, before expression resolution). */
+  unresolvedMethodArgs?: Record<string, unknown>;
+}
+
+/** Result shape swamp expects from a check. */
+interface CheckResult {
+  pass: boolean;
+  errors?: string[];
+}
+
+/** Seconds allowed for one check probe on the node. */
+const CHECK_PROBE_TIMEOUT_SEC = 30;
+
+const SKIP_LIVE_HINT = "Fix the cause, or skip with --skip-check-label live.";
+
+/** Names of the global args a live check needs but the definition lacks. */
+function missingNodeArgs(ga: GlobalArgs): string[] {
+  const missing: string[] = [];
+  if (!ga.node) missing.push("node");
+  if (ga.ctid === undefined) missing.push("ctid");
+  return missing;
+}
+
+type NodeProbe =
+  | { ok: true; res: NodeResult }
+  | { ok: false; errors: string[] };
+
+/**
+ * Run one read-only command on the node for a check. Never throws: a missing
+ * global arg or a failed ssh transport comes back as `ok: false` with an error
+ * that says what failed and how to skip the check.
+ */
+async function probeNode(
+  ctx: CheckContext,
+  command: string,
+): Promise<NodeProbe> {
+  const missing = missingNodeArgs(ctx.globalArgs);
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      errors: [
+        `Global arg(s) not set: ${
+          missing.join(", ")
+        }. Set them in the model definition (see check manage-args-present).`,
+      ],
+    };
+  }
+  try {
+    const res = await nodeExec(
+      ctx.globalArgs as ManageArgs,
+      ctx.repoDir,
+      command,
+      CHECK_PROBE_TIMEOUT_SEC,
+    );
+    return { ok: true, res };
+  } catch (err) {
+    return {
+      ok: false,
+      errors: [`${(err as Error).message} ${SKIP_LIVE_HINT}`],
+    };
+  }
+}
+
+/** A string method arg, or undefined when absent or still an unresolved expression. */
+function stringArg(
+  ctx: CheckContext,
+  name: string,
+): string | undefined {
+  const v = ctx.unresolvedMethodArgs?.[name];
+  return typeof v === "string" && v.length > 0 && !v.includes("${{")
+    ? v
+    : undefined;
+}
+
+const CHECK_METHODS = ["install", "safeUpdate", "rollback"];
+
+const checks = {
+  "manage-args-present": {
+    description:
+      "Verify the definition sets node, ctid and service — every mutating method needs them to reach the container",
+    labels: ["policy"],
+    appliesTo: CHECK_METHODS,
+    execute: (context: CheckContext): Promise<CheckResult> => {
+      const ga = context.globalArgs;
+      const missing: string[] = [];
+      if (!ga.node) missing.push("node");
+      if (ga.ctid === undefined) missing.push("ctid");
+      if (!ga.service) missing.push("service");
+      return Promise.resolve(
+        missing.length === 0 ? { pass: true } : {
+          pass: false,
+          errors: [
+            `Global arg(s) not set: ${
+              missing.join(", ")
+            }. Set them in the model definition, or skip with --skip-check manage-args-present.`,
+          ],
+        },
+      );
+    },
+  },
+  "install-app-present": {
+    description:
+      "Verify the definition sets the community-scripts app slug that install needs",
+    labels: ["policy"],
+    appliesTo: ["install"],
+    execute: (context: CheckContext): Promise<CheckResult> =>
+      Promise.resolve(
+        context.globalArgs.app ? { pass: true } : {
+          pass: false,
+          errors: [
+            'Global arg "app" is not set. Set the community-scripts slug (for example "forgejo") in the model definition, or skip with --skip-check install-app-present.',
+          ],
+        },
+      ),
+  },
+  "node-reachable": {
+    description:
+      "Verify the PVE node answers over the ssh model and has the pct tool. Does not look at the container, so it is safe before a rollback.",
+    labels: ["live"],
+    appliesTo: CHECK_METHODS,
+    execute: async (context: CheckContext): Promise<CheckResult> => {
+      const probe = await probeNode(context, "command -v pct");
+      if (!probe.ok) return { pass: false, errors: probe.errors };
+      if (probe.res.rc !== 0) {
+        return {
+          pass: false,
+          errors: [
+            `Node "${context.globalArgs.node}" answered over ssh but the pct tool was not found. Check that the node is a Proxmox VE host. ${SKIP_LIVE_HINT}`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "ctid-free": {
+    description:
+      "Verify no container or VM already uses this ctid anywhere in the cluster, so install does not collide. Passes when install is run with force=true.",
+    labels: ["live"],
+    appliesTo: ["install"],
+    execute: async (context: CheckContext): Promise<CheckResult> => {
+      if (context.unresolvedMethodArgs?.force === true) return { pass: true };
+      const ctid = context.globalArgs.ctid;
+      const probe = await probeNode(
+        context,
+        `ls /etc/pve/nodes/*/lxc/${ctid}.conf /etc/pve/nodes/*/qemu-server/${ctid}.conf 2>/dev/null; true`,
+      );
+      if (!probe.ok) return { pass: false, errors: probe.errors };
+      const used = probe.res.out.split("\n").map((l) => l.trim()).filter((l) =>
+        l.endsWith(".conf")
+      );
+      if (used.length > 0) {
+        return {
+          pass: false,
+          errors: [
+            `ctid ${ctid} is already in use (${
+              used.join(", ")
+            }). Pick another ctid, run install with force=true, or skip with --skip-check ctid-free.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "container-exists": {
+    description:
+      "Verify the container answers to pct status on the node. Does not need the app or the container to be healthy: safeUpdate has its own baseline and rollback logic.",
+    labels: ["live"],
+    appliesTo: ["safeUpdate"],
+    execute: async (context: CheckContext): Promise<CheckResult> => {
+      const ctid = context.globalArgs.ctid;
+      const probe = await probeNode(context, `pct status ${ctid}`);
+      if (!probe.ok) return { pass: false, errors: probe.errors };
+      if (probe.res.rc !== 0) {
+        return {
+          pass: false,
+          errors: [
+            `Container ${ctid} was not found on node "${context.globalArgs.node}" (${
+              probe.res.out.slice(0, 200)
+            }). Fix node or ctid in the definition, or skip with --skip-check container-exists.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+  "snapshot-available": {
+    description:
+      "Verify the snapshot to roll back to exists for the ctid: the named snapshot, or at least one preupdate-* snapshot when none is named. Does not need the container to be running or healthy.",
+    labels: ["live"],
+    appliesTo: ["rollback"],
+    execute: async (context: CheckContext): Promise<CheckResult> => {
+      const ctid = context.globalArgs.ctid;
+      const probe = await probeNode(context, `pct listsnapshot ${ctid}`);
+      if (!probe.ok) return { pass: false, errors: probe.errors };
+      if (probe.res.rc !== 0) {
+        return {
+          pass: false,
+          errors: [
+            `Could not list snapshots of container ${ctid} on node "${context.globalArgs.node}" (${
+              probe.res.out.slice(0, 200)
+            }). Fix node or ctid, or skip with --skip-check snapshot-available.`,
+          ],
+        };
+      }
+      const names = parseSnapshots(probe.res.out).map((s) => s.name);
+      const requested = stringArg(context, "snapshot");
+      if (requested) {
+        if (!names.includes(requested)) {
+          return {
+            pass: false,
+            errors: [
+              `Snapshot "${requested}" does not exist for container ${ctid}. Existing snapshots: ${
+                names.join(", ") || "none"
+              }. Pass a snapshot that exists, or skip with --skip-check snapshot-available.`,
+            ],
+          };
+        }
+        return { pass: true };
+      }
+      if (!names.some((n) => n.startsWith("preupdate-"))) {
+        return {
+          pass: false,
+          errors: [
+            `No preupdate-* snapshot exists for container ${ctid} (snapshots: ${
+              names.join(", ") || "none"
+            }). Pass an explicit snapshot name, or skip with --skip-check snapshot-available.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
+};
+
 /** Model definition: manage a PVE community-scripts LXC with safe updates. */
 export const model = {
   type: "@dmc/proxmox/community-script",
@@ -948,6 +1202,7 @@ export const model = {
       garbageCollection: 5,
     },
   },
+  checks,
   methods: {
     status: {
       description:

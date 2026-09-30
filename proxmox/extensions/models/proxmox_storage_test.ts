@@ -2,7 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   createModelTestContext,
   withMockedCommand,
-} from "jsr:@systeminit/swamp-testing";
+} from "jsr:@systeminit/swamp-testing@0.20260604.20";
 import { model } from "./proxmox_storage.ts";
 
 const globalArgs = {
@@ -156,4 +156,13 @@ Deno.test("storage-target-exists check fails when the storage is inactive", asyn
   );
 
   assertEquals(result.pass, false);
+});
+
+Deno.test("every method is covered by a check", () => {
+  for (const method of Object.keys(model.methods)) {
+    const covering = Object.values(model.checks).filter((c) =>
+      c.appliesTo.includes(method)
+    );
+    assertEquals(covering.length > 0, true, `${method} has no check`);
+  }
 });
