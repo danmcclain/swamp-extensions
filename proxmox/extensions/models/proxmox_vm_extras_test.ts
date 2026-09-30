@@ -39,7 +39,7 @@ Deno.test("cluster-has-migration-target passes for a healthy multi-node cluster"
         ],
       }),
     ],
-    () => clusterCheck.execute(context),
+    () => clusterCheck.execute({ ...context, methodName: "migrate" }),
   );
 
   assertEquals(result, { pass: true });
@@ -50,7 +50,7 @@ Deno.test("cluster-has-migration-target fails on a standalone node", async () =>
 
   const { result } = await withMockedCommand(
     [httpOutput(200, { data: [{ type: "node", name: "pve", online: 1 }] })],
-    () => clusterCheck.execute(context),
+    () => clusterCheck.execute({ ...context, methodName: "migrate" }),
   );
 
   assertEquals(result.pass, false);
@@ -68,7 +68,7 @@ Deno.test("cluster-has-migration-target fails when the node is reported offline"
         ],
       }),
     ],
-    () => clusterCheck.execute(context),
+    () => clusterCheck.execute({ ...context, methodName: "migrate" }),
   );
 
   assertEquals(result.pass, false);
@@ -79,7 +79,7 @@ Deno.test("cluster-has-migration-target fails when the cluster status call error
 
   const { result } = await withMockedCommand(
     [httpOutput(500, {})],
-    () => clusterCheck.execute(context),
+    () => clusterCheck.execute({ ...context, methodName: "migrate" }),
   );
 
   assertEquals(result.pass, false);
@@ -314,6 +314,25 @@ Deno.test("vmid-free fails when the API call errors", async () => {
     [httpOutput(500, {})],
   );
   assertEquals(result.pass, false);
+});
+
+Deno.test("vmid-free passes without a call under a plain `swamp model validate` (empty methodName), even for a taken vmid", async () => {
+  // An existing VM's own vmid (merged in from its global args) is always taken.
+  const { result, calls } = await runCheck("vmid-free", "", { vmid: 100 }, [
+    httpOutput(200, { data: [{ vmid: 100, name: "this-vm" }] }),
+  ]);
+  assertEquals(result, { pass: true });
+  assertEquals(calls.length, 0);
+});
+
+Deno.test("cluster-has-migration-target passes without a call under a plain `swamp model validate` (empty methodName)", async () => {
+  const { context } = createModelTestContext({ globalArgs });
+  const { result, calls } = await withMockedCommand(
+    [httpOutput(200, { data: [{ type: "node", name: "pve", online: 1 }] })],
+    () => clusterCheck.execute({ ...context, methodName: "" }),
+  );
+  assertEquals(result, { pass: true });
+  assertEquals(calls.length, 0);
 });
 
 Deno.test("target-storage-exists passes for an active storage (createFromImage and moveDisk)", async () => {

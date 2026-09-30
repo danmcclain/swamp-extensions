@@ -92,6 +92,13 @@ The `rollback` checks never need the container to be running or healthy: a
 broken container is the reason to roll back. Skip checks with
 `--skip-check <name>`, `--skip-check-label <policy|live>` or `--skip-checks`.
 
+`install-app-present`, `ctid-free` and `snapshot-available` test a precondition
+of one specific method that a managed container normally fails (its ctid is
+taken, it has no `app`, it may have no retained snapshot). They are evaluated
+only when their method is selected — a real run, or
+`swamp model validate <name> --method <method>` — and pass under a plain
+`swamp model validate <name>`.
+
 ### `@keeb/proxmox/vm` extension
 
 Extends `@keeb/proxmox/vm`, the base QEMU VM model from `@keeb/proxmox`, with
@@ -150,7 +157,10 @@ method's own validation decides.
 | `cluster-has-migration-target` | `live`   | `migrate`                                                                                                         | the node is in a multi-node cluster                           |
 
 Skip checks with `--skip-check <name>`, `--skip-check-label <policy|live>` or
-`--skip-checks`.
+`--skip-checks`. `vmid-free` and `cluster-has-migration-target` are evaluated
+only when their method is selected (a real run or `validate --method`); a plain
+`swamp model validate <name>` passes them, since an existing VM's own vmid is
+taken and a standalone node has no migration target.
 
 ## Usage
 

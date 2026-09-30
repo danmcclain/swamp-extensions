@@ -496,6 +496,8 @@ async function runCheck(
     globalArgs?: Record<string, unknown>;
     methodArgs?: Record<string, unknown>;
     handler?: (remote: string) => { stdout: string; code: number };
+    /** Defaults to the check's own method; "" models a plain `swamp model validate`. */
+    methodName?: string;
   } = {},
 ) {
   const { context } = createModelTestContext({
@@ -503,6 +505,7 @@ async function runCheck(
   });
   const ctx = {
     ...context,
+    methodName: opts.methodName ?? model.checks[name].appliesTo[0],
     unresolvedMethodArgs: opts.methodArgs,
   } as unknown as CheckCtx;
   const remotes: string[] = [];
@@ -725,6 +728,45 @@ Deno.test("snapshot-available fails when pct listsnapshot fails", async () => {
     handler: () => sshOut("Configuration file does not exist", 2),
   });
   assertEquals(result.pass, false);
+});
+
+Deno.test("method-specific preconditions pass without probing under a plain `swamp model validate` (empty methodName)", async () => {
+  // A managed instance: its container exists, it has no app slug, and it has
+  // no retained snapshot. Every probe would fail — none may run.
+  for (
+    const name of [
+      "install-app-present",
+      "ctid-free",
+      "snapshot-available",
+    ] as const
+  ) {
+    const { result, remotes } = await runCheck(name, {
+      methodName: "",
+      globalArgs: { ...baseArgs },
+      handler: () => sshOut("/etc/pve/nodes/pve1/lxc/601.conf", 1),
+    });
+    assertEquals(result, { pass: true }, name);
+    assertEquals(remotes, [], name);
+  }
+});
+
+Deno.test("method-specific preconditions still gate under `swamp model validate --method <theirs>`", async () => {
+  const { result: noApp } = await runCheck("install-app-present", {
+    methodName: "install",
+    globalArgs: { ...baseArgs },
+  });
+  assertEquals(noApp.pass, false);
+  const { result: taken } = await runCheck("ctid-free", {
+    methodName: "install",
+    methodArgs: { force: false },
+    handler: () => sshOut("/etc/pve/nodes/pve1/lxc/601.conf"),
+  });
+  assertEquals(taken.pass, false);
+  const { result: noSnap } = await runCheck("snapshot-available", {
+    methodName: "rollback",
+    handler: () => sshOut(" `-> current   You are here!"),
+  });
+  assertEquals(noSnap.pass, false);
 });
 
 Deno.test("rollback checks do not need a healthy or running container (recovery rule)", async () => {

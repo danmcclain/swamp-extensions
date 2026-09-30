@@ -915,6 +915,8 @@ function snapshotName(): string {
 interface CheckContext {
   globalArgs: GlobalArgs;
   repoDir: string;
+  /** The selected method; empty for a plain `swamp model validate <name>`. */
+  methodName?: string;
   /** Method args merged over global args (raw, before expression resolution). */
   unresolvedMethodArgs?: Record<string, unknown>;
 }
@@ -989,6 +991,17 @@ function stringArg(
     : undefined;
 }
 
+/**
+ * True only when `method` is the method being run (or validated with
+ * `--method`). A plain `swamp model validate <name>` runs every check with an
+ * empty methodName; method-specific preconditions that contradict a managed
+ * instance's normal state (the container exists, no app slug, no retained
+ * snapshot) must pass there, or validation could never succeed.
+ */
+function selected(ctx: CheckContext, method: string): boolean {
+  return ctx.methodName === method;
+}
+
 const CHECK_METHODS = ["install", "safeUpdate", "rollback"];
 
 const checks = {
@@ -1017,17 +1030,19 @@ const checks = {
   },
   "install-app-present": {
     description:
-      "Verify the definition sets the community-scripts app slug that install needs",
+      "Verify the definition sets the community-scripts app slug that install needs. Only evaluated when install is the selected method.",
     labels: ["policy"],
     appliesTo: ["install"],
     execute: (context: CheckContext): Promise<CheckResult> =>
       Promise.resolve(
-        context.globalArgs.app ? { pass: true } : {
-          pass: false,
-          errors: [
-            'Global arg "app" is not set. Set the community-scripts slug (for example "forgejo") in the model definition, or skip with --skip-check install-app-present.',
-          ],
-        },
+        !selected(context, "install") || context.globalArgs.app
+          ? { pass: true }
+          : {
+            pass: false,
+            errors: [
+              'Global arg "app" is not set. Set the community-scripts slug (for example "forgejo") in the model definition, or skip with --skip-check install-app-present.',
+            ],
+          },
       ),
   },
   "node-reachable": {
@@ -1051,10 +1066,11 @@ const checks = {
   },
   "ctid-free": {
     description:
-      "Verify no container or VM already uses this ctid anywhere in the cluster, so install does not collide. Passes when install is run with force=true.",
+      "Verify no container or VM already uses this ctid anywhere in the cluster, so install does not collide. Passes when install is run with force=true. Only evaluated when install is the selected method.",
     labels: ["live"],
     appliesTo: ["install"],
     execute: async (context: CheckContext): Promise<CheckResult> => {
+      if (!selected(context, "install")) return { pass: true };
       if (context.unresolvedMethodArgs?.force === true) return { pass: true };
       const ctid = context.globalArgs.ctid;
       const probe = await probeNode(
@@ -1102,10 +1118,11 @@ const checks = {
   },
   "snapshot-available": {
     description:
-      "Verify the snapshot to roll back to exists for the ctid: the named snapshot, or at least one preupdate-* snapshot when none is named. Does not need the container to be running or healthy.",
+      "Verify the snapshot to roll back to exists for the ctid: the named snapshot, or at least one preupdate-* snapshot when none is named. Does not need the container to be running or healthy. Only evaluated when rollback is the selected method.",
     labels: ["live"],
     appliesTo: ["rollback"],
     execute: async (context: CheckContext): Promise<CheckResult> => {
+      if (!selected(context, "rollback")) return { pass: true };
       const ctid = context.globalArgs.ctid;
       const probe = await probeNode(context, `pct listsnapshot ${ctid}`);
       if (!probe.ok) return { pass: false, errors: probe.errors };

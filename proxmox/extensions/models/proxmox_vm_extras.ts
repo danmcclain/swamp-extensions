@@ -99,6 +99,16 @@ interface VmCheckContext {
   unresolvedMethodArgs?: Record<string, unknown>;
 }
 
+/**
+ * True only when `method` is the method being run (or validated with
+ * `--method`). A plain `swamp model validate <name>` runs every check with an
+ * empty methodName; method-specific preconditions that contradict an existing
+ * guest's normal state (its vmid is taken, a standalone node) must pass there.
+ */
+function selected(ctx: { methodName?: string }, method: string): boolean {
+  return ctx.methodName === method;
+}
+
 /** Result shape swamp expects from a check. */
 interface CheckResult {
   pass: boolean;
@@ -256,10 +266,11 @@ const preflightChecks = {
   },
   "vmid-free": {
     description:
-      "Verify the explicit vmid is not already used by any VM or container in the cluster. Passes when no vmid is given (Proxmox picks one).",
+      "Verify the explicit vmid is not already used by any VM or container in the cluster. Passes when no vmid is given (Proxmox picks one). Only evaluated when createFromImage is the selected method.",
     labels: ["live"],
     appliesTo: ["createFromImage"],
     execute: async (ctx: VmCheckContext): Promise<CheckResult> => {
+      if (!selected(ctx, "createFromImage")) return { pass: true };
       const vmid = ctx.unresolvedMethodArgs?.vmid;
       if (typeof vmid !== "number") return { pass: true };
       const res = await checkApiGet(
@@ -388,10 +399,11 @@ export const extension = {
   checks: [{
     "cluster-has-migration-target": {
       description:
-        "Verify the node is part of a multi-node Proxmox cluster — migration has nowhere to go on a standalone node",
+        "Verify the node is part of a multi-node Proxmox cluster — migration has nowhere to go on a standalone node. Only evaluated when migrate is the selected method.",
       labels: ["live"],
       appliesTo: ["migrate"],
       execute: async (context) => {
+        if (!selected(context, "migrate")) return { pass: true };
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
 
