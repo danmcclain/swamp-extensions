@@ -58,6 +58,16 @@ const GlobalArgsSchema = z.object({
   releaseApiUrl: z.string().url().optional().describe(
     "Optional release API URL whose JSON `tag_name` is the latest upstream version, e.g. https://codeberg.org/api/v1/repos/forgejo/forgejo/releases/latest . When set, status/checkUpdate report whether an update is available.",
   ),
+  osManaged: z.boolean().default(false).describe(
+    "True when the app binary is delivered by the container's OS package manager (apk/apt/dnf), " +
+      "not by this updater fetching an upstream release. When true, `latestVersion` is the package " +
+      "manager's available candidate (the actionable update), the releaseApiUrl version is reported " +
+      "separately as `upstreamVersion` (informational drift), and `updateAvailable` compares installed " +
+      "against the package candidate — so an upstream release the repo doesn't ship isn't flagged installable.",
+  ),
+  packageName: z.string().optional().describe(
+    "OS package to query for the available version when osManaged (apk/apt-cache/dnf). Defaults to `app` then `service`.",
+  ),
   healthUrl: z.string().url().optional().describe(
     "Optional HTTP(S) URL probed from the swamp host after update to confirm the app is serving",
   ),
@@ -128,7 +138,9 @@ const StateSchema = z.object({
   version: z.string().nullable(),
   installedVersion: z.string().nullable(),
   latestVersion: z.string().nullable(),
+  upstreamVersion: z.string().nullable(),
   updateAvailable: z.boolean().nullable(),
+  osManaged: z.boolean(),
   healthy: z.boolean(),
   healthUrl: z.string().nullable(),
   httpStatus: z.number().nullable(),
@@ -159,7 +171,9 @@ const UpdateCheckSchema = z.object({
   ctid: z.number(),
   installedVersion: z.string().nullable(),
   latestVersion: z.string().nullable(),
+  upstreamVersion: z.string().nullable(),
   updateAvailable: z.boolean().nullable(),
+  osManaged: z.boolean(),
   checkedAt: z.iso.datetime(),
 });
 
@@ -419,27 +433,82 @@ async function fetchLatestVersion(ga: GlobalArgs): Promise<string | null> {
 }
 
 /**
- * Compute update availability: installed version (from versionCommand output)
- * vs latest upstream release. Returns nulls when the inputs aren't configured or
- * can't be determined — never guesses.
+ * The available candidate version of the app's OS package (apk / apt / dnf), or
+ * null. Used when osManaged so `latestVersion` reflects what the package manager
+ * can actually install, not an upstream release the repo doesn't ship.
+ */
+async function packageManagerVersion(
+  ga: ManageArgs,
+  repoDir: string,
+): Promise<string | null> {
+  const pkg = ga.packageName ?? ga.app ?? ga.service;
+  if (!pkg) return null;
+  const cmd = `if command -v apk >/dev/null 2>&1; then apk policy ${pkg}; ` +
+    `elif command -v apt-cache >/dev/null 2>&1; then apt-cache policy ${pkg}; ` +
+    `elif command -v dnf >/dev/null 2>&1; then dnf --quiet list ${pkg} 2>/dev/null; fi`;
+  try {
+    const r = await nodeExec(
+      ga,
+      repoDir,
+      `pct exec ${ga.ctid} -- sh -c ${shSingleQuote(cmd)}`,
+      60,
+    );
+    if (r.rc !== 0) return null;
+    // Return the highest semver in the output (the candidate the manager would install).
+    const versions = [...r.out.matchAll(/(\d+\.\d+\.\d+)/g)].map((m) => m[1]);
+    if (versions.length === 0) return null;
+    versions.sort(cmpSemver);
+    return versions[versions.length - 1];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compute update availability. For a fetch-managed app (default), `latestVersion`
+ * is the upstream release (releaseApiUrl) and drives `updateAvailable`. For an
+ * osManaged app, `latestVersion` is the OS package manager's candidate (the
+ * actionable update) and the upstream release is reported separately as
+ * `upstreamVersion` (informational drift). Never guesses — nulls when unknown.
  */
 async function computeUpdate(
-  ga: GlobalArgs,
+  ga: ManageArgs,
   rawVersion: string | null,
+  repoDir: string,
 ): Promise<
   {
     installedVersion: string | null;
     latestVersion: string | null;
+    upstreamVersion: string | null;
     updateAvailable: boolean | null;
+    osManaged: boolean;
   }
 > {
   const installedVersion = extractSemver(rawVersion, ga.versionRegex);
-  const latestVersion = await fetchLatestVersion(ga);
+  const upstream = await fetchLatestVersion(ga);
+  let latestVersion: string | null;
+  let upstreamVersion: string | null;
   let updateAvailable: boolean | null = null;
-  if (installedVersion && latestVersion) {
-    updateAvailable = cmpSemver(latestVersion, installedVersion) > 0;
+  if (ga.osManaged) {
+    latestVersion = await packageManagerVersion(ga, repoDir);
+    upstreamVersion = upstream; // informational drift
+    if (installedVersion && latestVersion) {
+      updateAvailable = cmpSemver(latestVersion, installedVersion) > 0;
+    }
+  } else {
+    latestVersion = upstream; // the upstream release IS what gets installed
+    upstreamVersion = null;
+    if (installedVersion && latestVersion) {
+      updateAvailable = cmpSemver(latestVersion, installedVersion) > 0;
+    }
   }
-  return { installedVersion, latestVersion, updateAvailable };
+  return {
+    installedVersion,
+    latestVersion,
+    upstreamVersion,
+    updateAvailable,
+    osManaged: ga.osManaged,
+  };
 }
 
 /** Best-effort fetch of a text resource (script, build.func). Null on any error. */
@@ -880,7 +949,7 @@ export const model = {
         const ga = requireManage(context.globalArgs);
         const health = await checkHealth(ga, context.repoDir);
         const version = await readVersion(ga, context.repoDir);
-        const upd = await computeUpdate(ga, version);
+        const upd = await computeUpdate(ga, version, context.repoDir);
         const snapshots = await listSnapshots(ga, context.repoDir);
         const handle = await context.writeResource("state", "state", {
           name: ga.appName,
@@ -891,7 +960,9 @@ export const model = {
           version,
           installedVersion: upd.installedVersion,
           latestVersion: upd.latestVersion,
+          upstreamVersion: upd.upstreamVersion,
           updateAvailable: upd.updateAvailable,
+          osManaged: upd.osManaged,
           healthy: health.healthy,
           healthUrl: ga.healthUrl ?? null,
           httpStatus: health.httpStatus,
@@ -1115,7 +1186,7 @@ export const model = {
       }) => {
         const ga = requireManage(context.globalArgs);
         const version = await readVersion(ga, context.repoDir);
-        const upd = await computeUpdate(ga, version);
+        const upd = await computeUpdate(ga, version, context.repoDir);
         const handle = await context.writeResource(
           "updateCheck",
           "updateCheck",
@@ -1125,7 +1196,9 @@ export const model = {
             ctid: ga.ctid,
             installedVersion: upd.installedVersion,
             latestVersion: upd.latestVersion,
+            upstreamVersion: upd.upstreamVersion,
             updateAvailable: upd.updateAvailable,
+            osManaged: upd.osManaged,
             checkedAt: new Date().toISOString(),
           },
         );
@@ -1393,7 +1466,7 @@ export const model = {
           );
         }
         const rbVersion = await readVersion(ga, repoDir);
-        const rbUpd = await computeUpdate(ga, rbVersion);
+        const rbUpd = await computeUpdate(ga, rbVersion, context.repoDir);
         const handle = await context.writeResource("state", "state", {
           name: ga.appName,
           node: ga.node,
@@ -1403,7 +1476,9 @@ export const model = {
           version: rbVersion,
           installedVersion: rbUpd.installedVersion,
           latestVersion: rbUpd.latestVersion,
+          upstreamVersion: rbUpd.upstreamVersion,
           updateAvailable: rbUpd.updateAvailable,
+          osManaged: rbUpd.osManaged,
           healthy: health.healthy,
           healthUrl: ga.healthUrl ?? null,
           httpStatus: health.httpStatus,
