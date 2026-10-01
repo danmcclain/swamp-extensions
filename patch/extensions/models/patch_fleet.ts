@@ -634,14 +634,21 @@ async function runModelMethod(
   return out.code === 0;
 }
 
-/** Fire `swamp model method run <model> <method> --input k:json=<v>…`; returns success. */
-async function runModelMethodInput(
+/** Outcome of one `swamp model method run` call: success flag plus the output tails. */
+export interface MethodRunResult {
+  ok: boolean;
+  rc: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** Run `swamp model method run <model> <method> --input k:json=<v>…`; no logging. */
+async function execModelMethodInput(
   model: string,
   method: string,
   input: Record<string, unknown>,
   repoDir: string,
-  logger: Logger,
-): Promise<boolean> {
+): Promise<MethodRunResult> {
   const inputArgs: string[] = [];
   for (const [k, v] of Object.entries(input)) {
     inputArgs.push("--input", `${k}:json=${JSON.stringify(v)}`);
@@ -664,15 +671,78 @@ async function runModelMethodInput(
     stderr: "piped",
   });
   const out = await proc.output();
-  if (out.code !== 0) {
+  return {
+    ok: out.code === 0,
+    rc: out.code,
+    stdout: new TextDecoder().decode(out.stdout).slice(-1000),
+    stderr: new TextDecoder().decode(out.stderr).slice(-1000),
+  };
+}
+
+/** Fire `swamp model method run <model> <method> --input k:json=<v>…`; returns success. */
+async function runModelMethodInput(
+  model: string,
+  method: string,
+  input: Record<string, unknown>,
+  repoDir: string,
+  logger: Logger,
+): Promise<boolean> {
+  const res = await execModelMethodInput(model, method, input, repoDir);
+  if (!res.ok) {
     logger.warn("{model} {method} failed with rc {rc}: {stderr}", {
       model,
       method,
-      rc: out.code,
-      stderr: new TextDecoder().decode(out.stderr).slice(-300),
+      rc: res.rc,
+      stderr: res.stderr.slice(-300),
     });
   }
-  return out.code === 0;
+  return res.ok;
+}
+
+/** True when a failed run says the method does not know the argument `name`.
+ *  swamp prints "Unknown method input(s): <names>. Valid inputs are: …". */
+export function isUnknownArgumentError(
+  res: MethodRunResult,
+  name: string,
+): boolean {
+  if (res.ok) return false;
+  const text = `${res.stderr}\n${res.stdout}`;
+  // Only the part before "Valid inputs" lists the rejected names.
+  const rejected = text.split(/valid inputs/i)[0];
+  return /unknown|unrecognized/i.test(rejected) &&
+    new RegExp(`\\b${name}\\b`).test(rejected);
+}
+
+/** Run the community-script source's `safeUpdate` for a CT whose snapshot @dmc/patch
+ *  already owns: passes `{ snapshot: false }` so the source takes no snapshot of its own.
+ *  An older source (@dmc/proxmox < 2026.10.01.1) rejects that argument; then retry ONCE
+ *  with no arguments. Any other failure is returned as is, never retried. */
+export async function runSourceSafeUpdate(
+  src: string,
+  repoDir: string,
+  logger: Logger,
+): Promise<boolean> {
+  const first = await execModelMethodInput(
+    src,
+    "safeUpdate",
+    { snapshot: false },
+    repoDir,
+  );
+  if (first.ok) return true;
+  if (!isUnknownArgumentError(first, "snapshot")) {
+    logger.warn("{model} {method} failed with rc {rc}: {stderr}", {
+      model: src,
+      method: "safeUpdate",
+      rc: first.rc,
+      stderr: first.stderr.slice(-300),
+    });
+    return false;
+  }
+  logger.warn(
+    "{model} safeUpdate does not support snapshot:false (needs @dmc/proxmox >= 2026.10.01.1), so it took its own extra snapshot",
+    { model: src },
+  );
+  return await runModelMethod(src, "safeUpdate", repoDir);
 }
 
 /** Run one shell command on a single host via `<sshModel> exec`; returns rc + output.
@@ -868,6 +938,13 @@ export interface HealthResult {
   results: Array<{ label: string; ok: boolean; detail: string }>;
 }
 
+/** The inventory record's `health` field for a verdict (null when no checks ran). */
+export function inventoryHealth(
+  h: HealthResult | null,
+): { healthy: boolean; checks: HealthResult["results"] } | null {
+  return h ? { healthy: h.healthy, checks: h.results } : null;
+}
+
 /** Evaluate a machine's health checks (all must pass). Empty list ⇒ healthy=true. */
 export async function evalHealth(
   m: MachineShape,
@@ -917,6 +994,43 @@ export async function evalHealth(
     results.push({ label, ok, detail });
   }
   return { healthy: results.every((r) => r.ok), results };
+}
+
+/** Timing of the post-update health re-checks. Tests shrink it; the defaults are real. */
+export const healthPolling: {
+  intervalMs: number;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+} = {
+  intervalMs: 10_000,
+  sleep: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
+  now: () => Date.now(),
+};
+
+/** Evaluate health, and while it is unhealthy re-evaluate every `intervalMs` (10 s)
+ *  until it is healthy or `graceSec` has elapsed. Returns the final result. Each failed
+ *  attempt is logged at info with the failing labels. `graceSec` 0 = one evaluation.
+ *  A `docker-ce` upgrade restarts every container, so the first check can read
+ *  unhealthy for a good update. Do NOT use this for a pre-flight check. */
+export async function evalHealthWithGrace(
+  evaluate: () => Promise<HealthResult>,
+  graceSec: number,
+  logger: Logger,
+  timing: Pick<typeof healthPolling, "intervalMs" | "sleep" | "now"> =
+    healthPolling,
+): Promise<HealthResult> {
+  const deadline = timing.now() + graceSec * 1000;
+  for (let attempt = 1;; attempt++) {
+    const res = await evaluate();
+    if (res.healthy) return res;
+    logger.info("health attempt {attempt} failed: {labels}", {
+      attempt,
+      labels: res.results.filter((r) => !r.ok).map((r) => r.label).join("; "),
+    });
+    const remainingMs = deadline - timing.now();
+    if (remainingMs <= 0) return res;
+    await timing.sleep(Math.min(timing.intervalMs, remainingMs));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,7 +1315,15 @@ export async function checkSnapshotTargetResolves(
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.09.27.1",
+  version: "2026.10.01.1",
+  upgrades: [
+    {
+      toVersion: "2026.10.01.1",
+      description:
+        "Version bump, no globalArguments schema change (adds the healthGraceSec method argument and single-snapshot CT updates)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgs,
   resources: {
     inventory: {
@@ -1976,12 +2098,16 @@ export const model = {
         rollbackOnFailure: z.boolean().default(true).describe(
           "Roll back when the machine is unhealthy after the upgrade",
         ),
+        healthGraceSec: z.number().int().min(0).default(120).describe(
+          "Grace window for the post-update health check. While the machine is unhealthy, re-check every 10 s until healthy or this many seconds have passed (a docker-ce upgrade restarts every container). 0 = check once.",
+        ),
       }),
       execute: async (args: {
         host: string;
         mode: "safe" | "full";
         retentionHours: number;
         rollbackOnFailure: boolean;
+        healthGraceSec: number;
       }, context: Ctx) => {
         const { sshModel, machines } = context.globalArgs;
         const repoDir = context.repoDir;
@@ -2005,9 +2131,16 @@ export const model = {
         // with `--skip-check baseline-healthy`); here they judge the result only.
         const checks = await resolveHealthChecks(machine, repoDir);
         // After an update: health verdict. With checks → evalHealth; else reachability.
+        // Last post-update verdict, written into the refreshed inventory record.
+        let lastHealth: HealthResult | null = null;
         const afterHealthy = async (reachable: boolean): Promise<boolean> => {
           if (!checks.length) return reachable;
-          const h = await evalHealth(machine, checks, sshModel, repoDir);
+          const h = await evalHealthWithGrace(
+            () => evalHealth(machine, checks, sshModel, repoDir),
+            args.healthGraceSec,
+            context.logger,
+          );
+          lastHealth = h;
           log(
             `post-update health: ${
               h.results.map((r) => `${r.ok ? "✓" : "✗"} ${r.label}`).join("; ")
@@ -2138,7 +2271,9 @@ export const model = {
           const src = appSource(machine);
           let appNote = "";
           if (src) {
-            const ok = await runModelMethod(src, "safeUpdate", repoDir);
+            // This method owns the snapshot (taken above) and the rollback, so the
+            // source must not take a second, untracked snapshot.
+            const ok = await runSourceSafeUpdate(src, repoDir, context.logger);
             appNote = `; app ${src}: ${ok ? "ok" : "failed"}`;
             log(`app source ${src} safeUpdate: ${ok ? "ok" : "failed"}`);
           }
@@ -2249,6 +2384,8 @@ export const model = {
               await context.writeResource("inventory", args.host, {
                 ...after,
                 reachMethod: "pct",
+                // After a rollback the restored state is unchecked: leave it to the next scan.
+                health: rolledBack ? null : inventoryHealth(lastHealth),
                 error: null,
               }),
             );
@@ -2468,6 +2605,8 @@ export const model = {
             await context.writeResource("inventory", args.host, {
               ...after,
               reachMethod: "ssh",
+              // After a rollback the restored state is unchecked: leave it to the next scan.
+              health: rolledBack ? null : inventoryHealth(lastHealth),
               error: null,
             }),
           );
@@ -2491,12 +2630,16 @@ export const model = {
           "Wait for the host to return, then re-scan to confirm",
         ),
         waitTimeoutSec: z.number().int().default(300),
+        healthGraceSec: z.number().int().min(0).default(120).describe(
+          "Grace window for the post-reboot health detection. While the machine is unhealthy, re-check every 10 s until healthy or this many seconds have passed. 0 = check once.",
+        ),
       }),
       execute: async (args: {
         host: string;
         force: boolean;
         wait: boolean;
         waitTimeoutSec: number;
+        healthGraceSec: number;
       }, context: Ctx) => {
         const { sshModel, machines } = context.globalArgs;
         const repoDir = context.repoDir;
@@ -2691,9 +2834,15 @@ export const model = {
         // retained pre-update snapshot, never automatic here.
         const checks = await resolveHealthChecks(machine, repoDir);
         let appHealthy: boolean | null = null;
+        let rebootHealth: HealthResult | null = null;
         if (confirmed && checks.length) {
-          const h = await evalHealth(machine, checks, sshModel, repoDir);
+          const h = await evalHealthWithGrace(
+            () => evalHealth(machine, checks, sshModel, repoDir),
+            args.healthGraceSec,
+            context.logger,
+          );
           appHealthy = h.healthy;
+          rebootHealth = h;
           log(
             `post-reboot health: ${
               h.results.map((r) => `${r.ok ? "✓" : "✗"} ${r.label}`).join("; ")
@@ -2744,6 +2893,7 @@ export const model = {
             await context.writeResource("inventory", args.host, {
               ...confirmInv,
               reachMethod: via,
+              health: inventoryHealth(rebootHealth),
               error: null,
             }),
           );
