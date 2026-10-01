@@ -73,6 +73,19 @@ detection), optional `healthUrl` (end-to-end HTTP readiness probe).
   upstream release tag; sets `updateAvailable`
 - `safeUpdate` — snapshot → update → validate → auto-rollback on failure.
   Refuses to run on an already-unhealthy container unless `force: true`.
+  Arguments:
+  - `force` (default `false`) — proceed even if the container is unhealthy
+    before the update.
+  - `keepSnapshot` (default `true`) — keep the `preupdate-*` snapshot after a
+    successful update; `false` deletes it. Ignored when `snapshot` is `false`.
+  - `snapshot` (default `true`) — `false` takes no snapshot and never rolls
+    back. Use it when the caller already holds its own snapshot and owns the
+    rollback (for example `@dmc/patch` `safeOsUpdate` snapshots before the OS
+    upgrade, so a second untracked `preupdate-*` snapshot only piles up on the
+    node). The baseline health gate, the update, and the post-update health
+    check still run. If the app is unhealthy afterwards, the method records
+    `outcome: "failed"` (`snapshot: null`, `snapshotTaken: false`,
+    `rolledBack: false`) and throws, so the caller can roll back.
 - `rollback` — roll back to a named snapshot, or the most recent `preupdate-*`
   one
 
@@ -219,6 +232,9 @@ swamp model method run forgejo checkUpdate
 
 # Snapshot → update → validate → roll back if it comes back unhealthy
 swamp model method run forgejo safeUpdate
+
+# Caller already holds its own snapshot and owns the rollback: take none here
+swamp model method run forgejo safeUpdate --input snapshot:json=false
 ```
 
 ### Provision a new community-scripts LXC (headless)

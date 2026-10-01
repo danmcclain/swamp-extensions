@@ -274,6 +274,164 @@ Deno.test("safeUpdate rolls back and throws when the app is unhealthy after upda
   assertEquals(result?.healthyAfter, true); // healthy again post-rollback
 });
 
+/**
+ * Run safeUpdate against a mocked node and record every remote command.
+ * `broken` makes the app unhealthy after the update runs.
+ */
+async function runSafeUpdate(
+  args: { force: boolean; keepSnapshot: boolean; snapshot?: boolean },
+  broken: boolean,
+) {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: {
+      ...baseArgs,
+      versionCommand: "/bin/app --version",
+      healthUrl: "https://app.example.test/health",
+    },
+  });
+  const commands: string[] = [];
+  let updated = false;
+  let error: Error | null = null;
+  try {
+    await withMockedFetch(
+      () => new Response("", { status: updated && broken ? 502 : 200 }),
+      () =>
+        withMockedCommand((_cmd, a) => {
+          const c = remoteCommand(a);
+          commands.push(c);
+          if (c.includes("/usr/bin/update")) {
+            updated = true;
+            return sshOut("Updated successfully!");
+          }
+          if (c.includes("pct status")) return sshOut("status: running");
+          if (c.includes("systemctl is-active")) {
+            return updated && broken
+              ? sshOut("failed", 3)
+              : sshOut("active", 0);
+          }
+          if (c.includes("--version")) {
+            return sshOut(updated ? "app 2.0.0" : "app 1.0.0");
+          }
+          return sshOut("");
+        }, () =>
+          model.methods.safeUpdate.execute(args, asCtx(context))),
+    );
+  } catch (e) {
+    error = e as Error;
+  }
+  return { commands, error, result: getWrittenResources().at(-1)?.data };
+}
+
+Deno.test("safeUpdate snapshot:false takes no snapshot, runs the update and keeps a healthy result", async () => {
+  const { commands, error, result } = await runSafeUpdate(
+    { force: false, keepSnapshot: true, snapshot: false },
+    false,
+  );
+  assertEquals(error, null);
+  assertEquals(commands.some((c) => c.includes("pct snapshot")), false);
+  assertEquals(commands.some((c) => c.includes("pct delsnapshot")), false);
+  assertEquals(commands.some((c) => c.includes("pct rollback")), false);
+  assertEquals(commands.some((c) => c.includes("/usr/bin/update")), true);
+  assertEquals(result?.outcome, "updated");
+  assertEquals(result?.snapshot, null);
+  assertEquals(result?.snapshotTaken, false);
+  assertEquals(result?.healthyAfter, true);
+  assertEquals(result?.rolledBack, false);
+});
+
+Deno.test("safeUpdate snapshot:false ignores keepSnapshot:false (no delete command)", async () => {
+  const { commands, error, result } = await runSafeUpdate(
+    { force: false, keepSnapshot: false, snapshot: false },
+    false,
+  );
+  assertEquals(error, null);
+  assertEquals(commands.some((c) => c.includes("pct delsnapshot")), false);
+  assertEquals(commands.some((c) => c.includes("pct snapshot")), false);
+  assertEquals(result?.snapshot, null);
+  assertEquals(result?.snapshotTaken, false);
+});
+
+Deno.test("safeUpdate snapshot:false surfaces an unhealthy app as a failure without rollback", async () => {
+  const { commands, error, result } = await runSafeUpdate(
+    { force: false, keepSnapshot: true, snapshot: false },
+    true,
+  );
+  assertEquals(error instanceof Error, true);
+  assertStringIncludes(error!.message, "update failed validation");
+  assertStringIncludes(error!.message, "caller owns the snapshot and rollback");
+  assertEquals(commands.some((c) => c.includes("pct snapshot")), false);
+  assertEquals(commands.some((c) => c.includes("pct rollback")), false);
+  assertEquals(commands.some((c) => c.includes("pct stop")), false);
+  assertEquals(commands.some((c) => c.includes("/usr/bin/update")), true);
+  assertEquals(result?.outcome, "failed");
+  assertEquals(result?.rolledBack, false);
+  assertEquals(result?.snapshot, null);
+  assertEquals(result?.snapshotTaken, false);
+  assertEquals(result?.healthyAfter, false);
+  assertStringIncludes(String(result?.logs), "caller owns the snapshot");
+});
+
+Deno.test("safeUpdate snapshot:false still runs the baseline health gate", async () => {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: { ...baseArgs, versionCommand: "/bin/app --version" },
+  });
+  const commands: string[] = [];
+  await assertRejects(
+    () =>
+      withMockedCommand((_cmd, args) => {
+        const c = remoteCommand(args);
+        commands.push(c);
+        if (c.includes("pct status")) return sshOut("status: stopped");
+        return sshOut("");
+      }, () =>
+        model.methods.safeUpdate.execute(
+          { force: false, keepSnapshot: true, snapshot: false },
+          asCtx(context),
+        )),
+    Error,
+    "not healthy before the update",
+  );
+  assertEquals(commands.some((c) => c.includes("/usr/bin/update")), false);
+  assertEquals(getWrittenResources().at(-1)?.data.outcome, "skipped");
+});
+
+Deno.test("safeUpdate snapshot:true takes a snapshot and keeps it (explicit and default)", async () => {
+  for (const snapshot of [true, undefined]) {
+    const { commands, error, result } = await runSafeUpdate(
+      { force: false, keepSnapshot: true, snapshot },
+      false,
+    );
+    assertEquals(error, null);
+    assertEquals(commands.some((c) => c.includes("pct snapshot")), true);
+    assertEquals(commands.some((c) => c.includes("pct delsnapshot")), false);
+    assertEquals(String(result?.snapshot).startsWith("preupdate-"), true);
+    assertEquals(result?.snapshotTaken, true);
+    assertEquals(result?.outcome, "updated");
+  }
+});
+
+Deno.test("safeUpdate snapshot:true with keepSnapshot:false deletes the snapshot", async () => {
+  const { commands, result } = await runSafeUpdate(
+    { force: false, keepSnapshot: false, snapshot: true },
+    false,
+  );
+  assertEquals(commands.some((c) => c.includes("pct snapshot")), true);
+  assertEquals(commands.some((c) => c.includes("pct delsnapshot")), true);
+  assertEquals(result?.snapshot, null);
+  assertEquals(result?.snapshotTaken, true);
+});
+
+Deno.test("safeUpdate snapshot:true rolls back on an unhealthy update", async () => {
+  const { commands, error, result } = await runSafeUpdate(
+    { force: false, keepSnapshot: true, snapshot: true },
+    true,
+  );
+  assertEquals(error instanceof Error, true);
+  assertEquals(commands.some((c) => c.includes("pct rollback")), true);
+  assertEquals(result?.outcome, "rolled-back");
+  assertEquals(result?.snapshotTaken, true);
+});
+
 // ---- discoverApp ------------------------------------------------------------
 
 Deno.test("discoverApp parses app defaults from the ct script and recognized vars from build.func", async () => {
