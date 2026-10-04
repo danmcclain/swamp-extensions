@@ -166,9 +166,22 @@ Where checks are used:
   `--skip-check baseline-healthy`.
 - **After** the update, `safeOsUpdate` evaluates them again; that **post-update**
   verdict drives the automatic rollback. It runs inside the method and is never
-  skipped.
+  skipped. It has a **grace window** (`healthGraceSec`, below).
 - **`reboot`** runs them *after* the host returns — **detection only** (a reboot
-  can't be rolled back; recovery is the explicit `rollback` method).
+  can't be rolled back; recovery is the explicit `rollback` method). It has the
+  same grace window.
+
+**Grace window (`healthGraceSec`).** A `docker-ce` upgrade restarts every
+container, so a check made right after the update can read unhealthy for a good
+update. `safeOsUpdate` and `reboot` take `healthGraceSec` (integer, `>= 0`,
+default `120`). While the post-update (or post-reboot) health is unhealthy, the
+method checks again every 10 seconds, until the machine is healthy or
+`healthGraceSec` seconds have passed. Each failed attempt is logged at `info`
+with the failing check labels. `healthGraceSec: 0` checks exactly once. The
+window applies to both the CT path and the VM / bare-metal path of
+`safeOsUpdate`. It never applies to the `baseline-healthy` pre-flight check,
+which is immediate. A machine with no health checks keeps the reachability
+fallback, with no wait.
 
 **Secrets:** reference an on-host credential file in a `command`; the secret is
 read at check time and never enters the config, git, or logs. Example (a cache server):
@@ -193,7 +206,7 @@ existing setups work without extra config, and you can override anytime.
 | `import` | Emit a suggested `machines:` block seeded from the `sshModel` host list and Proxmox guest discovery (VMs → `vm`, CTs → `ct` + commented `source`). Paste into `globalArguments` and decorate. |
 | `safeOsUpdate` | Snapshot-guarded OS update for one machine (see below). |
 | `safeUpdate` | Health-checked, rollback-capable **docker** update: record image ids → pull + `up -d` → wait for health → roll back to the prior image on failure. Replaced images are retained for `retentionHours` (pruned by `pruneImages`). |
-| `reboot` | Graceful reboot: `systemctl reboot` (ssh, scheduled via `systemd-run` so the call returns before the link drops) or `pct reboot` (CT). Guarded on `needsReboot` unless `force`; waits for return; runs health as **detection**. |
+| `reboot` | Graceful reboot: `systemctl reboot` (ssh, scheduled via `systemd-run` so the call returns before the link drops) or `pct reboot` (CT). Guarded on `needsReboot` unless `force`; waits for return; runs health as **detection** (with the `healthGraceSec` grace window, default 120 s). |
 | `rollback` | Deliberately revert a machine to its newest retained pre-update snapshot (VM snapshot rollback / `pct rollback`), or a named one. The recovery for a reboot/update that left a host unhealthy. |
 | `pruneSnapshots` | Delete retained pre-update snapshots past their retention window that are health-confirmed, reboot-confirmed (when a reboot was needed), and pass a fresh healthcheck. `dryRun` to preview. VM → node-model delete; CT → `pct delsnapshot`. |
 | `pruneImages` | Delete retained previous docker images past their retention window (via `docker rmi`, which refuses if still in use). `dryRun` to preview. |
@@ -202,7 +215,8 @@ existing setups work without extra config, and you can override anytime.
 
 Arguments: `host`, `mode` (`safe` = `apt upgrade` / `full` = `apt full-upgrade`;
 dnf/apk always upgrade), `retentionHours` (default 168 = 7 days),
-`rollbackOnFailure` (default true).
+`rollbackOnFailure` (default true), `healthGraceSec` (default 120, see
+[Health checks](#health-checks)).
 
 Before the method runs, its [pre-flight checks](#pre-flight-checks) gate it:
 `host-in-fleet`, `host-reachable`, `baseline-healthy` (health checks pass now) and
@@ -219,10 +233,16 @@ Flow, per machine type:
 2. **Upgrade** — apt/dnf/apk, over ssh (VM/bare) or `pct exec` (CT), capturing an
    installed-package **before/after diff** (`{name, from, to}`).
 3. **App update** (CTs with a `source`) — delegate to the `source` updater on top
-   of the OS update (one snapshot guards both).
+   of the OS update. **One snapshot guards both**: the method calls the source's
+   `safeUpdate` with `{ snapshot: false }`, so the updater takes no snapshot of
+   its own. This needs `@dmc/proxmox` >= 2026.10.01.1. An older `@dmc/proxmox`
+   rejects the argument; the method then retries once with no arguments and logs
+   a `warn`. That older updater takes its own extra, untracked snapshot (the
+   old behavior). Any other failure of the source is not retried.
 4. **Post-update health** — `healthyAfter` from the `health` checks (or
-   reachability when none). Unhealthy → **roll back** the snapshot (VM / `pct`);
-   healthy → **retain** it with the retention window.
+   reachability when none), with the `healthGraceSec` grace window. Unhealthy
+   after the window → **roll back** the snapshot (VM / `pct`); healthy →
+   **retain** it with the retention window.
 5. **Reboot is never automatic** — `needsReboot` is reported; you call `reboot`.
 
 ### Pre-flight checks
@@ -384,9 +404,9 @@ swamp workflow run patch-prune
   `$SUDO VAR=val cmd` (which breaks when `$SUDO` is non-empty).
 - **A reboot can't be rolled back** (the disk is unchanged); reboot health is
   detection, and recovery is the explicit `rollback` to the pre-update snapshot.
-- **Community-script CTs snapshot twice** today — the fleet's guarding snapshot
-  and the community-script updater's own. Unifying to a single guarded envelope
-  (a `snapshot: false` mode on the updater) is planned.
+- **Community-script CTs take ONE snapshot** — the fleet's guarding snapshot. The
+  app step calls the updater with `snapshot: false` (needs `@dmc/proxmox` >=
+  2026.10.01.1; an older one takes its own extra snapshot and a `warn` is logged).
 - **Health checks share a definition** with `@dmc/proxmox/community-script`
   (a shared contract, since swamp extensions bundle independently).
 

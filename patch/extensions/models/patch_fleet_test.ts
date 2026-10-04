@@ -376,7 +376,17 @@ Deno.test("schema: method arguments carry their documented defaults", () => {
     mode: "safe",
     retentionHours: 168,
     rollbackOnFailure: true,
+    healthGraceSec: 120,
   });
+  assertThrows(() =>
+    model.methods.safeOsUpdate.arguments.parse({
+      host: "h",
+      healthGraceSec: -1,
+    })
+  );
+  assertThrows(() =>
+    model.methods.reboot.arguments.parse({ host: "h", healthGraceSec: 1.5 })
+  );
   // The baseline gate is the `baseline-healthy` pre-flight check now; its bypass
   // is `--skip-check baseline-healthy`, not a method argument.
   assertEquals("force" in model.methods.safeOsUpdate.arguments.shape, false);
@@ -385,6 +395,7 @@ Deno.test("schema: method arguments carry their documented defaults", () => {
     force: false,
     wait: true,
     waitTimeoutSec: 300,
+    healthGraceSec: 120,
   });
   assertEquals(model.methods.pruneSnapshots.arguments.parse({}), {
     dryRun: false,
@@ -1419,7 +1430,10 @@ Deno.test("safeOsUpdate: the method itself does not gate on baseline health (the
     await withFake(osUpdateEnv(), async () => {
       const t = mkCtx({ sshModel: "ssh", machines });
       await model.methods.safeOsUpdate.execute(
-        model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
         t.ctx,
       );
       const os = t.one("osUpdate");
@@ -1448,7 +1462,10 @@ Deno.test("safeOsUpdate: a VM that turns unhealthy after the upgrade is rolled b
         }],
       });
       await model.methods.safeOsUpdate.execute(
-        model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
         t.ctx,
       );
       const os = t.one("osUpdate");
@@ -1473,6 +1490,7 @@ Deno.test("safeOsUpdate: a VM that turns unhealthy after the upgrade is rolled b
           model.methods.safeOsUpdate.arguments.parse({
             host: "web1",
             rollbackOnFailure: false,
+            healthGraceSec: 0,
           }),
           t.ctx,
         );
@@ -1485,6 +1503,368 @@ Deno.test("safeOsUpdate: a VM that turns unhealthy after the upgrade is rolled b
   } finally {
     await server.stop();
   }
+});
+
+// --- safeOsUpdate: one snapshot for a community-script CT -------------------
+
+/** Run `fn` with a call log: the fake appends one line per `model method run` call. */
+async function withCallLog<T>(
+  env: Env,
+  fn: (calls: () => Promise<string[]>) => Promise<T>,
+): Promise<T> {
+  const file = `${Deno.env.get("TMPDIR") ?? "/tmp"}/fake-swamp-calls-${crypto.randomUUID()}`;
+  const calls = async () => {
+    try {
+      return (await Deno.readTextFile(file)).split("\n").filter(Boolean);
+    } catch {
+      return []; // the fake never wrote: no calls
+    }
+  };
+  try {
+    return await withFake({ ...env, FAKE_SWAMP_CALL_LOG: file }, () => fn(calls));
+  } finally {
+    await new Deno.Command("rm", { args: ["-f", file] }).output();
+  }
+}
+
+/** A community-script CT with an app updater, as safeOsUpdate sees it. */
+function ctAppFleet(healthUrl: string) {
+  return {
+    sshModel: "ssh",
+    machines: [{
+      host: "ct1",
+      ct: { proxmoxNode: "pve", ctid: 200 },
+      source: { type: "community-script", model: "app1" },
+      health: [{ type: "http", label: "app", url: healthUrl }],
+    }],
+  };
+}
+
+function ctAppEnv(extra: Env = {}): Env {
+  const inv = scriptOut("pve", collectorStdout());
+  return {
+    FAKE_SWAMP_SCRIPT_1: inv,
+    FAKE_SWAMP_SCRIPT_2: inv,
+    FAKE_SWAMP_EXEC: execOut(""),
+    ...extra,
+  };
+}
+
+const appCalls = (all: string[]) => all.filter((c) => c.startsWith("app1 safeUpdate "));
+
+Deno.test("safeOsUpdate: a community-script CT takes ONE snapshot and passes snapshot:false to the source", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog(ctAppEnv(), async (calls) => {
+      const t = mkCtx(ctAppFleet(server.url));
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({ host: "ct1" }),
+        t.ctx,
+      );
+      const all = await calls();
+      // One source call, with the argument, and no retry.
+      const app = appCalls(all);
+      assertEquals(app.length, 1);
+      assertStringIncludes(app[0], "--input snapshot:json=false");
+      // The model's own snapshot is the only one it asks for.
+      const snaps = all.filter((c) => c.includes("pct snapshot 200 preupdate-"));
+      assertEquals(snaps.length, 1);
+      const os = t.one("osUpdate");
+      assertEquals(os.kind, "ct");
+      assertMatch(String(os.snapshot), /^preupdate-/);
+      assertEquals(os.healthyAfter, true);
+      assertEquals(os.rolledBack, false);
+      assertStringIncludes(String(os.logs), "app app1: ok");
+      assertEquals(t.getLogsByLevel("warning").length, 0);
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate: an older source that rejects snapshot:false is retried ONCE with no arguments and a warn is logged", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog(
+      ctAppEnv({ FAKE_SWAMP_APP_REJECT_SNAPSHOT: "1" }),
+      async (calls) => {
+        const t = mkCtx(ctAppFleet(server.url));
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({ host: "ct1" }),
+          t.ctx,
+        );
+        const app = appCalls(await calls());
+        assertEquals(app.length, 2);
+        assertStringIncludes(app[0], "snapshot:json=false");
+        assertEquals(app[1].includes("snapshot"), false);
+        assertEquals(app[1].includes("--input"), false);
+        const warns = JSON.stringify(t.getLogsByLevel("warning"));
+        assertStringIncludes(warns, "does not support snapshot:false");
+        assertStringIncludes(warns, "2026.10.01.1");
+        // The retry worked, so the app step is ok and the run is not rolled back.
+        assertStringIncludes(String(t.one("osUpdate").logs), "app app1: ok");
+        assertEquals(t.one("osUpdate").rolledBack, false);
+      },
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate: a source failure that is not about the argument is NOT retried", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog(
+      ctAppEnv({ FAKE_SWAMP_APP_RC: "1", FAKE_SWAMP_APP_ERR: "update script exploded" }),
+      async (calls) => {
+        const t = mkCtx(ctAppFleet(server.url));
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({ host: "ct1" }),
+          t.ctx,
+        );
+        assertEquals(appCalls(await calls()).length, 1);
+        assertStringIncludes(String(t.one("osUpdate").logs), "app app1: failed");
+        assertEquals(
+          JSON.stringify(t.getLogsByLevel("warning")).includes(
+            "does not support snapshot:false",
+          ),
+          false,
+        );
+      },
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("isUnknownArgumentError: only an 'unknown input' error that names the argument counts", () => {
+  const fail = (stderr: string, stdout = "") => ({
+    ok: false,
+    rc: 1,
+    stdout,
+    stderr,
+  });
+  assert(
+    fleet.isUnknownArgumentError(
+      fail(
+        '{"error": "Unknown method input(s): snapshot. Valid inputs are: keepSnapshot"}',
+      ),
+      "snapshot",
+    ),
+  );
+  // The valid-inputs list must not count as a rejected name.
+  assertEquals(
+    fleet.isUnknownArgumentError(
+      fail("Unknown method input(s): other. Valid inputs are: snapshot"),
+      "snapshot",
+    ),
+    false,
+  );
+  assertEquals(
+    fleet.isUnknownArgumentError(fail("snapshot failed: disk full"), "snapshot"),
+    false,
+  );
+  assertEquals(
+    fleet.isUnknownArgumentError(
+      { ok: true, rc: 0, stdout: "", stderr: "Unknown input snapshot" },
+      "snapshot",
+    ),
+    false,
+  );
+});
+
+// --- post-update health grace ---------------------------------------------------
+
+/** A fake clock for evalHealthWithGrace: sleeping moves the clock, nothing really waits. */
+function fakeTiming() {
+  let now = 0;
+  const sleeps: number[] = [];
+  return {
+    sleeps,
+    timing: {
+      intervalMs: 10_000,
+      now: () => now,
+      sleep: (ms: number) => {
+        sleeps.push(ms);
+        now += ms;
+        return Promise.resolve();
+      },
+    },
+  };
+}
+
+/** An evaluator that returns the given verdicts in order, then repeats the last one. */
+function verdicts(...oks: boolean[]) {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    evaluate: () => {
+      const ok = oks[Math.min(calls++, oks.length - 1)];
+      return Promise.resolve({
+        healthy: ok,
+        results: [
+          { label: "web up", ok, detail: "" },
+          { label: "db up", ok: true, detail: "" },
+        ],
+      });
+    },
+  };
+}
+
+function collectLogger() {
+  const lines: Array<{ msg: string; props: Record<string, unknown> }> = [];
+  const add = (msg: string, props: Record<string, unknown> = {}) =>
+    lines.push({ msg, props });
+  return { lines, logger: { debug: add, info: add, warn: add, error: add } };
+}
+
+Deno.test("evalHealthWithGrace: healthy on the first attempt returns at once, no wait, no log", async () => {
+  const c = fakeTiming();
+  const v = verdicts(true);
+  const l = collectLogger();
+  const res = await fleet.evalHealthWithGrace(v.evaluate, 120, l.logger, c.timing);
+  assertEquals(res.healthy, true);
+  assertEquals(v.calls(), 1);
+  assertEquals(c.sleeps, []);
+  assertEquals(l.lines, []);
+});
+
+Deno.test("evalHealthWithGrace: returns healthy as soon as a later attempt passes, logging each failed attempt", async () => {
+  const c = fakeTiming();
+  const v = verdicts(false, false, true);
+  const l = collectLogger();
+  const res = await fleet.evalHealthWithGrace(v.evaluate, 120, l.logger, c.timing);
+  assertEquals(res.healthy, true);
+  assertEquals(v.calls(), 3);
+  assertEquals(c.sleeps, [10_000, 10_000]);
+  assertEquals(l.lines.length, 2);
+  assertEquals(l.lines[0].props, { attempt: 1, labels: "web up" });
+  assertEquals(l.lines[1].props, { attempt: 2, labels: "web up" });
+});
+
+Deno.test("evalHealthWithGrace: gives up after the window and returns the last unhealthy result", async () => {
+  const c = fakeTiming();
+  const v = verdicts(false);
+  const l = collectLogger();
+  const res = await fleet.evalHealthWithGrace(v.evaluate, 25, l.logger, c.timing);
+  assertEquals(res.healthy, false);
+  assertEquals(res.results.filter((r) => !r.ok).map((r) => r.label), ["web up"]);
+  // Attempts at 0, 10, 20 and 25 s; the last wait is cut to the time that is left.
+  assertEquals(v.calls(), 4);
+  assertEquals(c.sleeps, [10_000, 10_000, 5_000]);
+  assertEquals(l.lines.length, 4);
+});
+
+Deno.test("evalHealthWithGrace: healthGraceSec 0 evaluates exactly once", async () => {
+  const c = fakeTiming();
+  const v = verdicts(false, true);
+  const res = await fleet.evalHealthWithGrace(
+    v.evaluate,
+    0,
+    collectLogger().logger,
+    c.timing,
+  );
+  assertEquals(res.healthy, false);
+  assertEquals(v.calls(), 1);
+  assertEquals(c.sleeps, []);
+});
+
+/** Shrink the real poll interval for a method-level test, then restore it. */
+async function withFastPolling<T>(fn: () => Promise<T>): Promise<T> {
+  const saved = fleet.healthPolling.intervalMs;
+  fleet.healthPolling.intervalMs = 20;
+  try {
+    return await fn();
+  } finally {
+    fleet.healthPolling.intervalMs = saved;
+  }
+}
+
+Deno.test("safeOsUpdate: a VM that becomes healthy within the grace window is NOT rolled back", async () => {
+  // Two unhealthy probes (containers still restarting), then healthy.
+  const server = startServer((n) => (n <= 2 ? 503 : 200));
+  try {
+    await withFastPolling(() =>
+      withCallLog(osUpdateEnv(), async (calls) => {
+        const t = mkCtx({
+          sshModel: "ssh",
+          machines: [{
+            host: "web1",
+            vm: { proxmoxNode: "pve", vmid: 100 },
+            health: [{ type: "http", url: server.url }],
+          }],
+        });
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({
+            host: "web1",
+            healthGraceSec: 30,
+          }),
+          t.ctx,
+        );
+        const os = t.one("osUpdate");
+        assertEquals(os.healthyAfter, true);
+        assertEquals(os.rolledBack, false);
+        assertEquals(os.outcome === "rolled-back", false);
+        assertEquals(server.requests(), 3);
+        assertEquals((await calls()).some((c) => c.includes(" rollbackVm ")), false);
+        // The refreshed inventory is schema-valid and carries the post-update verdict
+        // (it used to omit `health`, which erased the host's health from the report).
+        const inv = model.resources.inventory.schema.parse(t.one("inventory"));
+        assertEquals(inv.health?.healthy, true);
+        assertEquals(inv.health?.checks.map((c) => c.ok), [true]);
+      })
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate: a VM that stays unhealthy past the grace window is rolled back", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withFastPolling(() =>
+      withCallLog(osUpdateEnv(), async (calls) => {
+        const t = mkCtx({
+          sshModel: "ssh",
+          machines: [{
+            host: "web1",
+            vm: { proxmoxNode: "pve", vmid: 100 },
+            health: [{ type: "http", url: server.url }],
+          }],
+        });
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({
+            host: "web1",
+            healthGraceSec: 1,
+          }),
+          t.ctx,
+        );
+        const os = t.one("osUpdate");
+        assertEquals(os.outcome, "rolled-back");
+        assertEquals(os.healthyAfter, false);
+        // It re-checked during the window before it gave up.
+        assert(server.requests() > 2);
+        assertEquals((await calls()).some((c) => c.includes(" rollbackVm ")), true);
+        // After a rollback the restored state is unchecked: health is null, and the
+        // record still matches the schema.
+        for (const r of t.written("inventory")) {
+          const inv = model.resources.inventory.schema.parse(r.data);
+          assertEquals(inv.health, null);
+        }
+      })
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("inventoryHealth maps a verdict to the inventory shape, and no verdict to null", () => {
+  const checks = [{ label: "app", ok: false, detail: "rc 1" }];
+  assertEquals(fleet.inventoryHealth({ healthy: false, results: checks }), {
+    healthy: false,
+    checks,
+  });
+  assertEquals(fleet.inventoryHealth(null), null);
 });
 
 // --- reboot ---------------------------------------------------------------
@@ -2317,6 +2697,8 @@ Deno.test("baseline-healthy: only the failing label is named when one check pass
     const msg = r.errors!.join(" ");
     assertStringIncludes(msg, "api");
     assertEquals(msg.includes("front page"), false);
+    // The pre-flight check is immediate: one request per check, no grace re-checks.
+    assertEquals(srv.requests(), 2);
   } finally {
     await srv.stop();
   }

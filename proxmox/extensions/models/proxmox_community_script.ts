@@ -160,8 +160,11 @@ const UpdateResultSchema = z.object({
   name: z.string(),
   node: z.string(),
   ctid: z.number(),
-  outcome: z.enum(["updated", "no-change", "rolled-back", "skipped"]),
+  outcome: z.enum(["updated", "no-change", "rolled-back", "skipped", "failed"]),
+  /** Snapshot name, or null when none is kept or none was taken. */
   snapshot: z.string().nullable(),
+  /** False when the caller passed `snapshot: false` (the caller owns the snapshot). */
+  snapshotTaken: z.boolean().default(true),
   healthyBefore: z.boolean(),
   healthyAfter: z.boolean(),
   beforeVersion: z.string().nullable(),
@@ -1568,17 +1571,20 @@ export const model = {
     },
     safeUpdate: {
       description:
-        "Snapshot the container, run the in-container update, validate health, and roll back to the snapshot if the app does not come back healthy",
+        "Snapshot the container, run the in-container update, validate health, and roll back to the snapshot if the app does not come back healthy (pass snapshot=false to skip the snapshot and rollback when the caller owns them)",
       arguments: z.object({
         force: z.boolean().default(false).describe(
           "Proceed even if the container is not healthy before the update",
         ),
         keepSnapshot: z.boolean().default(true).describe(
-          "Keep the pre-update snapshot after a successful update (false deletes it)",
+          "Keep the pre-update snapshot after a successful update (false deletes it). Ignored when snapshot is false",
+        ),
+        snapshot: z.boolean().default(true).describe(
+          "Take a pre-update snapshot and roll back to it on failure (default). Pass false when the caller already holds its own snapshot and owns the rollback (for example @dmc/patch safeOsUpdate): no snapshot is taken, keepSnapshot is ignored, the update and health gate still run, and an unhealthy result is reported as a failure without any rollback",
         ),
       }),
       execute: async (
-        args: { force: boolean; keepSnapshot: boolean },
+        args: { force: boolean; keepSnapshot: boolean; snapshot?: boolean },
         context: {
           globalArgs: GlobalArgs;
           repoDir: string;
@@ -1623,6 +1629,7 @@ export const model = {
             ctid: ga.ctid,
             outcome: "skipped",
             snapshot: null,
+            snapshotTaken: false,
             healthyBefore: false,
             healthyAfter: false,
             beforeVersion,
@@ -1646,27 +1653,41 @@ export const model = {
           );
         }
 
-        // 2. Snapshot.
-        const snap = snapshotName();
-        log(`Creating snapshot ${snap}`);
-        const snapRes = await nodeExec(
-          ga,
-          repoDir,
-          `pct snapshot ${ga.ctid} ${snap} --description ${
-            shSingleQuote(`swamp safeUpdate pre-update ${ga.appName}`)
-          }`,
-          120,
-        );
-        if (snapRes.rc !== 0) {
-          context.logger.error(
-            "Snapshot {snapshot} of container {ctid} failed (rc {rc})",
-            { snapshot: snap, ctid: ga.ctid, rc: snapRes.rc },
+        // 2. Snapshot — skipped when the caller passes `snapshot: false` (it
+        //    holds its own snapshot and owns the rollback).
+        const takeSnapshot = args.snapshot !== false;
+        let snap: string | null = null;
+        if (takeSnapshot) {
+          const name = snapshotName();
+          log(`Creating snapshot ${name}`);
+          const snapRes = await nodeExec(
+            ga,
+            repoDir,
+            `pct snapshot ${ga.ctid} ${name} --description ${
+              shSingleQuote(`swamp safeUpdate pre-update ${ga.appName}`)
+            }`,
+            120,
           );
-          throw new Error(
-            `Snapshot failed (rc ${snapRes.rc}): ${snapRes.out.slice(-800)}`,
+          if (snapRes.rc !== 0) {
+            context.logger.error(
+              "Snapshot {snapshot} of container {ctid} failed (rc {rc})",
+              { snapshot: name, ctid: ga.ctid, rc: snapRes.rc },
+            );
+            throw new Error(
+              `Snapshot failed (rc ${snapRes.rc}): ${snapRes.out.slice(-800)}`,
+            );
+          }
+          snap = name;
+          log(`Snapshot created`);
+        } else {
+          log(
+            `snapshot=false: taking no snapshot; the caller owns the snapshot and any rollback`,
+          );
+          context.logger.info(
+            "Skipping snapshot of container {ctid}: caller owns the snapshot and rollback",
+            { ctid: ga.ctid },
           );
         }
-        log(`Snapshot created`);
 
         // 3–4. Run the update and validate health. Anything that throws in this
         //       region (transport failure, update timeout, probe error) must
@@ -1720,7 +1741,7 @@ export const model = {
 
         // 5a. Healthy and the update reported success → keep. Optionally prune.
         if (!updateError && after.healthy && updateRc === 0) {
-          if (!args.keepSnapshot) {
+          if (snap !== null && !args.keepSnapshot) {
             log(`Deleting snapshot ${snap}`);
             const del = await nodeExec(
               ga,
@@ -1737,7 +1758,8 @@ export const model = {
             node: ga.node,
             ctid: ga.ctid,
             outcome: versionChanged ? "updated" : "no-change",
-            snapshot: args.keepSnapshot ? snap : null,
+            snapshot: snap !== null && args.keepSnapshot ? snap : null,
+            snapshotTaken: snap !== null,
             healthyBefore: before.healthy,
             healthyAfter: true,
             beforeVersion,
@@ -1760,6 +1782,42 @@ export const model = {
           return { dataHandles: [handle] };
         }
 
+        // 5b-0. No snapshot (snapshot=false): nothing to roll back to. Record
+        //       and surface the failure; the caller owns snapshot and rollback.
+        if (snap === null) {
+          log(
+            `Update did not leave ${ga.appName} healthy — no snapshot was taken (snapshot=false); the caller owns the snapshot and rollback`,
+          );
+          const handle = await writeResult({
+            name: ga.appName,
+            node: ga.node,
+            ctid: ga.ctid,
+            outcome: "failed",
+            snapshot: null,
+            snapshotTaken: false,
+            healthyBefore: before.healthy,
+            healthyAfter: after.healthy,
+            beforeVersion,
+            afterVersion,
+            versionChanged: false,
+            rolledBack: false,
+            updateOutput: updateError
+              ? `${updateOutput}\n[update error] ${updateError}`
+              : updateOutput,
+            logs: logs.join("\n"),
+            timestamp: new Date().toISOString(),
+          });
+          context.logger.error(
+            "Update of {appName} failed validation; no snapshot was taken, the caller owns the snapshot and rollback (healthy: {healthy})",
+            { appName: ga.appName, healthy: after.healthy },
+          );
+          throw new Error(
+            `${ga.appName} update failed validation (healthy=${after.healthy}, update rc=${updateRc}). No snapshot was taken (snapshot=false): the caller owns the snapshot and rollback. [data: ${
+              (handle as { name?: string })?.name
+            }]`,
+          );
+        }
+
         // 5b. Anything else (unhealthy, non-zero update, or thrown error) → roll back.
         log(
           `Update did not leave ${ga.appName} healthy — rolling back to ${snap}`,
@@ -1776,6 +1834,7 @@ export const model = {
           ctid: ga.ctid,
           outcome: "rolled-back",
           snapshot: snap,
+          snapshotTaken: true,
           healthyBefore: before.healthy,
           healthyAfter: restored.healthy,
           beforeVersion,
