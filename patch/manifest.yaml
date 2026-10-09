@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@dmc/patch"
-version: "2026.10.01.1"
+version: "2026.10.09.1"
 description: "Agentless fleet patch management — scan Proxmox VMs/CTs, bare-metal, and VPS hosts for pending updates, apply them safely (snapshot-guarded, health-checked, auto-rollback), and keep an auditable history over @swamp/ssh"
 repository: "https://github.com/danmcclain/swamp-extensions"
 labels:

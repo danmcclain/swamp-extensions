@@ -11,6 +11,7 @@
  */
 import { z } from "npm:zod@4";
 
+// The swamp CLI, used only by `checkSwamp` (pre-flight checks get no runModel).
 const SWAMP_BIN = Deno.env.get("SWAMP_BIN") ?? "swamp";
 const RC_SENTINEL = "__SWAMP_RC__";
 /**
@@ -470,7 +471,7 @@ const SnapshotRecord = z.object({
 
 const PruneResult = z.object({
   scannedAt: z.string(),
-  kind: z.enum(["snapshots", "images"]),
+  kind: z.enum(["snapshots", "images", "retired"]),
   dryRun: z.boolean(),
   pruned: z.array(
     z.object({
@@ -508,10 +509,20 @@ type Logger = {
   error(message: string, props?: Record<string, unknown>): void;
 };
 
-/** Extension-author-facing method context (subset of swamp's MethodContext). */
-type Ctx = {
+/** Metadata of one stored record, as `dataRepository.findAllForModel` returns it (latest version). */
+type OwnDataMeta = {
+  name: string;
+  version: number;
+  tags: Record<string, string>;
+  /** True for a deletion marker. */
+  isDeleted?: boolean;
+};
+
+/** Extension-author-facing method context (subset of swamp's MethodContext). Other
+ *  models are reached through `runModel` / `readModelData` / `definitionRepository`
+ *  (see `methodSwamp`). */
+type Ctx = SwampMethodCtx & {
   globalArgs: z.infer<typeof GlobalArgs>;
-  repoDir: string;
   logger: Logger;
   definition: {
     id: string;
@@ -528,17 +539,291 @@ type Ctx = {
     name: string,
     version?: number,
   ) => Promise<Record<string, unknown> | null>;
-  readModelData: (
-    modelName: string,
-    specName?: string,
-  ) => Promise<
-    Array<
-      { name: string; isLatest: boolean; attributes: Record<string, unknown> }
-    >
-  >;
+  /** Opaque model type token; the data repository needs it with the model id. */
+  modelType: unknown;
+  /** The model id (never renamed), under which all records of this model are stored. */
+  modelId: string;
+  /** Low-level data API. Own records are read here, by model id (see `readOwnRecords`). */
+  dataRepository: {
+    findAllForModel(type: unknown, modelId: string): Promise<OwnDataMeta[]>;
+    getContent(
+      type: unknown,
+      modelId: string,
+      dataName: string,
+      version?: number,
+    ): Promise<Uint8Array | null>;
+  };
+  /** Remove every version of one stored resource. A no-op when it is absent. */
+  deleteResource: (instanceName: string) => Promise<void>;
 };
 
+/** One record of this model, in the shape `readModelData` returned. */
+export interface OwnRecord {
+  name: string;
+  isLatest: boolean;
+  attributes: Record<string, unknown>;
+}
+
+/**
+ * Read this model's OWN records by model id. `context.readModelData(name, spec)`
+ * matches the `modelName` tag that swamp stamps on a record when it is written.
+ * After a model rename, every older record carries the old name and
+ * `readModelData` can not see it. The model id never changes, so this reads
+ * `dataRepository.findAllForModel(modelType, modelId)` (latest version of each
+ * name), keeps the records whose `specName` tag is one of `specs`, and parses
+ * their JSON. Deleted records and records that are not valid JSON are skipped.
+ * `readModelData` stays for reading OTHER models only.
+ */
+export async function readOwnRecords(
+  context: Pick<Ctx, "dataRepository" | "modelType" | "modelId">,
+  specs: string | readonly string[],
+): Promise<Array<OwnRecord & { specName: string }>> {
+  const wanted = new Set(typeof specs === "string" ? [specs] : specs);
+  const dec = new TextDecoder();
+  const out: Array<OwnRecord & { specName: string }> = [];
+  const metas = await context.dataRepository.findAllForModel(
+    context.modelType,
+    context.modelId,
+  );
+  for (const m of metas) {
+    const specName = m.tags?.specName ?? "";
+    if (!wanted.has(specName) || m.isDeleted) continue;
+    const raw = await context.dataRepository.getContent(
+      context.modelType,
+      context.modelId,
+      m.name,
+      m.version,
+    );
+    if (!raw) continue;
+    try {
+      const attributes = JSON.parse(dec.decode(raw));
+      if (attributes && typeof attributes === "object") {
+        out.push({ name: m.name, isLatest: true, attributes, specName });
+      }
+    } catch { /* not JSON: skip */ }
+  }
+  return out;
+}
+
+/** The latest records of one spec of this model. */
+async function readOwnSpec(
+  context: Pick<Ctx, "dataRepository" | "modelType" | "modelId">,
+  spec: string,
+): Promise<OwnRecord[]> {
+  return await readOwnRecords(context, spec);
+}
+
 const DEFAULT_RETENTION_HOURS = 168; // 7 days
+
+// ---------------------------------------------------------------------------
+// Reaching other models. Methods use swamp's in-process API (`context.runModel`,
+// `context.readModelData`, `context.definitionRepository`). Pre-flight checks get
+// no `runModel` from swamp, so the live checks fall back to the swamp CLI.
+// ---------------------------------------------------------------------------
+
+/** Outcome of running another model's method. `artifacts` = attributes of the resources it wrote. */
+export interface RunOutcome {
+  ok: boolean;
+  artifacts: Array<Record<string, unknown>>;
+  error: string;
+}
+
+/** How this model reaches other models: `methodSwamp` in methods, `checkSwamp` in checks. */
+export interface SwampApi {
+  run(
+    model: string,
+    method: string,
+    args?: Record<string, unknown>,
+  ): Promise<RunOutcome>;
+  /** Latest records of another model's spec (methods only; undefined in checks). */
+  readData?(
+    model: string,
+    spec: string,
+  ): Promise<Array<{ name: string; attributes: Record<string, unknown> }>>;
+  /** Raw globalArguments of a definition, or null when it does not exist. */
+  globalArguments(model: string): Promise<Record<string, unknown> | null>;
+}
+
+/** The part of swamp's definition repository this model uses. */
+type DefinitionLookup = {
+  findByNameGlobal(
+    name: string,
+  ): Promise<{ definition: { globalArguments: unknown } } | null>;
+};
+
+/** What `context.runModel` returns (subset): it never throws. */
+type RunModelResult =
+  | {
+    ok: true;
+    resources: Array<{ name: string; attributes?: Record<string, unknown> }>;
+  }
+  | { ok: false; error: { message: string } };
+
+/** The parts of swamp's method context that reach other models. */
+export type SwampMethodCtx = {
+  runModel?: (opts: {
+    definition: string;
+    method: string;
+    arguments?: Record<string, unknown>;
+  }) => Promise<RunModelResult>;
+  readModelData?: (
+    modelName: string,
+    specName?: string,
+  ) => Promise<Array<{ name: string; attributes?: Record<string, unknown> }>>;
+  definitionRepository?: DefinitionLookup;
+};
+
+/** The last `n` characters of a message. */
+function tail(s: string, n: number): string {
+  return s.length > n ? s.slice(-n) : s;
+}
+
+/** Raw globalArguments of a definition through the definition repository; null when absent. */
+async function definitionGlobals(
+  repo: DefinitionLookup | undefined,
+  name: string,
+): Promise<Record<string, unknown> | null> {
+  if (!repo) return null;
+  const found = await repo.findByNameGlobal(name);
+  if (!found) return null;
+  const ga = found.definition.globalArguments;
+  return ga && typeof ga === "object" ? ga as Record<string, unknown> : {};
+}
+
+/** The SwampApi of a method: swamp's in-process `runModel` / `readModelData` / definitions. */
+export function methodSwamp(context: SwampMethodCtx): SwampApi {
+  const api: SwampApi = {
+    run: async (model, method, args = {}) => {
+      if (!context.runModel) {
+        return {
+          ok: false,
+          artifacts: [],
+          error: "context.runModel is not available in this execution",
+        };
+      }
+      let res: RunModelResult;
+      try {
+        res = await context.runModel({
+          definition: model,
+          method,
+          ...(Object.keys(args).length ? { arguments: args } : {}),
+        });
+      } catch (e) { // runModel returns failures; this guards a broken host API
+        return { ok: false, artifacts: [], error: (e as Error).message };
+      }
+      return res.ok
+        ? {
+          ok: true,
+          artifacts: res.resources.map((r) => r.attributes ?? {}),
+          error: "",
+        }
+        : { ok: false, artifacts: [], error: res.error.message };
+    },
+    globalArguments: (model) =>
+      definitionGlobals(context.definitionRepository, model),
+  };
+  const read = context.readModelData;
+  if (read) {
+    api.readData = async (model, spec) =>
+      (await read(model, spec)).map((r) => ({
+        name: r.name,
+        attributes: r.attributes ?? {},
+      }));
+  }
+  return api;
+}
+
+/** The argv of `swamp model method run <model> <method> --json --quiet --repo-dir <dir> --input …`.
+ *  A string value is passed as `k=<v>`, any other value as `k:json=<JSON>`. Each
+ *  value is one argv element: no shell is involved. */
+export function methodRunArgv(
+  model: string,
+  method: string,
+  args: Record<string, unknown>,
+  repoDir: string,
+): string[] {
+  const argv = [
+    "model",
+    "method",
+    "run",
+    model,
+    method,
+    "--json",
+    "--quiet",
+    "--repo-dir",
+    repoDir,
+  ];
+  for (const [k, v] of Object.entries(args)) {
+    argv.push(
+      "--input",
+      typeof v === "string" ? `${k}=${v}` : `${k}:json=${JSON.stringify(v)}`,
+    );
+  }
+  return argv;
+}
+
+/** The SwampApi of a pre-flight check. swamp gives checks no `runModel`, so `run` starts
+ *  `swamp model method run` as a subprocess (the model's only one). Definitions are
+ *  read in-process from `definitionRepository`. There is no `readData`. */
+export function checkSwamp(
+  ctx: { repoDir: string; definitionRepository?: DefinitionLookup },
+): SwampApi {
+  return {
+    run: async (model, method, args = {}) => {
+      // A check has no context.runModel (swamp builds the check context without it),
+      // and the live checks must still reach hosts through the ssh / node models.
+      // swamp-quality-ignore deno-command: checks get no runModel
+      const out = await new Deno.Command(SWAMP_BIN, {
+        args: methodRunArgv(model, method, args, ctx.repoDir),
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      const stdout = new TextDecoder().decode(out.stdout);
+      const stderr = new TextDecoder().decode(out.stderr);
+      // A failing fan-out (one host exits non-zero) still prints the artifacts of
+      // the hosts that ran, so parse stdout whatever the exit code is.
+      let artifacts: Array<Record<string, unknown>> = [];
+      let parseError = "";
+      try {
+        const parsed = JSON.parse(stdout) as {
+          dataArtifacts?: Array<{ attributes?: Record<string, unknown> }>;
+        };
+        artifacts = (parsed.dataArtifacts ?? []).map((a) => a.attributes ?? {});
+      } catch {
+        parseError = `could not parse ${model} ${method} output: ${
+          tail(stdout.trim(), 300)
+        }`;
+      }
+      const ok = out.code === 0;
+      return {
+        ok,
+        artifacts,
+        error: ok ? parseError : tail(stderr.trim() || parseError, 1000),
+      };
+    },
+    globalArguments: (model) =>
+      definitionGlobals(ctx.definitionRepository, model),
+  };
+}
+
+/** Run another model's method; when it fails, warn `{model} {method} failed: {error}`. */
+async function runLogged(
+  swamp: SwampApi,
+  model: string,
+  method: string,
+  args: Record<string, unknown>,
+  logger: Logger,
+): Promise<boolean> {
+  const res = await swamp.run(model, method, args);
+  if (!res.ok) {
+    logger.warn("{model} {method} failed: {error}", {
+      model,
+      method,
+      error: tail(res.error, 300),
+    });
+  }
+  return res.ok;
+}
 
 /** Parsed result of one host from the ssh model's `script` method. */
 export interface HostRun {
@@ -547,168 +832,103 @@ export interface HostRun {
   exitCode: number;
 }
 
-/** Run `swamp model method run <sshModel> script` (fan-out) and return per-host output. */
-export async function runScript(
+/** Per-host results of one `<sshModel> script` call, plus the call's own verdict. */
+export interface ScriptOutcome {
+  runs: HostRun[];
+  ok: boolean;
+  error: string;
+}
+
+/**
+ * The fresh `runResult` records of a failed `<sshModel> <method>` call. The ssh model
+ * writes one record per host (`run-<method>-<host>`) BEFORE it fails the call when a
+ * host exits non-zero, but `runModel` then returns no handles. So read the records
+ * back: only those of the requested hosts, and only those started at or after `since`
+ * (just before the call), so a result of an earlier run is never used.
+ * Residual risk: a second run of the same method on the same host through the same
+ * ssh model at the same time can write a record that is read here instead.
+ */
+export async function freshRunResults(
+  swamp: SwampApi,
+  sshModel: string,
+  method: string,
+  hosts: string[],
+  since: number,
+): Promise<Array<Record<string, unknown>>> {
+  if (!swamp.readData) return [];
+  let records: Array<{ name: string; attributes: Record<string, unknown> }>;
+  try {
+    records = await swamp.readData(sshModel, "runResult");
+  } catch {
+    return [];
+  }
+  const wanted = new Set(hosts.map((h) => `run-${method}-${h}`));
+  return records.filter((r) => {
+    const started = r.attributes.startedAt;
+    return wanted.has(r.name) && typeof started === "string" &&
+      Date.parse(started) >= since;
+  }).map((r) => r.attributes);
+}
+
+/** Run `<sshModel> script` (fan-out) and return per-host output and the call's verdict.
+ *  Throws only when the call failed and no host result can be found. */
+export async function runScriptOutcome(
   sshModel: string,
   hosts: string[],
   script: string,
   timeoutSec: number,
-  repoDir: string,
-): Promise<HostRun[]> {
-  // @ts-ignore Deno API
-  const proc = new Deno.Command(SWAMP_BIN, {
-    args: [
-      "model",
-      "method",
-      "run",
-      sshModel,
-      "script",
-      "--json",
-      "--quiet",
-      "--repo-dir",
-      repoDir,
-      "--input",
-      `hosts:json=${JSON.stringify(hosts)}`,
-      "--input",
-      "interpreter=bash",
-      "--input",
-      `script=${script}`,
-      "--input",
-      "captureOutput:json=true",
-      "--input",
-      `timeoutSec:json=${timeoutSec}`,
-    ],
-    stdout: "piped",
-    stderr: "piped",
+  swamp: SwampApi,
+): Promise<ScriptOutcome> {
+  const t0 = Date.now();
+  const res = await swamp.run(sshModel, "script", {
+    hosts,
+    interpreter: "bash",
+    script,
+    captureOutput: true,
+    timeoutSec,
   });
-  const out = await proc.output();
-  const stdout = new TextDecoder().decode(out.stdout);
-  // The method throws (non-zero) when ANY host fails, but still prints the JSON with
-  // the successful hosts' artifacts — so parse stdout regardless of exit code.
-  let parsed: {
-    dataArtifacts?: Array<{ attributes?: Record<string, unknown> }>;
-  };
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
-    const stderr = new TextDecoder().decode(out.stderr);
+  let artifacts = res.artifacts;
+  if (!res.ok && artifacts.length === 0) {
+    artifacts = await freshRunResults(swamp, sshModel, "script", hosts, t0);
+  }
+  if (!res.ok && artifacts.length === 0) {
     throw new Error(
-      `Could not parse ${sshModel} script output: ${
-        (stdout || stderr).slice(-800)
-      }`,
+      `${sshModel} script failed: ${tail(res.error || "no output", 800)}`,
     );
   }
-  return (parsed.dataArtifacts ?? [])
-    .map((a) => a.attributes ?? {})
+  const runs = artifacts
     .filter((at) => typeof at.host === "string")
     .map((at) => ({
       host: at.host as string,
       stdout: (at.stdout as string) ?? "",
       exitCode: (at.exitCode as number) ?? -1,
     }));
+  return { runs, ok: res.ok, error: res.error };
 }
 
-/** Best-effort fire of `swamp model method run <model> <method>`. */
-async function runModelMethod(
-  model: string,
-  method: string,
-  repoDir: string,
-): Promise<boolean> {
-  // @ts-ignore Deno API
-  const proc = new Deno.Command(SWAMP_BIN, {
-    args: [
-      "model",
-      "method",
-      "run",
-      model,
-      method,
-      "--json",
-      "--quiet",
-      "--repo-dir",
-      repoDir,
-    ],
-    stdout: "piped",
-    stderr: "piped",
-  });
-  const out = await proc.output();
-  return out.code === 0;
+/** Run `<sshModel> script` (fan-out) and return per-host output. A host that failed
+ *  is still returned with its exit code; a host with no result is missing. */
+export async function runScript(
+  sshModel: string,
+  hosts: string[],
+  script: string,
+  timeoutSec: number,
+  swamp: SwampApi,
+): Promise<HostRun[]> {
+  return (await runScriptOutcome(sshModel, hosts, script, timeoutSec, swamp))
+    .runs;
 }
 
-/** Outcome of one `swamp model method run` call: success flag plus the output tails. */
-export interface MethodRunResult {
-  ok: boolean;
-  rc: number;
-  stdout: string;
-  stderr: string;
-}
-
-/** Run `swamp model method run <model> <method> --input k:json=<v>…`; no logging. */
-async function execModelMethodInput(
-  model: string,
-  method: string,
-  input: Record<string, unknown>,
-  repoDir: string,
-): Promise<MethodRunResult> {
-  const inputArgs: string[] = [];
-  for (const [k, v] of Object.entries(input)) {
-    inputArgs.push("--input", `${k}:json=${JSON.stringify(v)}`);
-  }
-  // @ts-ignore Deno API
-  const proc = new Deno.Command(SWAMP_BIN, {
-    args: [
-      "model",
-      "method",
-      "run",
-      model,
-      method,
-      "--json",
-      "--quiet",
-      "--repo-dir",
-      repoDir,
-      ...inputArgs,
-    ],
-    stdout: "piped",
-    stderr: "piped",
-  });
-  const out = await proc.output();
-  return {
-    ok: out.code === 0,
-    rc: out.code,
-    stdout: new TextDecoder().decode(out.stdout).slice(-1000),
-    stderr: new TextDecoder().decode(out.stderr).slice(-1000),
-  };
-}
-
-/** Fire `swamp model method run <model> <method> --input k:json=<v>…`; returns success. */
-async function runModelMethodInput(
-  model: string,
-  method: string,
-  input: Record<string, unknown>,
-  repoDir: string,
-  logger: Logger,
-): Promise<boolean> {
-  const res = await execModelMethodInput(model, method, input, repoDir);
-  if (!res.ok) {
-    logger.warn("{model} {method} failed with rc {rc}: {stderr}", {
-      model,
-      method,
-      rc: res.rc,
-      stderr: res.stderr.slice(-300),
-    });
-  }
-  return res.ok;
-}
-
-/** True when a failed run says the method does not know the argument `name`.
- *  swamp prints "Unknown method input(s): <names>. Valid inputs are: …". */
+/** True when a failed run says the method does not know the argument `name`. The CLI
+ *  says "Unknown method input(s): <names>. Valid inputs are: …"; `runModel` says
+ *  "Unknown argument(s): <names>. Valid arguments are: …". */
 export function isUnknownArgumentError(
-  res: MethodRunResult,
+  res: RunOutcome,
   name: string,
 ): boolean {
   if (res.ok) return false;
-  const text = `${res.stderr}\n${res.stdout}`;
-  // Only the part before "Valid inputs" lists the rejected names.
-  const rejected = text.split(/valid inputs/i)[0];
+  // Only the part before "Valid inputs" / "Valid arguments" lists the rejected names.
+  const rejected = res.error.split(/valid (?:inputs|arguments)/i)[0];
   return /unknown|unrecognized/i.test(rejected) &&
     new RegExp(`\\b${name}\\b`).test(rejected);
 }
@@ -719,22 +939,16 @@ export function isUnknownArgumentError(
  *  with no arguments. Any other failure is returned as is, never retried. */
 export async function runSourceSafeUpdate(
   src: string,
-  repoDir: string,
+  swamp: SwampApi,
   logger: Logger,
 ): Promise<boolean> {
-  const first = await execModelMethodInput(
-    src,
-    "safeUpdate",
-    { snapshot: false },
-    repoDir,
-  );
+  const first = await swamp.run(src, "safeUpdate", { snapshot: false });
   if (first.ok) return true;
   if (!isUnknownArgumentError(first, "snapshot")) {
-    logger.warn("{model} {method} failed with rc {rc}: {stderr}", {
+    logger.warn("{model} {method} failed: {error}", {
       model: src,
       method: "safeUpdate",
-      rc: first.rc,
-      stderr: first.stderr.slice(-300),
+      error: tail(first.error, 300),
     });
     return false;
   }
@@ -742,7 +956,7 @@ export async function runSourceSafeUpdate(
     "{model} safeUpdate does not support snapshot:false (needs @dmc/proxmox >= 2026.10.01.1), so it took its own extra snapshot",
     { model: src },
   );
-  return await runModelMethod(src, "safeUpdate", repoDir);
+  return await runLogged(swamp, src, "safeUpdate", {}, logger);
 }
 
 /** Run one shell command on a single host via `<sshModel> exec`; returns rc + output.
@@ -752,47 +966,26 @@ export async function nodeExec(
   host: string,
   command: string,
   timeoutSec: number,
-  repoDir: string,
+  swamp: SwampApi,
 ): Promise<{ rc: number; out: string }> {
   const wrapped = `{ ${command}; } 2>&1; printf '\\n${RC_SENTINEL}=%s\\n' "$?"`;
-  // @ts-ignore Deno API
-  const proc = new Deno.Command(SWAMP_BIN, {
-    args: [
-      "model",
-      "method",
-      "run",
-      sshModel,
-      "exec",
-      "--json",
-      "--quiet",
-      "--repo-dir",
-      repoDir,
-      "--input",
-      `hosts:json=[${JSON.stringify(host)}]`,
-      "--input",
-      `command=${wrapped}`,
-      "--input",
-      "captureOutput:json=true",
-      "--input",
-      `timeoutSec:json=${timeoutSec}`,
-    ],
-    stdout: "piped",
-    stderr: "piped",
+  const res = await swamp.run(sshModel, "exec", {
+    hosts: [host],
+    command: wrapped,
+    captureOutput: true,
+    timeoutSec,
   });
-  const res = await proc.output();
-  const stdout = new TextDecoder().decode(res.stdout);
-  if (res.code !== 0) {
+  if (!res.ok) {
     throw new Error(
       `ssh transport to ${host} via ${sshModel} failed: ${
-        new TextDecoder().decode(res.stderr).slice(-400)
+        tail(res.error, 400)
       }`,
     );
   }
-  const attrs = (JSON.parse(stdout) as {
-    dataArtifacts?: Array<
-      { attributes?: { stdout?: string; exitCode?: number } }
-    >;
-  }).dataArtifacts?.[0]?.attributes ?? {};
+  const attrs = (res.artifacts[0] ?? {}) as {
+    stdout?: string;
+    exitCode?: number;
+  };
   const raw = attrs.stdout ?? "";
   const m = raw.match(new RegExp(`${RC_SENTINEL}=(\\d+)\\s*$`));
   const rc = m ? parseInt(m[1], 10) : (attrs.exitCode ?? -1);
@@ -840,10 +1033,11 @@ export function appSource(m: MachineShape): string | null {
   return null;
 }
 
-/** Resolve a CT's node + ctid: from `ct`, else legacy (read from the proxmox model). */
+/** Resolve a CT's node + ctid: from `ct`, else legacy (read from the proxmox model's
+ *  globalArguments). */
 export async function ctLocation(
   m: MachineShape,
-  repoDir: string,
+  swamp: SwampApi,
 ): Promise<{ node: string; ctid: number }> {
   if (m.ct) return { node: m.ct.proxmoxNode, ctid: m.ct.ctid };
   const model = m.proxmox?.model;
@@ -852,42 +1046,28 @@ export async function ctLocation(
       `${m.host}: no CT location (need a \`ct\` decoration or legacy proxmox.model)`,
     );
   }
-  // @ts-ignore Deno API
-  const out = await new Deno.Command(SWAMP_BIN, {
-    args: ["model", "get", model, "--json", "--quiet", "--repo-dir", repoDir],
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  const ga = (JSON.parse(new TextDecoder().decode(out.stdout)) as {
-    globalArguments?: { node?: string; ctid?: number };
-  }).globalArguments ?? {};
-  if (!ga.node || !ga.ctid) throw new Error(`${model}: no node/ctid`);
-  return { node: ga.node, ctid: ga.ctid };
+  const ga = await swamp.globalArguments(model);
+  const node = ga?.node;
+  const ctid = ga?.ctid;
+  if (!node || !ctid) throw new Error(`${model}: no node/ctid`);
+  return { node: String(node), ctid: Number(ctid) };
 }
 
 /** The effective health checks for a machine: its own `health`, else derived from a
  *  community-script `source` (its healthUrl + service), else empty (reachability). */
 export async function resolveHealthChecks(
   m: MachineShape,
-  repoDir: string,
+  swamp: SwampApi,
 ): Promise<Array<z.infer<typeof HealthCheck>>> {
   if (m.health && m.health.length) return m.health;
   const src = appSource(m);
   if (!src) return [];
-  // @ts-ignore Deno API
-  const out = await new Deno.Command(SWAMP_BIN, {
-    args: ["model", "get", src, "--json", "--quiet", "--repo-dir", repoDir],
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  if (out.code !== 0) return [];
-  const ga = (JSON.parse(new TextDecoder().decode(out.stdout)) as {
-    globalArguments?: {
-      healthUrl?: string;
-      healthExpectStatus?: number;
-      service?: string;
-    };
-  }).globalArguments ?? {};
+  const ga = (await swamp.globalArguments(src)) as {
+    healthUrl?: string;
+    healthExpectStatus?: number;
+    service?: string;
+  } | null;
+  if (!ga) return [];
   const checks: Array<z.infer<typeof HealthCheck>> = [];
   if (ga.healthUrl) {
     checks.push({
@@ -908,29 +1088,52 @@ export async function resolveHealthChecks(
   return checks;
 }
 
-/** Run a shell snippet on a machine via its transport: pct exec for a CT, ssh otherwise. */
+/** Run a (multi-line) shell script on a machine via its transport: `pct exec` on the
+ *  node for a CT, the ssh model's `script` method otherwise. One model call. */
 async function runOnMachine(
   m: MachineShape,
   sshModel: string,
-  snippet: string,
+  script: string,
   timeoutSec: number,
-  repoDir: string,
+  swamp: SwampApi,
 ): Promise<{ rc: number; out: string }> {
+  let host = m.host;
+  let body = script;
   if (isCtMachine(m) && !m.vm) {
-    const { node, ctid } = await ctLocation(m, repoDir);
-    const runs = await runScript(
-      sshModel,
-      [node],
-      `pct exec ${ctid} -- bash -c "echo '${
-        utf8b64(snippet)
-      }' | base64 -d | bash"`,
-      timeoutSec,
-      repoDir,
-    );
-    const r = runs.find((x) => x.host === node) ?? runs[0];
-    return { rc: r?.exitCode ?? -1, out: r?.stdout ?? "" };
+    const { node, ctid } = await ctLocation(m, swamp);
+    host = node;
+    body = `pct exec ${ctid} -- bash -c "echo '${
+      utf8b64(script)
+    }' | base64 -d | bash"`;
   }
-  return await nodeExec(sshModel, m.host, snippet, timeoutSec, repoDir);
+  const runs = await runScript(sshModel, [host], body, timeoutSec, swamp);
+  const r = runs.find((x) => x.host === host) ?? runs[0];
+  return { rc: r?.exitCode ?? -1, out: r?.stdout ?? "" };
+}
+
+/** The marker a health batch prints after check `i`: `@@PATCH-HC <i> rc=<rc>`. */
+const HC_MARKER = "@@PATCH-HC";
+
+/**
+ * One shell script that runs every given check snippet in turn. Each snippet runs in
+ * its own subshell on its own lines, so a bare `exit` in a check ends only that check.
+ * Its stdin is /dev/null (the ssh model feeds the script itself on stdin) and its
+ * output goes to /dev/null: only the rc counts. After check `i` the script prints
+ * `@@PATCH-HC <i> rc=<rc>`.
+ */
+export function healthBatchScript(snippets: string[]): string {
+  return snippets.map((s, i) =>
+    `(\n${s}\n) </dev/null >/dev/null 2>&1\necho "${HC_MARKER} ${i} rc=$?"`
+  ).join("\n") + "\n";
+}
+
+/** The rc of each check from a health batch's output, by check index. */
+export function parseHealthBatch(stdout: string): Map<number, number> {
+  const rcs = new Map<number, number>();
+  for (const m of stdout.matchAll(/^@@PATCH-HC (\d+) rc=(\d+)\s*$/gm)) {
+    rcs.set(parseInt(m[1], 10), parseInt(m[2], 10));
+  }
+  return rcs;
 }
 
 export interface HealthResult {
@@ -945,14 +1148,41 @@ export function inventoryHealth(
   return h ? { healthy: h.healthy, checks: h.results } : null;
 }
 
-/** Evaluate a machine's health checks (all must pass). Empty list ⇒ healthy=true. */
+/** Evaluate a machine's health checks (all must pass). Empty list ⇒ healthy=true.
+ *  http checks run from the swamp host. ALL service + command checks run in ONE shell
+ *  call on the machine (see `healthBatchScript`). A check whose result is missing
+ *  from the output fails with the detail "no result". */
 export async function evalHealth(
   m: MachineShape,
   checks: Array<z.infer<typeof HealthCheck>>,
   sshModel: string,
-  repoDir: string,
+  swamp: SwampApi,
 ): Promise<HealthResult> {
+  // The shell checks, in order: their batch index is their position in this list.
+  const shell = checks.filter((c) => c.type !== "http");
+  let rcs = new Map<number, number>();
+  if (shell.length) {
+    const snippets = shell.map((c) =>
+      c.type === "service"
+        // Init-agnostic: systemd (is-active) OR OpenRC (rc-service status, for Alpine).
+        ? `systemctl is-active ${c.name} >/dev/null 2>&1 || rc-service ${c.name} status >/dev/null 2>&1`
+        : (c as { run: string }).run
+    );
+    const timeoutSec = shell.reduce(
+      (t, c) => t + (c.type === "command" ? c.timeoutSec : 30),
+      0,
+    );
+    const r = await runOnMachine(
+      m,
+      sshModel,
+      healthBatchScript(snippets),
+      timeoutSec,
+      swamp,
+    );
+    rcs = parseHealthBatch(r.out);
+  }
   const results: HealthResult["results"] = [];
+  let si = 0; // index of the next shell check in the batch
   for (const c of checks) {
     let ok = false;
     let detail = "";
@@ -973,23 +1203,21 @@ export async function evalHealth(
       } finally {
         clearTimeout(timer);
       }
-    } else if (c.type === "service") {
-      if (!label) label = `service ${c.name} active`;
-      // Init-agnostic: systemd (is-active) OR OpenRC (rc-service status, for Alpine).
-      const r = await runOnMachine(
-        m,
-        sshModel,
-        `systemctl is-active ${c.name} >/dev/null 2>&1 || rc-service ${c.name} status >/dev/null 2>&1`,
-        30,
-        repoDir,
-      );
-      ok = r.rc === 0;
-      detail = ok ? "active" : `not active (rc ${r.rc})`;
     } else {
-      if (!label) label = `command: ${c.run.slice(0, 40)}`;
-      const r = await runOnMachine(m, sshModel, c.run, c.timeoutSec, repoDir);
-      ok = r.rc === 0;
-      detail = `rc ${r.rc}`;
+      if (!label) {
+        label = c.type === "service"
+          ? `service ${c.name} active`
+          : `command: ${c.run.slice(0, 40)}`;
+      }
+      const rc = rcs.get(si++);
+      if (rc === undefined) {
+        detail = "no result";
+      } else {
+        ok = rc === 0;
+        detail = c.type === "service"
+          ? (ok ? "active" : `not active (rc ${rc})`)
+          : `rc ${rc}`;
+      }
     }
     results.push({ label, ok, detail });
   }
@@ -1043,6 +1271,8 @@ export async function evalHealthWithGrace(
 export interface CheckCtx {
   globalArgs: z.infer<typeof GlobalArgs>;
   repoDir: string;
+  /** Definitions, read in-process (checks get no runModel; see `checkSwamp`). */
+  definitionRepository: DefinitionLookup;
   methodName?: string;
   /** Method arguments merged with the global arguments. Not in the swamp docs, so optional. */
   unresolvedMethodArgs?: Record<string, unknown>;
@@ -1095,43 +1325,20 @@ type Machine = z.infer<typeof Machine>;
 export async function vmSnapshotNames(
   nodeModel: string,
   vmid: number,
-  repoDir: string,
+  swamp: SwampApi,
 ): Promise<string[] | null> {
-  // @ts-ignore Deno API
-  const out = await new Deno.Command(SWAMP_BIN, {
-    args: [
-      "model",
-      "method",
-      "run",
-      nodeModel,
-      "listVmSnapshots",
-      "--json",
-      "--quiet",
-      "--repo-dir",
-      repoDir,
-      "--input",
-      `vmid:json=${vmid}`,
-    ],
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  if (out.code !== 0) {
+  const res = await swamp.run(nodeModel, "listVmSnapshots", { vmid });
+  if (!res.ok) {
     throw new Error(
-      new TextDecoder().decode(out.stderr).slice(-300) || `rc ${out.code}`,
+      tail(res.error, 300) || `${nodeModel} listVmSnapshots failed`,
     );
   }
-  try {
-    const parsed = JSON.parse(new TextDecoder().decode(out.stdout)) as {
-      dataArtifacts?: Array<
-        { attributes?: { snapshots?: Array<{ name?: string }> } }
-      >;
-    };
-    const list = parsed.dataArtifacts?.[0]?.attributes?.snapshots;
-    if (!Array.isArray(list)) return null;
-    return list.map((s) => s.name ?? "").filter((n) => n && n !== "current");
-  } catch {
-    return null; // the node answered, but the list is not readable
-  }
+  const list = res.artifacts[0]?.snapshots;
+  // null: the node answered, but the list is not readable
+  if (!Array.isArray(list)) return null;
+  return list.map((s) => (s as { name?: string })?.name ?? "").filter((n) =>
+    n && n !== "current"
+  );
 }
 
 /** `policy` — the `host` argument names a machine in the fleet. */
@@ -1145,6 +1352,22 @@ export function checkHostInFleet(ctx: CheckCtx): CheckResult {
     `No machine "${host}" in globalArguments.machines. Known machines: ${known}. ` +
       `Fix the host name, or add the machine to the fleet. ${
         skipHint("host-in-fleet", "policy")
+      }`,
+  );
+}
+
+/**
+ * `policy` — the `host` argument of `clearRetired` is NOT in the fleet. This is the
+ * opposite of `host-in-fleet`: clearRetired only removes hosts the fleet no longer lists.
+ */
+export function checkHostRetired(ctx: CheckCtx): CheckResult {
+  const host = checkHost(ctx);
+  if (host === undefined) return PASS; // no host filter, or no input yet
+  if (!ctx.globalArgs.machines.some((m) => m.host === host)) return PASS;
+  return fail(
+    `Host "${host}" is still in globalArguments.machines, so it is not retired. ` +
+      `Remove it from the fleet first, then run clearRetired. ${
+        skipHint("host-retired", "policy")
       }`,
   );
 }
@@ -1171,15 +1394,16 @@ export async function checkHostReachable(ctx: CheckCtx): Promise<CheckResult> {
   // safeUpdate always reaches the docker host over ssh; the others follow the OS path.
   const viaPct = ctx.methodName !== "safeUpdate" && !machine.vm &&
     isCtMachine(machine);
+  const swamp = checkSwamp(ctx);
   try {
     if (viaPct) {
-      const { node, ctid } = await ctLocation(machine, ctx.repoDir);
+      const { node, ctid } = await ctLocation(machine, swamp);
       const r = await nodeExec(
         sshModel,
         node,
         `pct status ${ctid}`,
         30,
-        ctx.repoDir,
+        swamp,
       );
       if (r.rc !== 0 || !/status:\s*running/.test(r.out)) {
         return fail(
@@ -1191,7 +1415,7 @@ export async function checkHostReachable(ctx: CheckCtx): Promise<CheckResult> {
       }
       return PASS;
     }
-    const r = await nodeExec(sshModel, host, "true", 30, ctx.repoDir);
+    const r = await nodeExec(sshModel, host, "true", 30, swamp);
     if (r.rc !== 0) {
       return fail(
         `Host "${host}" did not answer over ${sshModel} (rc ${r.rc}). ` +
@@ -1220,14 +1444,15 @@ export async function checkBaselineHealthy(
   const found = checkMachine(ctx);
   if (!found) return PASS;
   const { host, machine } = found;
+  const swamp = checkSwamp(ctx);
   try {
-    const health = await resolveHealthChecks(machine, ctx.repoDir);
+    const health = await resolveHealthChecks(machine, swamp);
     if (!health.length) return PASS;
     const res = await evalHealth(
       machine,
       health,
       ctx.globalArgs.sshModel,
-      ctx.repoDir,
+      swamp,
     );
     if (res.healthy) return PASS;
     const bad = res.results.filter((r) => !r.ok).map((r) =>
@@ -1260,22 +1485,23 @@ export async function checkSnapshotTargetResolves(
   if (!machine.vm && !isCt) return PASS; // bare metal: nothing to snapshot
   const wanted = checkArg(ctx, "snapshot");
   const needSnapshot = ctx.methodName === "rollback";
+  const swamp = checkSwamp(ctx);
   let names: string[] | null = null;
   let where: string;
   try {
     if (machine.vm) {
       const { proxmoxNode, vmid } = machine.vm;
       where = `VM ${vmid} via node model "${proxmoxNode}"`;
-      names = await vmSnapshotNames(proxmoxNode, vmid, ctx.repoDir);
+      names = await vmSnapshotNames(proxmoxNode, vmid, swamp);
     } else {
-      const { node, ctid } = await ctLocation(machine, ctx.repoDir);
+      const { node, ctid } = await ctLocation(machine, swamp);
       where = `CT ${ctid} on node "${node}"`;
       const r = await nodeExec(
         ctx.globalArgs.sshModel,
         node,
         `pct listsnapshot ${ctid}`,
         30,
-        ctx.repoDir,
+        swamp,
       );
       if (r.rc !== 0) {
         return fail(
@@ -1312,15 +1538,207 @@ export async function checkSnapshotTargetResolves(
   return PASS;
 }
 
+// ---------------------------------------------------------------------------
+// Retired machines: hosts that have stored records but are no longer in
+// globalArguments.machines. `clearRetired` removes their records.
+// ---------------------------------------------------------------------------
+
+/** The resource specs whose records belong to one host (never prune, seed or report). */
+export const HOST_SPECS = [
+  "inventory",
+  "update",
+  "osUpdate",
+  "reboot",
+  "run",
+  "snapshot",
+  "image",
+] as const;
+export type HostSpec = typeof HOST_SPECS[number];
+
+/** The specs that hold current status. `keepHistory` still deletes these. */
+const STATUS_SPECS: readonly HostSpec[] = [
+  "inventory",
+  "update",
+  "osUpdate",
+  "reboot",
+];
+
+/**
+ * The host a stored record belongs to. An inventory record is named by its host.
+ * Every other record carries `attributes.host`. A name prefix is never used, so
+ * `node` can not match a record of `node2`. Returns null when the host is unknown.
+ */
+export function recordHost(
+  spec: HostSpec,
+  name: string,
+  attributes: Record<string, unknown>,
+): string | null {
+  if (spec === "inventory") return name || null;
+  const h = attributes.host;
+  return typeof h === "string" && h !== "" ? h : null;
+}
+
+/** One stored record that belongs to a host. */
+export interface HostRecord {
+  host: string;
+  spec: HostSpec;
+  name: string;
+  attributes: Record<string, unknown>;
+}
+
+/** Read every host-owned record of this model (latest version of each name). */
+export async function readHostRecords(
+  context: Pick<Ctx, "dataRepository" | "modelType" | "modelId">,
+): Promise<HostRecord[]> {
+  const out: HostRecord[] = [];
+  for (const d of await readOwnRecords(context, HOST_SPECS)) {
+    const spec = d.specName as HostSpec;
+    const host = recordHost(spec, d.name, d.attributes);
+    if (host !== null) {
+      out.push({ host, spec, name: d.name, attributes: d.attributes });
+    }
+  }
+  return out;
+}
+
+/** The hosts that have stored records but are not in the fleet. */
+export function retiredHosts(
+  records: HostRecord[],
+  fleetHosts: string[],
+): string[] {
+  const fleet = new Set(fleetHosts);
+  return [...new Set(records.map((r) => r.host))].filter((h) => !fleet.has(h))
+    .sort();
+}
+
+/** One planned or done action on a record of a retired host. */
+export interface RetiredEntry {
+  host: string;
+  name: string;
+  spec: HostSpec;
+}
+
+/** What `clearRetired` does with the records of the retired hosts. */
+export interface RetiredPlan {
+  remove: RetiredEntry[];
+  keep: Array<RetiredEntry & { reason: string }>;
+}
+
+/** Decide, per record, whether `clearRetired` removes or keeps it. Pure. */
+export function planRetiredClear(
+  records: HostRecord[],
+  hosts: string[],
+  opts: { keepHistory: boolean; force: boolean },
+): RetiredPlan {
+  const plan: RetiredPlan = { remove: [], keep: [] };
+  const wanted = new Set(hosts);
+  const sorted = records.filter((r) => wanted.has(r.host)).sort((a, b) =>
+    a.host.localeCompare(b.host) || a.spec.localeCompare(b.spec) ||
+    a.name.localeCompare(b.name)
+  );
+  for (const r of sorted) {
+    const e = { host: r.host, name: r.name, spec: r.spec };
+    const retention = r.spec === "snapshot" || r.spec === "image";
+    if (STATUS_SPECS.includes(r.spec)) {
+      plan.remove.push(e);
+    } else if (retention && r.attributes.status === "active") {
+      if (opts.force) plan.remove.push(e);
+      else {
+        plan.keep.push({
+          ...e,
+          reason:
+            `active ${r.spec} record: the ${
+              r.spec === "snapshot" ? "snapshot" : "image"
+            } may still exist, so deleting the record would orphan it. ` +
+            "Prune it first, or use force=true",
+        });
+      }
+    } else if (opts.keepHistory) {
+      plan.keep.push({ ...e, reason: "history kept (keepHistory=true)" });
+    } else {
+      plan.remove.push(e);
+    }
+  }
+  return plan;
+}
+
+// ---------------------------------------------------------------------------
+// Scan fan-out. swamp allows at most 100 `runModel` calls in one method run, so
+// `scan` batches: ONE ssh `script` call for every ssh host, ONE call per Proxmox
+// node for its CTs, ONE shell call per machine for its health checks.
+// ---------------------------------------------------------------------------
+
+/** The text of swamp's error when a method run has used up its `runModel` calls. */
+export const INVOCATION_CAP_TEXT = "Maximum cross-model invocation count";
+
+/** swamp's limit of `runModel` calls in one method run (MAX_INVOCATION_BREADTH). */
+export const INVOCATION_CAP = 100;
+
+/**
+ * The node-side script that runs the collector in each CT of one node in turn.
+ * The collector is sent once (base64, in a shell variable). Each CT's output is
+ * delimited by `@@PATCH-CT <ctid> BEGIN` and `@@PATCH-CT <ctid> END rc=<rc>`.
+ * `pct exec` reads /dev/null, because the ssh model feeds this script on stdin.
+ */
+export function ctBatchScript(ctids: number[], collectorB64: string): string {
+  const lines = [`PATCH_COLLECTOR='${collectorB64}'`];
+  for (const ctid of ctids) {
+    lines.push(
+      `echo "@@PATCH-CT ${ctid} BEGIN"`,
+      `pct exec ${ctid} -- bash -c "echo '\${PATCH_COLLECTOR}' | base64 -d | bash" </dev/null`,
+      // printf starts a new line, so the marker is found even after output with no newline.
+      `printf '\\n@@PATCH-CT %s END rc=%s\\n' ${ctid} "$?"`,
+    );
+  }
+  return lines.join("\n") + "\n";
+}
+
+/** Split a CT batch's output into each CT's section. `rc` is null when the END
+ *  marker is missing (the run was cut short). A CT with no BEGIN marker is absent. */
+export function parseCtSections(
+  stdout: string,
+): Map<number, { out: string; rc: number | null }> {
+  const sections = new Map<number, { out: string; rc: number | null }>();
+  let cur: { ctid: number; lines: string[] } | null = null;
+  const close = (rc: number | null) => {
+    if (cur) sections.set(cur.ctid, { out: cur.lines.join("\n"), rc });
+    cur = null;
+  };
+  for (const line of stdout.split("\n")) {
+    const begin = line.match(/^@@PATCH-CT (\d+) BEGIN\s*$/);
+    if (begin) {
+      close(null);
+      cur = { ctid: parseInt(begin[1], 10), lines: [] };
+      continue;
+    }
+    const end = line.match(/^@@PATCH-CT (\d+) END rc=(\d+)\s*$/);
+    if (end) {
+      if (cur && cur.ctid === parseInt(end[1], 10)) {
+        close(parseInt(end[2], 10));
+      }
+      continue;
+    }
+    if (cur) cur.lines.push(line);
+  }
+  close(null);
+  return sections;
+}
+
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.10.01.1",
+  version: "2026.10.09.1",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
       description:
         "Version bump, no globalArguments schema change (adds the healthGraceSec method argument and single-snapshot CT updates)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.09.1",
+      description:
+        "Version bump, no globalArguments schema change (adds the clearRetired method; reads own data by model id)",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1401,6 +1819,14 @@ export const model = {
       execute: (context: CheckCtx) =>
         Promise.resolve(checkHostInFleet(context)),
     },
+    "host-retired": {
+      description:
+        "The host argument of clearRetired is not in globalArguments.machines (clearRetired removes only hosts the fleet no longer lists)",
+      labels: ["policy"],
+      appliesTo: ["clearRetired"],
+      execute: (context: CheckCtx) =>
+        Promise.resolve(checkHostRetired(context)),
+    },
     "docker-configured": {
       description: "The machine has a docker block, which safeUpdate needs",
       labels: ["policy"],
@@ -1435,22 +1861,36 @@ export const model = {
       description:
         "Fan out over the fleet: collect OS + docker image-drift per machine, and fire community-script checkUpdate for proxmox-referenced machines.",
       arguments: z.object({}),
-      execute: async (_args: unknown, context: {
-        globalArgs: z.infer<typeof GlobalArgs>;
-        repoDir: string;
-        logger: Logger;
-        writeResource: (
-          spec: string,
-          name: string,
-          data: unknown,
-        ) => Promise<{ name: string }>;
-      }) => {
+      execute: async (
+        _args: unknown,
+        context: SwampMethodCtx & {
+          globalArgs: z.infer<typeof GlobalArgs>;
+          logger: Logger;
+          writeResource: (
+            spec: string,
+            name: string,
+            data: unknown,
+          ) => Promise<{ name: string }>;
+        },
+      ) => {
         const { sshModel, machines } = context.globalArgs;
-        const repoDir = context.repoDir;
         context.logger.info("Scanning {count} machines via {sshModel}", {
           count: machines.length,
           sshModel,
         });
+        // Count the model calls, and notice when swamp's per-run cap is reached.
+        const base = methodSwamp(context);
+        let calls = 0;
+        let capHit = false;
+        const swamp: SwampApi = {
+          ...base,
+          run: async (model, method, args) => {
+            calls++;
+            const res = await base.run(model, method, args);
+            if (res.error.includes(INVOCATION_CAP_TEXT)) capHit = true;
+            return res;
+          },
+        };
         const collector = COLLECTOR_SCRIPT;
         const collectorB64 = utf8b64(collector);
 
@@ -1478,79 +1918,128 @@ export const model = {
           scannedAt,
         });
 
-        // Run the collector INSIDE a CT via `pct exec` on its node. The CT's location
-        // comes from its `ct` decoration (or, legacy, the referenced proxmox model).
-        const scanPct = async (m: MachineShape): Promise<string | null> => {
-          const { node, ctid } = await ctLocation(m, repoDir);
-          const wrapped =
-            `pct exec ${ctid} -- bash -c "echo '${collectorB64}' | base64 -d | bash"`;
-          const runs = await runScript(sshModel, [node], wrapped, 240, repoDir);
-          const r = runs.find((x) => x.host === node) ?? runs[0];
-          return r ? markerLine(r.stdout, "patch-inventory") : null;
-        };
-
         // Per machine: reach=ssh (default) tries SSH then falls back to pct when a
-        // proxmox ref exists; reach=pct goes straight to pct. reachMethod records which
-        // worked. Per-machine (not fan-out) so one unreachable host can't sink the run.
-        for (const m of machines) {
-          if (m.os === false) continue;
+        // CT location exists; reach=pct goes straight to pct. reachMethod records
+        // which worked. A failure of one host or node never sinks the others.
+        const scanned = machines.filter((m) => m.os !== false);
+        const lines = new Map<string, { line: string; via: "ssh" | "pct" }>();
+        const errs = new Map<string, string>();
+        const addErr = (h: string, e: string) =>
+          errs.set(h, errs.has(h) ? `${errs.get(h)}; ${e}` : e);
+
+        // 1) ONE ssh `script` call runs the collector on every ssh host.
+        const sshHosts = scanned.filter((m) => m.reach !== "pct").map((m) =>
+          m.host
+        );
+        if (sshHosts.length) {
+          try {
+            const res = await runScriptOutcome(
+              sshModel,
+              sshHosts,
+              collector,
+              240,
+              swamp,
+            );
+            for (const h of sshHosts) {
+              // A one-host call keeps the old fallback to the only result.
+              const r = res.runs.find((x) => x.host === h) ??
+                (sshHosts.length === 1 ? res.runs[0] : undefined);
+              const line = r ? markerLine(r.stdout, "patch-inventory") : null;
+              if (line) lines.set(h, { line, via: "ssh" });
+              else if (r) addErr(h, `no inventory (exit ${r.exitCode})`);
+              else if (!res.ok) addErr(h, `ssh: ${tail(res.error, 90)}`);
+              else addErr(h, "no inventory");
+            }
+          } catch (e) {
+            for (const h of sshHosts) {
+              addErr(h, `ssh: ${(e as Error).message.slice(0, 90)}`);
+            }
+          }
+        }
+
+        // 2) CTs with no inventory yet go to pct, grouped by node: ONE call per node
+        // runs the collector in each of its CTs (see ctBatchScript).
+        const byNode = new Map<string, Array<{ host: string; ctid: number }>>();
+        for (const m of scanned) {
+          if (lines.has(m.host) || !isCtMachine(m)) continue;
+          try {
+            const { node, ctid } = await ctLocation(m, swamp);
+            byNode.set(node, [...(byNode.get(node) ?? []), {
+              host: m.host,
+              ctid,
+            }]);
+          } catch (e) {
+            addErr(m.host, `pct: ${(e as Error).message.slice(0, 90)}`);
+          }
+        }
+        for (const [node, cts] of byNode) {
+          try {
+            const res = await runScriptOutcome(
+              sshModel,
+              [node],
+              ctBatchScript(cts.map((c) => c.ctid), collectorB64),
+              240 * cts.length,
+              swamp,
+            );
+            const r = res.runs.find((x) => x.host === node) ?? res.runs[0];
+            const sections = parseCtSections(r?.stdout ?? "");
+            for (const { host, ctid } of cts) {
+              const sec = sections.get(ctid);
+              const line = sec ? markerLine(sec.out, "patch-inventory") : null;
+              if (line) lines.set(host, { line, via: "pct" });
+              else if (!r && !res.ok) {
+                addErr(host, `pct: ${tail(res.error, 90)}`);
+              } else {
+                addErr(
+                  host,
+                  `pct: no inventory${
+                    sec?.rc !== null && sec?.rc !== undefined
+                      ? ` (exit ${sec.rc})`
+                      : ""
+                  }`,
+                );
+              }
+            }
+          } catch (e) {
+            for (const { host } of cts) {
+              addErr(host, `pct: ${(e as Error).message.slice(0, 90)}`);
+            }
+          }
+        }
+        context.logger.info(
+          "Collected inventory: {ssh} ssh host(s) in one call, {cts} CT(s) on {nodes} node(s) via pct",
+          {
+            ssh: sshHosts.length,
+            cts: [...byNode.values()].reduce((n, c) => n + c.length, 0),
+            nodes: byNode.size,
+          },
+        );
+
+        // 3) Health checks (own, or derived from a community-script source): one
+        // shell call per machine for its service + command checks.
+        for (const m of scanned) {
           const h = m.host;
-          let line: string | null = null;
-          let method: "ssh" | "pct" | null = null;
-          let err = "";
-
-          if (m.reach !== "pct") {
-            try {
-              const runs = await runScript(
-                sshModel,
-                [h],
-                collector,
-                240,
-                repoDir,
-              );
-              const r = runs.find((x) => x.host === h) ?? runs[0];
-              line = r ? markerLine(r.stdout, "patch-inventory") : null;
-              if (line) method = "ssh";
-              else err = `no inventory${r ? ` (exit ${r.exitCode})` : ""}`;
-            } catch (e) {
-              err = `ssh: ${(e as Error).message.slice(0, 90)}`;
-            }
-          }
-          if (!line && isCtMachine(m)) {
-            try {
-              line = await scanPct(m);
-              if (line) method = "pct";
-              else {err = err
-                  ? `${err}; pct: no inventory`
-                  : "pct: no inventory";}
-            } catch (e) {
-              err = `${err ? err + "; " : ""}pct: ${
-                (e as Error).message.slice(0, 90)
-              }`;
-            }
-          }
-
-          // Evaluate health checks (own, or derived from a community-script source).
           let health: {
             healthy: boolean;
             checks: Array<{ label: string; ok: boolean; detail: string }>;
           } | null = null;
           try {
-            const checks = await resolveHealthChecks(m, repoDir);
+            const checks = await resolveHealthChecks(m, swamp);
             if (checks.length) {
-              const hres = await evalHealth(m, checks, sshModel, repoDir);
+              const hres = await evalHealth(m, checks, sshModel, swamp);
               health = { healthy: hres.healthy, checks: hres.results };
             }
           } catch { /* health stays null */ }
 
-          if (line) {
+          const found = lines.get(h);
+          if (found) {
             handles.push(
               await context.writeResource(
                 "inventory",
                 h,
                 {
-                  ...(JSON.parse(line) as Record<string, unknown>),
-                  reachMethod: method,
+                  ...(JSON.parse(found.line) as Record<string, unknown>),
+                  reachMethod: found.via,
                   health,
                   error: null,
                 },
@@ -1559,23 +2048,36 @@ export const model = {
           } else {
             handles.push(
               await context.writeResource("inventory", h, {
-                ...errorInv(h, err || "unreachable"),
+                ...errorInv(h, errs.get(h) || "unreachable"),
                 health,
               }),
             );
           }
         }
 
-        // Fire checkUpdate on each machine's app source (community-script) for fresh
-        // data the report reads; best-effort, never fails the scan.
+        // 4) Fire checkUpdate on each machine's app source (community-script) for
+        // fresh data the report reads; best-effort, never fails the scan.
         for (const m of machines) {
           const src = appSource(m);
-          if (src) await runModelMethod(src, "checkUpdate", repoDir);
+          if (src) {
+            await runLogged(swamp, src, "checkUpdate", {}, context.logger);
+          }
         }
 
+        if (capHit) {
+          context.logger.warn(
+            "swamp's cap of {cap} model calls per method run was reached while scanning {count} machines, so later calls failed. Split the fleet over more fleet models",
+            { cap: INVOCATION_CAP, count: machines.length },
+          );
+        }
         context.logger.info(
-          "Scanned {count} machines via {sshModel}: wrote {records} inventory records",
-          { count: machines.length, sshModel, records: handles.length },
+          "Scanned {count} machines via {sshModel}: wrote {records} inventory records in {calls} model calls",
+          {
+            count: machines.length,
+            sshModel,
+            records: handles.length,
+            calls,
+          },
         );
         return { dataHandles: handles };
       },
@@ -1585,30 +2087,24 @@ export const model = {
       description:
         "Emit a suggested `machines` block seeded from the sshModel host list (and, later, Proxmox guests) to paste into globalArguments and decorate.",
       arguments: z.object({}),
-      execute: async (_args: unknown, context: {
-        globalArgs: z.infer<typeof GlobalArgs>;
-        repoDir: string;
-        logger: Logger;
-        writeResource: (
-          spec: string,
-          name: string,
-          data: unknown,
-        ) => Promise<{ name: string }>;
-      }) => {
+      execute: async (
+        _args: unknown,
+        context: SwampMethodCtx & {
+          globalArgs: z.infer<typeof GlobalArgs>;
+          logger: Logger;
+          writeResource: (
+            spec: string,
+            name: string,
+            data: unknown,
+          ) => Promise<{ name: string }>;
+        },
+      ) => {
         const { sshModel, proxmoxNodes } = context.globalArgs;
-        const repoDir = context.repoDir;
+        const swamp = methodSwamp(context);
         context.logger.info(
           "Seeding machines from {sshModel} and {nodeCount} Proxmox nodes",
           { sshModel, nodeCount: proxmoxNodes.length },
         );
-        const dec = new TextDecoder();
-        const swamp = (args: string[]) =>
-          // @ts-ignore Deno API
-          new Deno.Command(SWAMP_BIN, {
-            args: [...args, "--quiet", "--repo-dir", repoDir],
-            stdout: "piped",
-            stderr: "piped",
-          }).output();
 
         // 1) Discover Proxmox guests first, indexed by name (so ssh hosts can be decorated).
         interface Guest {
@@ -1622,38 +2118,19 @@ export const model = {
         const notes: string[] = [];
         for (const pnode of proxmoxNodes) {
           try {
-            await swamp([
-              "model",
-              "method",
-              "run",
-              pnode,
-              "listGuests",
-              "--json",
-            ]);
-            const gout = await swamp([
-              "data",
-              "get",
-              pnode,
-              "guests",
-              "--json",
-            ]);
-            const content =
-              (JSON.parse(dec.decode(gout.stdout)) as { content?: unknown })
-                .content;
-            const parsed = typeof content === "string"
-              ? JSON.parse(content)
-              : content;
-            const gs = (parsed as {
-              guests?: Array<
-                {
-                  type: string;
-                  vmid: number;
-                  name: string;
-                  node: string;
-                  ip: string | null;
-                }
-              >;
-            })?.guests ?? [];
+            const res = await swamp.run(pnode, "listGuests");
+            if (!res.ok) throw new Error(res.error || "listGuests failed");
+            // listGuests writes the `guests` resource; its attributes hold the list.
+            const found = res.artifacts.find((a) => Array.isArray(a.guests));
+            const gs = (found?.guests ?? []) as Array<
+              {
+                type: string;
+                vmid: number;
+                name: string;
+                node: string;
+                ip: string | null;
+              }
+            >;
             for (const g of gs) {
               if (g.type === "qemu" || g.type === "lxc") {
                 guests.set(g.name, {
@@ -1714,15 +2191,12 @@ export const model = {
         // 2) ssh model host list (decorated from discovery).
         let sshHosts: Array<{ name: string; tags?: string[] }> = [];
         try {
-          sshHosts = (JSON.parse(
-            dec.decode(
-              (await swamp(["model", "get", sshModel, "--json"])).stdout,
-            ),
-          ) as {
-            globalArguments?: {
-              hosts?: Array<{ name: string; tags?: string[] }>;
-            };
-          }).globalArguments?.hosts ?? [];
+          const ga = await swamp.globalArguments(sshModel);
+          if (!ga) throw new Error(`no model named ${sshModel}`);
+          const hosts = ga.hosts;
+          sshHosts = Array.isArray(hosts)
+            ? hosts as Array<{ name: string; tags?: string[] }>
+            : [];
         } catch (e) {
           lines.push(
             `  # sshModel ${sshModel} read failed: ${
@@ -1809,7 +2283,7 @@ export const model = {
         retentionHours: number;
       }, context: Ctx) => {
         const { sshModel, machines } = context.globalArgs;
-        const repoDir = context.repoDir;
+        const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
         if (!machine?.docker) {
           throw new Error(`machine "${args.host}" has no docker decoration`);
@@ -1831,7 +2305,7 @@ export const model = {
           { service: svc, host: args.host },
         );
         const ex = (cmd: string, t = 60) =>
-          nodeExec(sshModel, args.host, cmd, t, repoDir);
+          nodeExec(sshModel, args.host, cmd, t, swamp);
         const runTs = new Date().toISOString();
         // Append-only audit record for this docker run, including which container
         // images changed (from → to). Full detail also lives in `update-<host>`.
@@ -2110,7 +2584,7 @@ export const model = {
         healthGraceSec: number;
       }, context: Ctx) => {
         const { sshModel, machines } = context.globalArgs;
-        const repoDir = context.repoDir;
+        const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
         if (!machine) throw new Error(`no machine "${args.host}" in the fleet`);
         const logs: string[] = [];
@@ -2129,14 +2603,14 @@ export const model = {
         // Health checks (machine's own, or derived from a community-script source).
         // The BEFORE-update gate is the `baseline-healthy` pre-flight check (bypass
         // with `--skip-check baseline-healthy`); here they judge the result only.
-        const checks = await resolveHealthChecks(machine, repoDir);
+        const checks = await resolveHealthChecks(machine, swamp);
         // After an update: health verdict. With checks → evalHealth; else reachability.
         // Last post-update verdict, written into the refreshed inventory record.
         let lastHealth: HealthResult | null = null;
         const afterHealthy = async (reachable: boolean): Promise<boolean> => {
           if (!checks.length) return reachable;
           const h = await evalHealthWithGrace(
-            () => evalHealth(machine, checks, sshModel, repoDir),
+            () => evalHealth(machine, checks, sshModel, swamp),
             args.healthGraceSec,
             context.logger,
           );
@@ -2196,7 +2670,7 @@ export const model = {
         // ---- CT: snapshot-guarded OS update inside the container via pct (captured),
         // plus the optional app updater (community-script) on top — one snapshot guards both. ----
         if (isCtMachine(machine) && !machine.vm) {
-          const { node, ctid } = await ctLocation(machine, repoDir);
+          const { node, ctid } = await ctLocation(machine, swamp);
           const collectorB64 = utf8b64(collector);
           // Ship a shell snippet into the CT via pct, piped as a script (like scanCt) to
           // avoid the nested-quote breakage of `pct exec -- sh -c "..."` through exec.
@@ -2211,7 +2685,7 @@ export const model = {
                 utf8b64(snippet)
               }' | base64 -d | bash"`,
               t,
-              repoDir,
+              swamp,
             );
             const r = runs.find((x) => x.host === node) ?? runs[0];
             return { rc: r?.exitCode ?? -1, out: r?.stdout ?? "" };
@@ -2225,7 +2699,7 @@ export const model = {
                 [node],
                 `pct exec ${ctid} -- bash -c "echo '${collectorB64}' | base64 -d | bash"`,
                 240,
-                repoDir,
+                swamp,
               );
               const r = runs.find((x) => x.host === node) ?? runs[0];
               const line = r ? markerLine(r.stdout, "patch-inventory") : null;
@@ -2237,7 +2711,7 @@ export const model = {
             }
           };
           const pct = (opArgs: string, t = 300) =>
-            nodeExec(sshModel, node, `pct ${opArgs}`, t, repoDir);
+            nodeExec(sshModel, node, `pct ${opArgs}`, t, swamp);
 
           const before = await scanCt();
           if (!before) {
@@ -2273,7 +2747,7 @@ export const model = {
           if (src) {
             // This method owns the snapshot (taken above) and the rollback, so the
             // source must not take a second, untracked snapshot.
-            const ok = await runSourceSafeUpdate(src, repoDir, context.logger);
+            const ok = await runSourceSafeUpdate(src, swamp, context.logger);
             appNote = `; app ${src}: ${ok ? "ok" : "failed"}`;
             log(`app source ${src} safeUpdate: ${ok ? "ok" : "failed"}`);
           }
@@ -2409,7 +2883,7 @@ export const model = {
               [args.host],
               collector,
               240,
-              repoDir,
+              swamp,
             );
           } catch {
             return null;
@@ -2447,11 +2921,11 @@ export const model = {
               machine.vm!.proxmoxNode
             }`,
           );
-          const s = await runModelMethodInput(
+          const s = await runLogged(
+            swamp,
             machine.vm!.proxmoxNode,
             "snapshotVm",
             { vmid: machine.vm!.vmid, name: snap },
-            repoDir,
             context.logger,
           );
           if (!s) {
@@ -2467,7 +2941,7 @@ export const model = {
         const manifest = async (): Promise<Map<string, string>> => {
           try {
             return parseManifest(
-              (await nodeExec(sshModel, args.host, pkgCmd, 120, repoDir)).out,
+              (await nodeExec(sshModel, args.host, pkgCmd, 120, swamp)).out,
             );
           } catch {
             return new Map();
@@ -2476,7 +2950,7 @@ export const model = {
         const beforePkgs = await manifest();
 
         log(`upgrading (${args.mode})`);
-        const up = await nodeExec(sshModel, args.host, upScript, 1800, repoDir);
+        const up = await nodeExec(sshModel, args.host, upScript, 1800, swamp);
         log(`upgrade rc ${up.rc}`);
 
         let outcome: z.infer<typeof OsUpdateResult>["outcome"];
@@ -2500,11 +2974,11 @@ export const model = {
           log(`healthy after (${after?.updatesCount ?? "?"} updates left)`);
         } else if (isVm && snap && args.rollbackOnFailure) {
           log(`unhealthy after upgrade — rolling back to ${snap}`);
-          rolledBack = await runModelMethodInput(
+          rolledBack = await runLogged(
+            swamp,
             machine.vm!.proxmoxNode,
             "rollbackVm",
             { vmid: machine.vm!.vmid, name: snap },
-            repoDir,
             context.logger,
           );
           outcome = "rolled-back";
@@ -2642,7 +3116,7 @@ export const model = {
         healthGraceSec: number;
       }, context: Ctx) => {
         const { sshModel, machines } = context.globalArgs;
-        const repoDir = context.repoDir;
+        const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
         if (!machine) throw new Error(`no machine "${args.host}" in the fleet`);
         const logs: string[] = [];
@@ -2683,7 +3157,7 @@ export const model = {
           });
 
         // node + ctid for the pct path (from the `ct` decoration, or legacy proxmox ref).
-        const ctInfo = () => ctLocation(machine, repoDir);
+        const ctInfo = () => ctLocation(machine, swamp);
 
         // collector, UTF-8-safe base64 for the pct re-scan path (mirrors scan)
         const collector = COLLECTOR_SCRIPT;
@@ -2699,7 +3173,7 @@ export const model = {
                 [node],
                 wrapped,
                 240,
-                repoDir,
+                swamp,
               );
               const r = runs.find((x) => x.host === node) ?? runs[0];
               const line = r ? markerLine(r.stdout, "patch-inventory") : null;
@@ -2712,7 +3186,7 @@ export const model = {
               [args.host],
               collector,
               240,
-              repoDir,
+              swamp,
             );
             const r = runs.find((x) => x.host === args.host) ?? runs[0];
             const line = r ? markerLine(r.stdout, "patch-inventory") : null;
@@ -2769,7 +3243,7 @@ export const model = {
             node,
             `pct reboot ${ctid}`,
             180,
-            repoDir,
+            swamp,
           );
           cmdRc = r.rc;
         } else {
@@ -2777,7 +3251,7 @@ export const model = {
           const cmd = `SUDO=""; [ "$(id -u)" != 0 ] && SUDO="sudo -n"; ` +
             `$SUDO systemd-run --on-active=3 --timer-property=AccuracySec=100ms systemctl reboot`;
           log("scheduling systemctl reboot (+3s) over ssh");
-          const r = await nodeExec(sshModel, args.host, cmd, 30, repoDir);
+          const r = await nodeExec(sshModel, args.host, cmd, 30, swamp);
           cmdRc = r.rc;
         }
         log(`reboot command rc ${cmdRc}`);
@@ -2832,12 +3306,12 @@ export const model = {
         // Post-reboot health is DETECTION ONLY — a reboot cannot be rolled back
         // (the disk is unchanged). Recovery is a deliberate `rollback` to the
         // retained pre-update snapshot, never automatic here.
-        const checks = await resolveHealthChecks(machine, repoDir);
+        const checks = await resolveHealthChecks(machine, swamp);
         let appHealthy: boolean | null = null;
         let rebootHealth: HealthResult | null = null;
         if (confirmed && checks.length) {
           const h = await evalHealthWithGrace(
-            () => evalHealth(machine, checks, sshModel, repoDir),
+            () => evalHealth(machine, checks, sshModel, swamp),
             args.healthGraceSec,
             context.logger,
           );
@@ -2856,13 +3330,12 @@ export const model = {
           : (appHealthy === false ? "unhealthy" : "rebooted");
 
         if (outcome === "unhealthy") {
-          const snap =
-            (await context.readModelData(context.definition.name, "snapshot"))
-              .filter((d) =>
-                d.isLatest && d.attributes.host === args.host &&
-                d.attributes.status === "active"
-              )
-              .map((d) => d.attributes.name as string)[0];
+          const snap = (await readOwnSpec(context, "snapshot"))
+            .filter((d) =>
+              d.isLatest && d.attributes.host === args.host &&
+              d.attributes.status === "active"
+            )
+            .map((d) => d.attributes.name as string)[0];
           log(
             `⚠️ UNHEALTHY after reboot — no auto-rollback. ${
               snap
@@ -2901,12 +3374,11 @@ export const model = {
         // On a confirmed-healthy reboot, mark this host's active snapshot(s)
         // reboot-confirmed so pruneSnapshots can retire them after retention.
         if (outcome === "rebooted" && confirmed && needsRebootAfter === false) {
-          const snaps =
-            (await context.readModelData(context.definition.name, "snapshot"))
-              .filter((d) =>
-                d.isLatest && d.attributes.host === args.host &&
-                d.attributes.status === "active"
-              );
+          const snaps = (await readOwnSpec(context, "snapshot"))
+            .filter((d) =>
+              d.isLatest && d.attributes.host === args.host &&
+              d.attributes.status === "active"
+            );
           for (const s of snaps) {
             dh.push(
               await context.writeResource("snapshot", s.name, {
@@ -2941,7 +3413,7 @@ export const model = {
         context: Ctx,
       ) => {
         const { sshModel, machines } = context.globalArgs;
-        const repoDir = context.repoDir;
+        const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
         if (!machine) throw new Error(`no machine "${args.host}" in the fleet`);
         const logs: string[] = [];
@@ -2957,17 +3429,16 @@ export const model = {
         });
 
         // Find the target snapshot record (this host, active), newest first.
-        const recs =
-          (await context.readModelData(context.definition.name, "snapshot"))
-            .filter((d) =>
-              d.isLatest && d.attributes.host === args.host &&
-              d.attributes.status === "active"
-            )
-            .map((d) => ({
-              name: d.name,
-              a: d.attributes as unknown as z.infer<typeof SnapshotRecord>,
-            }))
-            .sort((x, y) => y.a.createdAt.localeCompare(x.a.createdAt));
+        const recs = (await readOwnSpec(context, "snapshot"))
+          .filter((d) =>
+            d.isLatest && d.attributes.host === args.host &&
+            d.attributes.status === "active"
+          )
+          .map((d) => ({
+            name: d.name,
+            a: d.attributes as unknown as z.infer<typeof SnapshotRecord>,
+          }))
+          .sort((x, y) => y.a.createdAt.localeCompare(x.a.createdAt));
         const target = args.snapshot
           ? recs.find((r) => r.a.name === args.snapshot)
           : recs[0];
@@ -2989,25 +3460,25 @@ export const model = {
             a.proxmoxNode,
             `pct rollback ${a.vmid} ${a.name}`,
             300,
-            repoDir,
+            swamp,
           )).rc === 0
-          : await runModelMethodInput(
+          : await runLogged(
+            swamp,
             a.proxmoxNode,
             "rollbackVm",
             {
               vmid: a.vmid,
               name: a.name,
             },
-            repoDir,
             context.logger,
           );
         log(ok ? `rolled back to ${a.name}` : `ROLLBACK FAILED for ${a.name}`);
 
         // Best-effort health verdict after the revert.
-        const checks = await resolveHealthChecks(machine, repoDir);
+        const checks = await resolveHealthChecks(machine, swamp);
         let healthy: boolean | null = null;
         if (ok && checks.length) {
-          const h = await evalHealth(machine, checks, sshModel, repoDir);
+          const h = await evalHealth(machine, checks, sshModel, swamp);
           healthy = h.healthy;
           log(
             `post-rollback health: ${
@@ -3071,7 +3542,7 @@ export const model = {
         context: Ctx,
       ) => {
         const { sshModel } = context.globalArgs;
-        const repoDir = context.repoDir;
+        const swamp = methodSwamp(context);
         context.logger.info(
           "Pruning retained snapshots (host={host} dryRun={dryRun})",
           { host: args.host ?? "all", dryRun: args.dryRun },
@@ -3079,18 +3550,13 @@ export const model = {
         const now = Date.now();
         const scannedAt = new Date().toISOString();
         const collector = COLLECTOR_SCRIPT;
-        // Final live gate: host answers a scan AND no reboot is pending.
-        const healthyNow = async (host: string): Promise<boolean> => {
+        // Final live gate: host answers a scan AND no reboot is pending. The scan
+        // goes the machine's own way: pct on its node for a CT (a CT often has no
+        // ssh), ssh otherwise.
+        const healthyNow = async (m: MachineShape): Promise<boolean> => {
           try {
-            const runs = await runScript(
-              sshModel,
-              [host],
-              collector,
-              240,
-              repoDir,
-            );
-            const r = runs.find((x) => x.host === host) ?? runs[0];
-            const line = r ? markerLine(r.stdout, "patch-inventory") : null;
+            const r = await runOnMachine(m, sshModel, collector, 240, swamp);
+            const line = markerLine(r.out, "patch-inventory");
             if (!line) return false;
             return (JSON.parse(line) as z.infer<typeof Inventory>)
               .needsReboot === false;
@@ -3099,12 +3565,11 @@ export const model = {
           }
         };
 
-        const records =
-          (await context.readModelData(context.definition.name, "snapshot"))
-            .filter((d) =>
-              d.isLatest && d.attributes.status === "active" &&
-              (!args.host || d.attributes.host === args.host)
-            );
+        const records = (await readOwnSpec(context, "snapshot"))
+          .filter((d) =>
+            d.isLatest && d.attributes.status === "active" &&
+            (!args.host || d.attributes.host === args.host)
+          );
 
         const pruned: Array<
           { host: string; name: string; detail: string | null }
@@ -3140,7 +3605,18 @@ export const model = {
             });
             continue;
           }
-          if (!(await healthyNow(a.host))) {
+          const machine = context.globalArgs.machines.find((m) =>
+            m.host === a.host
+          );
+          if (!machine) {
+            kept.push({
+              host: a.host,
+              name: a.name,
+              reason: "host not in the fleet",
+            });
+            continue;
+          }
+          if (!(await healthyNow(machine))) {
             kept.push({
               host: a.host,
               name: a.name,
@@ -3162,16 +3638,16 @@ export const model = {
               a.proxmoxNode,
               `pct delsnapshot ${a.vmid} ${a.name}`,
               180,
-              repoDir,
+              swamp,
             )).rc === 0
-            : await runModelMethodInput(
+            : await runLogged(
+              swamp,
               a.proxmoxNode,
               "deleteVmSnapshot",
               {
                 vmid: a.vmid,
                 name: a.name,
               },
-              repoDir,
               context.logger,
             );
           if (!ok) {
@@ -3232,7 +3708,7 @@ export const model = {
         context: Ctx,
       ) => {
         const { sshModel } = context.globalArgs;
-        const repoDir = context.repoDir;
+        const swamp = methodSwamp(context);
         context.logger.info(
           "Pruning retained images (host={host} dryRun={dryRun})",
           { host: args.host ?? "all", dryRun: args.dryRun },
@@ -3247,19 +3723,18 @@ export const model = {
               host,
               "docker version --format '{{.Server.Version}}'",
               30,
-              repoDir,
+              swamp,
             )).rc === 0;
           } catch {
             return false;
           }
         };
 
-        const records =
-          (await context.readModelData(context.definition.name, "image"))
-            .filter((d) =>
-              d.isLatest && d.attributes.status === "active" &&
-              (!args.host || d.attributes.host === args.host)
-            );
+        const records = (await readOwnSpec(context, "image"))
+          .filter((d) =>
+            d.isLatest && d.attributes.status === "active" &&
+            (!args.host || d.attributes.host === args.host)
+          );
 
         const pruned: Array<
           { host: string; name: string; detail: string | null }
@@ -3299,7 +3774,7 @@ export const model = {
             a.host,
             `docker rmi ${a.imageId}`,
             60,
-            repoDir,
+            swamp,
           );
           if (rm.rc !== 0) {
             kept.push({
@@ -3345,6 +3820,129 @@ export const model = {
           },
         );
         return { dataHandles: handles };
+      },
+    },
+    clearRetired: {
+      description:
+        "Remove the stored records of retired machines: hosts with records that are no longer in globalArguments.machines. dryRun defaults to TRUE, so a bare run only previews. Status records (inventory and last update, os-update, reboot results) and run history are deleted; ACTIVE snapshot/image records are kept (they track real snapshots/images) unless force=true. keepHistory keeps run and pruned retention records.",
+      arguments: z.object({
+        host: z.string().min(1).optional().describe(
+          "One retired host (default: every retired host)",
+        ),
+        dryRun: z.boolean().default(true).describe(
+          "Report what would be deleted without deleting (default true)",
+        ),
+        keepHistory: z.boolean().default(false).describe(
+          "Keep run records and pruned snapshot/image records; delete only status records",
+        ),
+        force: z.boolean().default(false).describe(
+          "Also delete ACTIVE snapshot/image records (the snapshots/images themselves are not touched)",
+        ),
+      }),
+      execute: async (
+        args: {
+          host?: string;
+          dryRun: boolean;
+          keepHistory: boolean;
+          force: boolean;
+        },
+        context: Ctx,
+      ) => {
+        context.logger.info(
+          "Clearing retired machines (host={host} dryRun={dryRun} keepHistory={keepHistory} force={force})",
+          {
+            host: args.host ?? "all",
+            dryRun: args.dryRun,
+            keepHistory: args.keepHistory,
+            force: args.force,
+          },
+        );
+        const fleetHosts = context.globalArgs.machines.map((m) => m.host);
+        if (fleetHosts.length === 0) {
+          throw new Error(
+            "globalArguments.machines is empty, so every host would look retired. " +
+              "Refusing to delete anything. Fix the fleet definition first.",
+          );
+        }
+        if (args.host !== undefined && fleetHosts.includes(args.host)) {
+          throw new Error(
+            `Host "${args.host}" is in globalArguments.machines, so it is not retired. Nothing was deleted.`,
+          );
+        }
+        const records = await readHostRecords(context);
+        const retired = retiredHosts(records, fleetHosts);
+        if (args.host !== undefined && !retired.includes(args.host)) {
+          throw new Error(
+            `No stored records for host "${args.host}", so there is nothing to clear. ` +
+              `Retired hosts: ${
+                retired.join(", ") || "(none)"
+              }. Nothing was deleted.`,
+          );
+        }
+        const targets = args.host !== undefined ? [args.host] : retired;
+        const plan = planRetiredClear(records, targets, {
+          keepHistory: args.keepHistory,
+          force: args.force,
+        });
+
+        const pruned: Array<
+          { host: string; name: string; detail: string | null }
+        > = [];
+        const kept: Array<{ host: string; name: string; reason: string }> = [];
+        for (const e of plan.remove) {
+          if (!args.dryRun) {
+            try {
+              await context.deleteResource(e.name);
+            } catch (err) {
+              kept.push({
+                host: e.host,
+                name: e.name,
+                reason: `delete failed: ${
+                  (err as Error).message.slice(0, 200)
+                }`,
+              });
+              continue;
+            }
+          }
+          pruned.push({ host: e.host, name: e.name, detail: e.spec });
+        }
+        for (const k of plan.keep) {
+          kept.push({ host: k.host, name: k.name, reason: k.reason });
+          if (k.spec === "snapshot" || k.spec === "image") {
+            context.logger.warn(
+              "Kept active {spec} record {name} of retired host {host}",
+              { spec: k.spec, name: k.name, host: k.host },
+            );
+          }
+        }
+        for (const host of targets) {
+          context.logger.info(
+            "Retired host {host}: {action} {prunedCount} record(s), kept {keptCount}",
+            {
+              host,
+              action: args.dryRun ? "would delete" : "deleted",
+              prunedCount: pruned.filter((p) => p.host === host).length,
+              keptCount: kept.filter((p) => p.host === host).length,
+            },
+          );
+        }
+
+        const scannedAt = new Date().toISOString();
+        const handle = await context.writeResource(
+          "prune",
+          `prune-retired-${scannedAt.replace(/[:.]/g, "-")}`,
+          { scannedAt, kind: "retired", dryRun: args.dryRun, pruned, kept },
+        );
+        context.logger.info(
+          "Retired machines: {action} {prunedCount} record(s) of {hostCount} host(s), kept {keptCount}",
+          {
+            action: args.dryRun ? "would delete" : "deleted",
+            prunedCount: pruned.length,
+            hostCount: targets.length,
+            keptCount: kept.length,
+          },
+        );
+        return { dataHandles: [handle] };
       },
     },
   },

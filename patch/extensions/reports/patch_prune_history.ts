@@ -1,9 +1,10 @@
 /**
  * @dmc/patch-prune-history — history of snapshot/image prune runs.
  *
- * Model-scoped on @dmc/patch/fleet: reads the `prune` results (from pruneSnapshots
- * and pruneImages) and renders a chronological table of what was retired and what
- * was kept (and why). Fetch with:
+ * Model-scoped on @dmc/patch/fleet: reads the `prune` results (from pruneSnapshots,
+ * pruneImages and clearRetired) and renders a chronological table of what was retired
+ * and what was kept (and why). For the kind `retired`, "retired" means the stored
+ * records of a retired machine that were deleted (or would be, in a dry run). Fetch with:
  *   swamp report get @dmc/patch-prune-history --model fleet --markdown
  *
  * @module
@@ -17,7 +18,7 @@ interface PruneEntry {
 }
 interface PruneResult {
   scannedAt: string;
-  kind: "snapshots" | "images";
+  kind: "snapshots" | "images" | "retired";
   dryRun: boolean;
   pruned: PruneEntry[];
   kept: PruneEntry[];
@@ -123,10 +124,16 @@ export const report = {
       );
       if (p.pruned.length) {
         lines.push(
-          "**Retired**",
+          p.kind === "retired"
+            ? (p.dryRun ? "**Would delete**" : "**Deleted**")
+            : "**Retired**",
           "",
-          "| Host | Item | Detail |",
-          "| ---- | ---- | ------ |",
+          p.kind === "retired"
+            ? "| Host | Record | Spec |"
+            : "| Host | Item | Detail |",
+          p.kind === "retired"
+            ? "| ---- | ------ | ---- |"
+            : "| ---- | ---- | ------ |",
         );
         for (const e of p.pruned) {
           lines.push(`| ${e.host} | ${e.name} | ${e.detail ?? "—"} |`);
