@@ -4,7 +4,10 @@
  * Model-scoped on @dmc/patch/fleet. For every host it renders current status
  * (OS packages, location, community-script app, docker, reboot) followed by that
  * host's run history (osUpdate / docker / reboot) with the exact packages and
- * container images each run changed. Fetch with:
+ * container images each run changed. Only machines in `globalArguments.machines`
+ * get a detail section. Hosts that left the fleet but still have stored records are
+ * listed under "Retired machines" (last status plus run history) until
+ * `clearRetired` removes them. Fetch with:
  *   swamp report get @dmc/patch-history --model fleet --markdown
  *
  * @module
@@ -94,7 +97,7 @@ interface ModelCtx {
   modelType: ModelTypeRef;
   modelId: string;
   definition: { name: string };
-  globalArgs: { machines?: Machine[] };
+  globalArgs?: { machines?: Machine[] };
   dataRepository: {
     findAllForModel(type: ModelTypeRef, modelId: string): Promise<DataMeta[]>;
     findAllGlobal(): Promise<
@@ -109,8 +112,11 @@ interface ModelCtx {
   };
 }
 
+// Inventory records are named by bare host. These records never are inventory.
 const NON_INVENTORY =
   /^(seed$|update-|os-update-|reboot-|run-|snap-|image-|prune-|report-)/;
+// Non-inventory records that belong to one host (their `host` field names it).
+const HOST_OWNED = /^(update-|os-update-|reboot-|run-|snap-|image-)/;
 const ICON: Record<string, string> = {
   osUpdate: "📦",
   docker: "🐳",
@@ -145,8 +151,10 @@ export const report = {
       const prev = latest.get(d.name);
       if (!prev || d.version > prev.version) latest.set(d.name, d);
     }
-    const read = async <T>(pred: (name: string) => boolean): Promise<T[]> => {
-      const out: T[] = [];
+    const read = async <T>(
+      pred: (name: string) => boolean,
+    ): Promise<Array<T & { _name: string }>> => {
+      const out: Array<T & { _name: string }> = [];
       for (const d of latest.values()) {
         if (!pred(d.name)) continue;
         const raw = await context.dataRepository.getContent(
@@ -157,16 +165,27 @@ export const report = {
         );
         if (!raw) continue;
         try {
-          out.push(JSON.parse(dec.decode(raw)) as T);
+          out.push({ _name: d.name, ...(JSON.parse(dec.decode(raw)) as T) });
         } catch { /* skip */ }
       }
       return out;
     };
 
-    // Current inventory per host.
+    // Inventory per host (current and retired), keyed by the record name.
     const invByHost = new Map<string, Inventory>();
-    for (const inv of await read<Inventory>((n) => !NON_INVENTORY.test(n))) {
-      if (inv.hostname && !inv.error) invByHost.set(inv.hostname, inv);
+    const invRecords = await read<Inventory>((n) => !NON_INVENTORY.test(n));
+    for (const inv of invRecords) {
+      if (inv.hostname && !inv.error) invByHost.set(inv._name, inv);
+    }
+    // Every host that owns a stored record. The host of an inventory record is its
+    // exact name, of the others the `host` field. Never a name prefix.
+    const storedHosts = new Set<string>(invRecords.map((i) => i._name));
+    for (
+      const rec of await read<{ host?: string }>((n) => HOST_OWNED.test(n))
+    ) {
+      if (typeof rec.host === "string" && rec.host !== "") {
+        storedHosts.add(rec.host);
+      }
     }
 
     // Community-script app per host (matched by app name).
@@ -208,13 +227,22 @@ export const report = {
     }
 
     const machineByHost = new Map<string, Machine>();
-    for (const m of context.globalArgs.machines ?? []) {
+    for (const m of context.globalArgs?.machines ?? []) {
       machineByHost.set(m.host, m);
     }
+    // With no machines in the context, show every host rather than hide everything.
+    const filtering = machineByHost.size > 0;
 
-    const hosts = [...new Set([...invByHost.keys(), ...runsByHost.keys()])]
-      .sort();
-    if (hosts.length === 0) {
+    const allHosts = [
+      ...new Set([...invByHost.keys(), ...runsByHost.keys()]),
+    ].sort();
+    const hosts = filtering
+      ? allHosts.filter((h) => machineByHost.has(h))
+      : allHosts;
+    const retiredHosts = filtering
+      ? [...storedHosts].filter((h) => !machineByHost.has(h)).sort()
+      : [];
+    if (hosts.length === 0 && retiredHosts.length === 0) {
       return {
         markdown:
           "# Fleet Host Detail\n\n_No data yet — run `swamp workflow run patch-scan`._",
@@ -222,14 +250,18 @@ export const report = {
       };
     }
 
-    const totalRuns = [...runsByHost.values()].reduce(
-      (s, a) => s + a.length,
+    const totalRuns = hosts.reduce(
+      (s, h) => s + (runsByHost.get(h)?.length ?? 0),
       0,
     );
     const lines: string[] = [
       "# Fleet Host Detail",
       "",
-      `**${hosts.length} host(s)** · **${totalRuns} recorded run(s)**`,
+      `**${hosts.length} host(s)** · **${totalRuns} recorded run(s)**${
+        retiredHosts.length > 0
+          ? ` · ${retiredHosts.length} retired machine(s) below`
+          : ""
+      }`,
       "",
     ];
 
@@ -243,6 +275,76 @@ export const report = {
         }`;
       }
       return "host / VPS";
+    };
+
+    // The run table and the package/image detail blocks of one host.
+    const runLines = (runs: RunRecord[]): string[] => {
+      const out: string[] = [];
+      out.push(
+        "| When | Action | Outcome | Changed | Reboot | Snapshot |",
+        "| ---- | ------ | ------- | ------- | ------ | -------- |",
+      );
+      for (const r of runs) {
+        const action = `${ICON[r.action] ?? ""} ${r.action}`.trim();
+        let changed = "—";
+        if (r.action === "osUpdate") {
+          changed =
+            `${r.beforeUpdates ?? "?"}→${r.afterUpdates ?? "?"} updates` +
+            (r.packagesChanged ? ` · ${r.packagesChanged} pkgs` : "");
+        } else if (r.action === "docker") {
+          changed = r.imagesChanged
+            ? `${r.imagesChanged} image(s)`
+            : "no change";
+        }
+        const reboot = r.needsReboot === true
+          ? "⚠️ needed"
+          : r.needsReboot === false
+          ? "ok"
+          : "—";
+        out.push(
+          `| ${when(r.timestamp)} | ${action} | ${
+            outcomeMark(r.outcome)
+          } | ${changed} | ${reboot} | ${r.snapshot ? "yes" : "—"} |`,
+        );
+      }
+      out.push("");
+
+      for (const r of runs) {
+        const pkgs = r.packages ?? [];
+        const imgs = r.images ?? [];
+        if (pkgs.length === 0 && imgs.length === 0) continue;
+        out.push(
+          `<details><summary>${
+            when(r.timestamp)
+          } — ${r.action} details</summary>`,
+          "",
+        );
+        if (pkgs.length) {
+          out.push("| Package | From | To |", "| ------- | ---- | -- |");
+          for (const p of pkgs.slice(0, 200)) {
+            out.push(
+              `| ${p.name} | ${p.from ?? "—"} | ${p.to ?? "removed"} |`,
+            );
+          }
+          if (pkgs.length > 200) {
+            out.push(`| … | ${pkgs.length - 200} more | |`);
+          }
+          out.push("");
+        }
+        if (imgs.length) {
+          out.push("| Image | From | To |", "| ----- | ---- | -- |");
+          for (const im of imgs) {
+            out.push(
+              `| ${im.ref} | ${(im.from ?? "—").slice(0, 19)} | ${
+                (im.to ?? "—").slice(0, 19)
+              } |`,
+            );
+          }
+          out.push("");
+        }
+        out.push("</details>", "");
+      }
+      return out;
     };
 
     for (const host of hosts) {
@@ -332,70 +434,49 @@ export const report = {
         continue;
       }
 
-      lines.push("### Runs", "");
-      lines.push(
-        "| When | Action | Outcome | Changed | Reboot | Snapshot |",
-        "| ---- | ------ | ------- | ------- | ------ | -------- |",
-      );
-      for (const r of runs) {
-        const action = `${ICON[r.action] ?? ""} ${r.action}`.trim();
-        let changed = "—";
-        if (r.action === "osUpdate") {
-          changed =
-            `${r.beforeUpdates ?? "?"}→${r.afterUpdates ?? "?"} updates` +
-            (r.packagesChanged ? ` · ${r.packagesChanged} pkgs` : "");
-        } else if (r.action === "docker") {
-          changed = r.imagesChanged
-            ? `${r.imagesChanged} image(s)`
-            : "no change";
-        }
-        const reboot = r.needsReboot === true
-          ? "⚠️ needed"
-          : r.needsReboot === false
-          ? "ok"
-          : "—";
-        lines.push(
-          `| ${when(r.timestamp)} | ${action} | ${
-            outcomeMark(r.outcome)
-          } | ${changed} | ${reboot} | ${r.snapshot ? "yes" : "—"} |`,
-        );
-      }
-      lines.push("");
+      lines.push("### Runs", "", ...runLines(runs));
+    }
 
-      for (const r of runs) {
-        const pkgs = r.packages ?? [];
-        const imgs = r.images ?? [];
-        if (pkgs.length === 0 && imgs.length === 0) continue;
+    // Retired machines: stored records, but not in the fleet any more.
+    if (retiredHosts.length > 0) {
+      lines.push(
+        "## Retired machines",
+        "",
+        `These hosts have stored records but are not in the fleet. They stay here until \`swamp model method run ${context.definition.name} clearRetired\` removes them (\`--input keepHistory=true\` keeps their run history).`,
+        "",
+      );
+      for (const host of retiredHosts) {
+        const inv = invByHost.get(host);
+        const runs = runsByHost.get(host) ?? [];
+        lines.push(`### ${host}`, "");
+        if (inv) {
+          const bits = [
+            `**${inv.osType} ${inv.osVersion}**`,
+            inv.packageManager,
+            `last scanned ${when(inv.scannedAt)}`,
+            num(inv.updatesCount) > 0
+              ? `${inv.updatesCount} updates`
+              : "up to date",
+            num(inv.securityUpdatesCount) > 0
+              ? `🔒 ${inv.securityUpdatesCount} security`
+              : null,
+            inv.needsReboot ? "⚠️ reboot was required" : null,
+          ].filter(Boolean).join(" · ");
+          lines.push(bits, "");
+        } else {
+          lines.push("_No inventory record kept._", "");
+        }
+        if (runs.length === 0) {
+          lines.push("_No runs recorded._", "");
+          continue;
+        }
         lines.push(
-          `<details><summary>${
-            when(r.timestamp)
-          } — ${r.action} details</summary>`,
+          `<details><summary>Run history (${runs.length} run(s))</summary>`,
+          "",
+          ...runLines(runs),
+          "</details>",
           "",
         );
-        if (pkgs.length) {
-          lines.push("| Package | From | To |", "| ------- | ---- | -- |");
-          for (const p of pkgs.slice(0, 200)) {
-            lines.push(
-              `| ${p.name} | ${p.from ?? "—"} | ${p.to ?? "removed"} |`,
-            );
-          }
-          if (pkgs.length > 200) {
-            lines.push(`| … | ${pkgs.length - 200} more | |`);
-          }
-          lines.push("");
-        }
-        if (imgs.length) {
-          lines.push("| Image | From | To |", "| ----- | ---- | -- |");
-          for (const im of imgs) {
-            lines.push(
-              `| ${im.ref} | ${(im.from ?? "—").slice(0, 19)} | ${
-                (im.to ?? "—").slice(0, 19)
-              } |`,
-            );
-          }
-          lines.push("");
-        }
-        lines.push("</details>", "");
       }
     }
 
@@ -431,6 +512,24 @@ export const report = {
           };
         }),
         totalRuns,
+        retired: retiredHosts.map((host) => {
+          const inv = invByHost.get(host);
+          return {
+            host,
+            os: inv ? `${inv.osType} ${inv.osVersion}` : null,
+            lastScanned: inv?.scannedAt ?? null,
+            updatesCount: inv?.updatesCount ?? null,
+            securityUpdatesCount: inv?.securityUpdatesCount ?? null,
+            runs: (runsByHost.get(host) ?? []).map((r) => ({
+              action: r.action,
+              outcome: r.outcome,
+              packagesChanged: r.packagesChanged,
+              imagesChanged: r.imagesChanged,
+              rolledBack: r.rolledBack,
+              timestamp: r.timestamp,
+            })),
+          };
+        }),
       },
     };
   },

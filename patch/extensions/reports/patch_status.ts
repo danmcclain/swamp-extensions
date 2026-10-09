@@ -3,7 +3,9 @@
  *
  * Model-scoped on @dmc/patch/fleet: reads the latest `inventory` per host (from
  * scan / safeOsUpdate) plus current retention (`snapshot` / `image`) and renders
- * one fleet status table. Fetch with:
+ * one fleet status table. Only machines in `globalArguments.machines` count in the
+ * table and the totals. Hosts that have stored records but left the fleet are listed
+ * under "Retired machines" until `clearRetired` removes them. Fetch with:
  *   swamp report get @dmc/patch-status --model fleet --markdown
  *
  * @module
@@ -55,9 +57,12 @@ interface DataMeta {
 
 // findAllForModel returns handles with names but no specName, so resources are
 // identified by their (controlled) name pattern. Inventory records are named by
-// bare host, everything else carries one of these prefixes.
-const NON_INVENTORY =
-  /^(seed$|update-|os-update-|reboot-|run-|snap-|image-|prune-|report-)/;
+// bare host; the records below carry one of these prefixes.
+// Records that belong to one host and carry `host` in their data. Inventory
+// records are the exception: they are named by the bare host.
+const HOST_OWNED = /^(update-|os-update-|reboot-|run-|snap-|image-)/;
+// Records that never belong to a host.
+const NOT_HOST = /^(seed$|prune-|report-)/;
 
 // ModelType is an opaque token object (not a string) that the data methods require.
 type ModelTypeRef = unknown;
@@ -66,6 +71,8 @@ interface ModelCtx {
   modelType: ModelTypeRef;
   modelId: string;
   definition: { name: string };
+  /** Model global arguments; `machines` is the current fleet. */
+  globalArgs?: { machines?: Array<{ host: string }> };
   dataRepository: {
     findAllForModel(type: ModelTypeRef, modelId: string): Promise<DataMeta[]>;
     findAllGlobal(): Promise<
@@ -121,14 +128,103 @@ export const report = {
       return out;
     };
 
-    const inv = (await readWhere<Inventory>((n) => !NON_INVENTORY.test(n)))
+    // Every record that belongs to a host. The host of an inventory record is its
+    // exact name; for the others it is the `host` field. Never a name prefix, so
+    // `node` can not match a record of `node2`.
+    type Owned = {
+      _name: string;
+      host?: string;
+      status?: string;
+      scannedAt?: string;
+    };
+    const ownedAll = await readWhere<Owned>((n) => !NOT_HOST.test(n));
+    // A record with no readable host can not be retired, so it counts as current.
+    const owned: Array<
+      { host: string | null; rec: Owned; inventory: boolean }
+    > = [];
+    for (const rec of ownedAll) {
+      if (HOST_OWNED.test(rec._name)) {
+        const host = typeof rec.host === "string" && rec.host !== ""
+          ? rec.host
+          : null;
+        owned.push({ host, rec, inventory: false });
+      } else {
+        owned.push({ host: rec._name, rec, inventory: true });
+      }
+    }
+
+    // The current fleet. With no machines in the context, show every host rather
+    // than hide everything.
+    const fleet = new Set(
+      (context.globalArgs?.machines ?? []).map((m) => m.host),
+    );
+    const filtering = fleet.size > 0;
+    const isCurrent = (host: string | null): boolean =>
+      !filtering || host === null || fleet.has(host);
+
+    const inv = owned.filter((o) => o.inventory && isCurrent(o.host))
+      .map((o) => o.rec as unknown as Inventory & { _name: string })
       .filter((h) => h.hostname && !h.error);
-    const snaps = await readWhere<{ status: string }>((n) =>
-      n.startsWith("snap-")
+    const snaps = owned.filter((o) =>
+      o.rec._name.startsWith("snap-") && isCurrent(o.host)
+    ).map((o) => o.rec);
+    const imgs = owned.filter((o) =>
+      o.rec._name.startsWith("image-") && isCurrent(o.host)
+    ).map((o) => o.rec);
+
+    // Retired: hosts with stored records that the fleet no longer lists.
+    interface Retired {
+      host: string;
+      lastScanned: string | null;
+      records: number;
+      activeRetention: number;
+    }
+    const retiredMap = new Map<string, Retired>();
+    if (filtering) {
+      for (const o of owned) {
+        if (o.host === null || fleet.has(o.host)) continue;
+        const r = retiredMap.get(o.host) ??
+          { host: o.host, lastScanned: null, records: 0, activeRetention: 0 };
+        r.records++;
+        if (
+          (o.rec._name.startsWith("snap-") ||
+            o.rec._name.startsWith("image-")) && o.rec.status === "active"
+        ) r.activeRetention++;
+        if (o.inventory && typeof o.rec.scannedAt === "string") {
+          r.lastScanned = o.rec.scannedAt;
+        }
+        retiredMap.set(o.host, r);
+      }
+    }
+    const retired = [...retiredMap.values()].sort((a, b) =>
+      a.host.localeCompare(b.host)
     );
-    const imgs = await readWhere<{ status: string }>((n) =>
-      n.startsWith("image-")
-    );
+    const retiredNames = new Set(retired.map((r) => r.host.toLowerCase()));
+    const stamp = (ts: string | null): string =>
+      ts
+        ? new Date(ts).toISOString().slice(0, 16).replace("T", " ") + " UTC"
+        : "—";
+    const retiredSection = (): string[] => {
+      if (retired.length === 0) return [];
+      const model = context.definition.name;
+      return [
+        "## Retired machines",
+        "",
+        "These hosts have stored records but are not in the fleet. They are left out of the table and the totals above.",
+        "",
+        "| Host | Last scanned | Records | Active retention |",
+        "| ---- | ------------ | ------- | ---------------- |",
+        ...retired.map((r) =>
+          `| ${r.host} | ${
+            stamp(r.lastScanned)
+          } | ${r.records} | ${r.activeRetention} |`
+        ),
+        "",
+        `Preview the clean-up: \`swamp model method run ${model} clearRetired\``,
+        `Delete the records: \`swamp model method run ${model} clearRetired --input dryRun=false\``,
+        "",
+      ];
+    };
 
     // LXC apps: the community-script `updateCheck` lives on separate
     // @dmc/proxmox/community-script models. findAllGlobal returns each with its own
@@ -155,7 +251,10 @@ export const report = {
       );
       if (!raw) continue;
       try {
-        lxc.push(JSON.parse(dec.decode(raw)) as LxcUpdate);
+        const app = JSON.parse(dec.decode(raw)) as LxcUpdate;
+        // An app of a retired host stays out of the totals.
+        if (retiredNames.has(app.name.toLowerCase())) continue;
+        lxc.push(app);
       } catch { /* skip */ }
     }
     const lxcUpdatable = lxc.filter((a) => a.updateAvailable === true);
@@ -171,9 +270,15 @@ export const report = {
 
     if (inv.length === 0) {
       return {
-        markdown:
-          "# Fleet Patch Status\n\n_No inventory yet — run `swamp workflow run patch-scan`._",
-        json: { status: "no-data" },
+        markdown: [
+          "# Fleet Patch Status",
+          "",
+          "_No inventory yet — run `swamp workflow run patch-scan`._",
+          ...(retired.length > 0 ? ["", ...retiredSection()] : []),
+        ].join("\n"),
+        json: retired.length > 0
+          ? { status: "no-data", retired }
+          : { status: "no-data" },
       };
     }
 
@@ -325,6 +430,8 @@ export const report = {
       lines.push("");
     }
 
+    lines.push(...retiredSection());
+
     return {
       markdown: lines.join("\n"),
       json: {
@@ -344,6 +451,7 @@ export const report = {
         hosts: sorted,
         lxcApps: lxcSorted,
         containers: dockerSorted,
+        retired,
       },
     };
   },

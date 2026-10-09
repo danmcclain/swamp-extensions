@@ -15,10 +15,12 @@ containers) through a single `@swamp/ssh` model.
 
 - [Concepts](#concepts)
 - [Dependencies](#dependencies)
+- [How `@dmc/patch` reaches other models](#how-dmcpatch-reaches-other-models)
 - [The fleet model — `@dmc/patch/fleet`](#the-fleet-model--dmcpatchfleet)
   - [Machine decorations](#machine-decorations)
   - [Health checks](#health-checks)
 - [Methods](#methods)
+  - [Retired machines and `clearRetired`](#retired-machines-and-clearretired)
 - [Resources (data)](#resources-data)
 - [Reports](#reports)
 - [Workflows](#workflows)
@@ -55,15 +57,92 @@ give a full, queryable history.
 ## Dependencies
 
 - **`@swamp/ssh`** (required) — the transport. The fleet takes an `sshModel`
-  (an `@swamp/ssh` instance name, e.g. `my-ssh`) and reaches every host by
-  delegating `swamp model method run <sshModel> exec/script`. Consumers point
-  `sshModel` at their own fleet.
+  (an `@swamp/ssh` instance name, e.g. `my-ssh`) and reaches every host through
+  its `exec` and `script` methods (see
+  [How `@dmc/patch` reaches other models](#how-dmcpatch-reaches-other-models)).
+  Consumers point `sshModel` at their own fleet.
 - **`@keeb/proxmox/node`** (for VMs) — snapshot / rollback API for Proxmox VMs
   (`snapshotVm` / `rollbackVm` / `listVmSnapshots` / `deleteVmSnapshot`).
 - **`@dmc/proxmox/community-script`** (optional, for CT app updates) — the
   `source` app updater referenced by a CT.
 
 CTs are snapshot-guarded via `pct` directly (no node-model method needed).
+
+---
+
+## How `@dmc/patch` reaches other models
+
+The fleet does no ssh or Proxmox work itself. It calls the methods of other
+models: `<sshModel> exec` / `script`, the `vm.proxmoxNode` model
+(`snapshotVm`, `rollbackVm`, `listVmSnapshots`, `deleteVmSnapshot`), the
+`proxmoxNodes` models (`listGuests`, for `import`), and the `source` updater
+(`checkUpdate`, `safeUpdate`).
+
+**Methods** use swamp's in-process API. They never start the swamp CLI:
+
+- `context.runModel` runs another model's method. The fleet reads the
+  attributes of the resources that method wrote.
+- `context.readModelData` reads another model's data. The fleet uses it for one
+  case only: when an `<sshModel> script` call fails because one host exits
+  non-zero, `runModel` returns no resources, but the ssh model has already
+  written one `runResult` record per host (`run-script-<host>`). The fleet reads
+  those records back, keeps only the requested hosts, and keeps only records
+  that started at or after the call. So a result of an earlier run is never
+  used. (A second run of the same method on the same host, through the same ssh
+  model, at the same time, could still write a record that is read instead.)
+- `context.definitionRepository` reads another model's `globalArguments`: a
+  legacy `proxmox.model` CT location, the `healthUrl` / `service` of a `source`,
+  and the `hosts` list of the `sshModel` (for `import`).
+
+The fleet reads its **own** records by model id (`dataRepository`), never with
+`readModelData`.
+
+**Pre-flight checks** get no `runModel` from swamp. Three `live` checks must
+still reach hosts, so they start the swamp CLI as a subprocess:
+
+```bash
+swamp model method run <model> <method> --json --quiet --repo-dir <repoDir> --input …
+```
+
+| Check | Model and method it runs |
+| ----- | ------------------------ |
+| `host-reachable` | `<sshModel> exec` (`true` on the host, or `pct status <ctid>` on the node of a CT) |
+| `baseline-healthy` | `<sshModel> script` (the machine's batched health checks; on the node through `pct exec` for a CT) |
+| `snapshot-target-resolves` | `<vm.proxmoxNode> listVmSnapshots` for a VM; `<sshModel> exec` (`pct listsnapshot <ctid>` on the node) for a CT |
+
+- The model names come from the fleet's own `globalArguments` (`sshModel`,
+  `machines[].vm.proxmoxNode`). They are zod-validated strings.
+- Every value is passed as a separate argv element (a string as `k=<v>`, any
+  other value as `k:json=<JSON>`). No shell is involved.
+- No secret is passed. The arguments are host names, ids, timeouts and the
+  command text: fixed commands and your own health-check commands. Keep secrets
+  on the host (see [Health checks](#health-checks)), because a command line is
+  visible in the local process list.
+- The checks read definitions in-process from `definitionRepository`, not
+  through the CLI.
+
+### The scan call budget
+
+swamp allows at most **100** `runModel` calls in one method run. `scan`
+batches its calls to stay well below that:
+
+```text
+calls = 1                                  one ssh `script` call: the collector on every ssh host
+      + nodes with CTs on the pct path     one call per Proxmox node: the collector in each of its CTs in turn
+      + machines with service/command checks   one health call per machine
+      + app sources                        one `checkUpdate` per `source`
+```
+
+`http` checks run from the swamp host and cost no call. A machine with no
+`service` / `command` check and no `source` costs no call of its own. So with a
+shell health check on every machine and two or three Proxmox nodes, about 95
+machines fit; with a `source` on every machine too, about 48 fit. When the cap
+is reached, the later calls fail, every machine still gets its inventory record
+(an error record when nothing worked), and `scan` logs **one** warning that names
+the cap and the machine count. Split a larger fleet over more fleet models.
+
+A failing host or node does not affect the others: each host keeps its own
+result or error, and each node's call is separate.
 
 ---
 
@@ -138,7 +217,12 @@ Notes:
 `health` is an array of checks; the machine is **healthy only when every check
 passes**. An empty/absent array falls back to reachability. Works on any machine —
 the transport is chosen automatically (HTTP from the swamp host; `service` /
-`command` via ssh or `pct`).
+`command` via ssh or `pct`). All `service` and `command` checks of one machine run in
+**one** shell call on it. Each check runs in its own subshell (with stdin and
+output on `/dev/null`), so a bare `exit` in one check ends only that check; only
+its exit code counts. The call's timeout is the sum of the `command` checks'
+`timeoutSec` plus 30 s per `service` check. A check with no result in the
+output fails with the detail `no result`.
 
 ```yaml
 health:
@@ -202,14 +286,15 @@ existing setups work without extra config, and you can override anytime.
 
 | Method | Purpose |
 | ------ | ------- |
-| `scan` | Fan out over the fleet: collect OS package status + docker image drift per machine, evaluate health, and refresh `source` app-update checks. Per-machine (resilient — one unreachable host can't sink the run). |
+| `scan` | Fan out over the fleet: collect OS package status + docker image drift per machine, evaluate health, and refresh `source` app-update checks. Batched (one ssh call for all ssh hosts, one call per Proxmox node for its CTs, one health call per machine) and resilient: one unreachable host or node can't sink the run. See the [scan call budget](#the-scan-call-budget). |
 | `import` | Emit a suggested `machines:` block seeded from the `sshModel` host list and Proxmox guest discovery (VMs → `vm`, CTs → `ct` + commented `source`). Paste into `globalArguments` and decorate. |
 | `safeOsUpdate` | Snapshot-guarded OS update for one machine (see below). |
 | `safeUpdate` | Health-checked, rollback-capable **docker** update: record image ids → pull + `up -d` → wait for health → roll back to the prior image on failure. Replaced images are retained for `retentionHours` (pruned by `pruneImages`). |
 | `reboot` | Graceful reboot: `systemctl reboot` (ssh, scheduled via `systemd-run` so the call returns before the link drops) or `pct reboot` (CT). Guarded on `needsReboot` unless `force`; waits for return; runs health as **detection** (with the `healthGraceSec` grace window, default 120 s). |
 | `rollback` | Deliberately revert a machine to its newest retained pre-update snapshot (VM snapshot rollback / `pct rollback`), or a named one. The recovery for a reboot/update that left a host unhealthy. |
-| `pruneSnapshots` | Delete retained pre-update snapshots past their retention window that are health-confirmed, reboot-confirmed (when a reboot was needed), and pass a fresh healthcheck. `dryRun` to preview. VM → node-model delete; CT → `pct delsnapshot`. |
+| `pruneSnapshots` | Delete retained pre-update snapshots past their retention window that are health-confirmed, reboot-confirmed (when a reboot was needed), and pass a fresh check: the host answers a scan (over `pct` on its node for a CT, over ssh otherwise) and has no reboot pending. A snapshot of a host that is no longer in the fleet is kept. `dryRun` to preview. VM → node-model delete; CT → `pct delsnapshot`. |
 | `pruneImages` | Delete retained previous docker images past their retention window (via `docker rmi`, which refuses if still in use). `dryRun` to preview. |
+| `clearRetired` | Delete the stored records of **retired machines** (hosts with records that are no longer in `globalArguments.machines`). **A bare run is a preview** (`dryRun` defaults to `true`). See [Retired machines and `clearRetired`](#retired-machines-and-clearretired). |
 
 ### `safeOsUpdate` in detail
 
@@ -257,6 +342,7 @@ run before anything changes. Each check is cheap and read-only. `scan` and
 | `docker-configured` | `policy` | `safeUpdate` | The machine has a `docker` block. |
 | `host-reachable` | `live` | `safeUpdate`, `safeOsUpdate`, `reboot` | The machine answers: ssh `true` through the `sshModel`, or `pct status <ctid>` on the node for a CT. Not run for `rollback`, because a broken host is the reason to roll back. |
 | `baseline-healthy` | `live` | `safeUpdate`, `safeOsUpdate` | The machine's [health checks](#health-checks) pass now. The failing labels are named. A machine with no health checks passes. |
+| `host-retired` | `policy` | `clearRetired` | The `host` argument is **not** in `globalArguments.machines` (the opposite of `host-in-fleet`). Without a `host`, it passes. |
 | `snapshot-target-resolves` | `live` | `safeOsUpdate`, `rollback`, `pruneSnapshots` | The VM or CT location resolves and its Proxmox node answers. For `rollback`, a snapshot also exists (the named one, if you pass `snapshot`). A machine with no `vm` or `ct` passes. |
 
 The prune methods keep their per-host skip behavior. Only `host-in-fleet`
@@ -275,6 +361,77 @@ To run the checks without the method, use
 takes no method arguments, so the checks that need a `host` pass without a
 target. Run the method to test a real host.
 
+### Retired machines and `clearRetired`
+
+A *retired machine* is a host that has stored records but is not in
+`globalArguments.machines`. The `inventory` record never expires, so a machine
+that you remove from the fleet would otherwise stay in the reports for ever, with
+frozen numbers.
+
+The reports handle this for you:
+
+- `@dmc/patch-status` counts **current machines only** in the node table and in
+  all totals (updates, security, dist-upgrade, reboot, LXC apps, container
+  images, retained snapshots and images). A section **Retired machines** lists
+  each retired host with `Last scanned`, `Records` (all stored records of the
+  host) and `Active retention` (active snapshot and image records). The section
+  does not appear when there are no retired hosts.
+- `@dmc/patch-history` gives detail sections to current machines only. Its
+  **Retired machines** section shows the last status line and the run history
+  (collapsed) of each retired host, until you clear it.
+- If `globalArguments.machines` is missing or empty, the reports show every host
+  and have no Retired section. A broken context never hides the whole fleet.
+- An LXC app (community-script `updateCheck`) whose name matches a retired host
+  is left out of the LXC totals.
+
+`clearRetired` removes the records:
+
+| Argument | Default | Meaning |
+| -------- | ------- | ------- |
+| `host` | all retired hosts | Clear one retired host only. |
+| `dryRun` | **`true`** | Only report what would happen. Nothing is deleted. |
+| `keepHistory` | `false` | Keep the `run` records and the **pruned** snapshot/image records. Delete only the status records, so the host leaves `patch-status` but its history stays under Retired in `patch-history`. |
+| `force` | `false` | Also delete **active** snapshot and image records. |
+
+What it does for each retired host:
+
+- Status records (`inventory`, last `update`, `osUpdate` and `reboot` results):
+  deleted.
+- `run` records and pruned snapshot/image records: deleted, unless `keepHistory`.
+- **Active** snapshot and image records: kept, with a reason, unless `force`.
+  They track snapshots and images that can still exist on the Proxmox node or on
+  the docker host. If you delete the record, the real snapshot or image has no
+  record any more. Prune them first, or use `force` when you know they are gone.
+- Never touched: `prune-*` and `report-*` records, `seed`, and every record of
+  another host. A host is matched by its exact name (`node` never matches `node2`).
+
+Safety:
+
+- `dryRun` deletes nothing. It writes a `prune` record
+  (`prune-retired-<timestamp>`, kind `retired`, `dryRun: true`) that lists
+  exactly what a real run would delete (`pruned`) and keep (`kept`, with reasons).
+  `@dmc/patch-prune-history` shows it.
+- If you pass `host` and the host is in the fleet, or has no records, the method
+  stops with an error and deletes nothing.
+- The pre-flight check `host-retired` (label `policy`) fails the run before it
+  starts when `host` is in the fleet. Skip it with `--skip-check host-retired`.
+  (`host-in-fleet` does not apply to `clearRetired`; it would mean the opposite.)
+- If `globalArguments.machines` is empty, the method refuses to run, because every
+  host would look retired.
+
+Example: preview first, then delete.
+
+```bash
+# 1. Preview: nothing is deleted
+swamp model method run fleet clearRetired
+
+# 2. Read the prune record, then delete for real
+swamp model method run fleet clearRetired --input dryRun=false
+
+# One host only, and keep its run history
+swamp model method run fleet clearRetired --input host=old-host --input keepHistory=true --input dryRun=false
+```
+
 ---
 
 ## Resources (data)
@@ -288,7 +445,7 @@ All are versioned model data (`swamp data list fleet`, `swamp data query`).
 | `snapshot` | safeOsUpdate | Lifecycle of a retained snapshot (`kind` vm/ct, retainUntil, healthConfirmed, rebootConfirmed, status). |
 | `image` | safeUpdate | A retained previous docker image (rollback point) with a retention window. |
 | `osUpdate` / `update` / `reboot` | the respective method | Latest result per host for that operation. |
-| `prune` | pruneSnapshots / pruneImages | What each prune run retired vs kept (and why). |
+| `prune` | pruneSnapshots / pruneImages / clearRetired | What each prune run retired vs kept (and why). Kind `retired` = records deleted by `clearRetired`. |
 | `seed` | import | A suggested `machines:` block. |
 
 Example queries:
@@ -309,12 +466,15 @@ Model-scoped (attached to the fleet model); fetch with
 - **`@dmc/patch-status`** — one holistic fleet table: per node its **health**,
   OS updates, security, community-script **app** version, reboot, docker engine +
   container count; plus **Docker containers**, **Unhealthy**, and
-  **Reboot required** sections.
+  **Reboot required** sections. Current machines only; hosts that left the fleet
+  appear under **Retired machines**.
 - **`@dmc/patch-history`** — per-host detail: current status (OS, location, app,
   docker, health) followed by that host's **run history** with collapsible
-  package / image `from → to` diffs. Every host gets a section, even with no runs.
+  package / image `from → to` diffs. Every current host gets a section, even with
+  no runs. Retired hosts get a **Retired machines** block with their last status
+  and run history.
 - **`@dmc/patch-prune-history`** — chronological snapshot/image prune runs
-  (retired vs kept, with reasons).
+  (retired vs kept, with reasons), including `clearRetired` runs.
 
 Model-scope reports regenerate when a fleet method runs; there is no
 `swamp report run`, so trigger a cheap method (e.g. `pruneImages --input dryRun=true`)
@@ -390,6 +550,10 @@ swamp model method run fleet rollback --input host=app-ct
 
 # 6. Clean up old rollback points on schedule
 swamp workflow run patch-prune
+
+# 7. After you remove a machine from the fleet: preview, then clear its records
+swamp model method run fleet clearRetired
+swamp model method run fleet clearRetired --input dryRun=false
 ```
 
 ---

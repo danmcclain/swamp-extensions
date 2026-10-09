@@ -1,11 +1,13 @@
 /**
  * Unit tests for @dmc/patch/fleet.
  *
- * Nothing here needs a real host. The model runs the `swamp` CLI to reach hosts
- * (`swamp model method run <ssh-model> script|exec`, `swamp model get`, ...). These
- * tests point `SWAMP_BIN` at `testdata/fake_swamp.sh`, a test double that prints
- * canned JSON chosen by `FAKE_SWAMP_*` environment variables. The model reads
- * `SWAMP_BIN` when it loads, so it is imported dynamically after the variable is set.
+ * Nothing here needs a real host. Methods reach other models through
+ * `context.runModel` / `readModelData` / `definitionRepository`; pre-flight checks run
+ * `swamp model method run` as a subprocess. Both paths end in `testdata/fake_swamp.sh`,
+ * a test double that prints canned JSON chosen by `FAKE_SWAMP_*` environment
+ * variables: `mkCtx` gives methods a `runModel` that runs the fake with the CLI
+ * arguments, and checks run it as `SWAMP_BIN`. The model reads `SWAMP_BIN` when it
+ * loads, so it is imported dynamically after the variable is set.
  */
 import {
   assert,
@@ -21,6 +23,7 @@ const FAKE_SWAMP = new URL("./testdata/fake_swamp.sh", import.meta.url)
   .pathname;
 Deno.env.set("SWAMP_BIN", FAKE_SWAMP);
 const fleet = await import("./patch_fleet.ts");
+type SwampApi = import("./patch_fleet.ts").SwampApi;
 const { model } = fleet;
 
 // ---------------------------------------------------------------------------
@@ -47,6 +50,14 @@ function scriptOut(host: string, stdout: string, exitCode = 0): string {
   return JSON.stringify({
     dataArtifacts: [{ attributes: { host, stdout, exitCode } }],
   });
+}
+
+/** What the fake prints for a health batch: one `@@PATCH-HC <i> rc=<rc>` line per rc. */
+function hcOut(host: string, ...rcs: number[]): string {
+  return scriptOut(
+    host,
+    rcs.map((rc, i) => `@@PATCH-HC ${i} rc=${rc}\n`).join(""),
+  );
 }
 
 /** What the fake prints for `<ssh-model> exec`: stdout plus the rc sentinel line. */
@@ -93,14 +104,148 @@ interface ModelDatum {
   name: string;
   isLatest: boolean;
   attributes: Record<string, unknown>;
+  /** The `modelName` tag stamped when the record was written (default: the current name). */
+  modelName?: string;
 }
 
-/** Build a method context. `data` feeds `readModelData` by spec name. */
+const TEST_MODEL_TYPE = { normalized: "@dmc/patch/fleet" };
+const TEST_MODEL_ID = "11111111-2222-3333-4444-555555555555";
+
+/**
+ * A stub `definitionRepository`. `findByNameGlobal` answers from FAKE_SWAMP_MODEL_GET
+ * (a `{ globalArguments }` JSON document) and FAKE_SWAMP_GET_RC, read at call time.
+ * It gives null (no such model) when the variable is unset, not JSON, or the rc is not 0.
+ */
+const fakeDefinitions = {
+  findByNameGlobal: (_name: string) => {
+    const raw = Deno.env.get("FAKE_SWAMP_MODEL_GET");
+    if ((Deno.env.get("FAKE_SWAMP_GET_RC") ?? "0") !== "0" || raw === undefined) {
+      return Promise.resolve(null);
+    }
+    let parsed: { globalArguments?: Record<string, unknown> };
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return Promise.resolve(null);
+    }
+    return Promise.resolve({
+      definition: { globalArguments: parsed?.globalArguments ?? {} },
+      type: {},
+    });
+  },
+};
+
+/** The CLI SwampApi a check uses, for direct helper tests (runs the fake as SWAMP_BIN). */
+const CLI = fleet.checkSwamp({
+  repoDir: "/r",
+  definitionRepository: fakeDefinitions,
+});
+
+/** A record of another model, as `readModelData` returns it. */
+interface OtherRecord {
+  model: string;
+  spec: string;
+  name: string;
+  attributes: Record<string, unknown>;
+}
+
+/** One `runModel` call the adapter received. */
+interface RunModelCall {
+  definition: string;
+  method: string;
+  arguments?: Record<string, unknown>;
+}
+
+/**
+ * A `runModel` like swamp's, backed by the fake: it runs `fake_swamp.sh` with the CLI
+ * arguments (`model method run <def> <method> --json --quiet --input …`), so the
+ * FAKE_SWAMP_* knobs and the call log work as for the CLI. rc 0 → `ok` with the
+ * printed artifacts as resources (empty output = no resources). Otherwise → not ok
+ * with stderr (or stdout) as the message; then, like @swamp/ssh, every printed host
+ * artifact is stored as `run-<method>-<host>` with `startedAt` = now, for `readModelData`.
+ * After `maxCalls` calls it answers like swamp at its cap, without running the fake.
+ */
+function fakeRunModel(
+  store: OtherRecord[],
+  calls: RunModelCall[],
+  maxCalls = Infinity,
+) {
+  return async (opts: RunModelCall) => {
+    calls.push(opts);
+    if (calls.length > maxCalls) {
+      return {
+        ok: false as const,
+        error: {
+          message:
+            "Maximum cross-model invocation count (100) exceeded in this execution. Reduce the number of runModel calls.",
+        },
+      };
+    }
+    const out = await new Deno.Command(FAKE_SWAMP, {
+      args: fleet.methodRunArgv(
+        opts.definition,
+        opts.method,
+        opts.arguments ?? {},
+        "/tmp/swamp-test",
+      ),
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const stdout = new TextDecoder().decode(out.stdout).trim();
+    const stderr = new TextDecoder().decode(out.stderr).trim();
+    let artifacts: Array<{ attributes?: Record<string, unknown> }> = [];
+    let parsed = stdout === "";
+    try {
+      artifacts = JSON.parse(stdout).dataArtifacts ?? [];
+      parsed = true;
+    } catch { /* not JSON */ }
+    if (out.code === 0 && parsed) {
+      return {
+        ok: true as const,
+        resources: artifacts.map((a, i) => ({
+          name: `${opts.method}-${i}`,
+          specName: "result",
+          attributes: a.attributes ?? {},
+        })),
+      };
+    }
+    if (out.code !== 0) {
+      for (const a of artifacts) {
+        const host = a.attributes?.host;
+        if (typeof host !== "string") continue;
+        store.push({
+          model: opts.definition,
+          spec: "runResult",
+          name: `run-${opts.method}-${host}`,
+          attributes: { ...a.attributes, startedAt: new Date().toISOString() },
+        });
+      }
+    }
+    return { ok: false as const, error: { message: stderr || stdout } };
+  };
+}
+
+/**
+ * Build a method context. `data` (by spec name) feeds the stub `dataRepository`, which
+ * answers by model id like swamp does. Records that are not the latest version are not
+ * returned, because `findAllForModel` returns the latest version of each name only.
+ * `runModel` is the fake-backed adapter (`fakeRunModel`); `definitionRepository` is
+ * `fakeDefinitions`. `readModelData` serves OTHER models' records (`otherData`, plus
+ * the run results of failed calls) and throws for this model's own name: the model
+ * must read its own records by model id, because `readModelData` matches the
+ * `modelName` tag and misses records of a renamed model.
+ */
 function mkCtx(
   globalArgs: unknown,
   opts: {
     stored?: Record<string, Record<string, unknown>>;
     data?: Record<string, ModelDatum[]>;
+    /** Names for which the deleteResource stub throws. */
+    deleteFails?: string[];
+    /** Records of other models that readModelData serves. */
+    otherData?: OtherRecord[];
+    /** runModel answers like swamp at its cap after this many calls. */
+    maxRunModelCalls?: number;
   } = {},
 ) {
   const t = createModelTestContext({
@@ -111,11 +256,80 @@ function mkCtx(
     definition: { name: "fleet" },
     storedResources: opts.stored,
   });
-  const readModelData = (_model: string, spec?: string) =>
-    Promise.resolve(opts.data?.[spec ?? ""] ?? []);
+  const store: OtherRecord[] = [...(opts.otherData ?? [])];
+  const calls: RunModelCall[] = [];
+  const readModelData = (modelName: string, specName?: string) => {
+    if (modelName === "fleet") {
+      throw new Error("readModelData must not be used for the model's own data");
+    }
+    // Latest version of each name: the last record stored under it.
+    const latest = new Map<string, OtherRecord>();
+    for (const r of store) {
+      if (r.model === modelName && (!specName || r.spec === specName)) {
+        latest.set(r.name, r);
+      }
+    }
+    return Promise.resolve(
+      [...latest.values()].map((r) => ({
+        name: r.name,
+        specName: r.spec,
+        attributes: r.attributes,
+      })),
+    );
+  };
+  const records = Object.entries(opts.data ?? {}).flatMap(([spec, rows]) =>
+    rows.filter((r) => r.isLatest).map((r) => ({ spec, row: r }))
+  );
+  const byId = (type: unknown, modelId: string) => {
+    if (type !== TEST_MODEL_TYPE || modelId !== TEST_MODEL_ID) {
+      throw new Error(`read by the wrong model type or id: ${modelId}`);
+    }
+  };
+  const dataRepository = {
+    findAllForModel: (type: unknown, modelId: string) => {
+      byId(type, modelId);
+      return Promise.resolve(records.map(({ spec, row }) => ({
+        name: row.name,
+        version: 1,
+        tags: {
+          specName: spec,
+          type: "resource",
+          modelName: row.modelName ?? "fleet",
+        },
+      })));
+    },
+    getContent: (type: unknown, modelId: string, name: string) => {
+      byId(type, modelId);
+      const rec = records.find((r) => r.row.name === name);
+      return Promise.resolve(
+        rec ? new TextEncoder().encode(JSON.stringify(rec.row.attributes)) : null,
+      );
+    },
+  };
+  // createModelTestContext has no deleteResource, so this stub records the deletions.
+  const deleted: string[] = [];
+  const deleteResource = (name: string) => {
+    if (opts.deleteFails?.includes(name)) {
+      return Promise.reject(new Error(`cannot delete ${name}`));
+    }
+    deleted.push(name);
+    return Promise.resolve();
+  };
   return {
     // The testing context and the model's own context type differ slightly.
-    ctx: { ...t.context, readModelData } as never,
+    ctx: {
+      ...t.context,
+      modelType: TEST_MODEL_TYPE,
+      modelId: TEST_MODEL_ID,
+      dataRepository,
+      readModelData,
+      runModel: fakeRunModel(store, calls, opts.maxRunModelCalls),
+      definitionRepository: fakeDefinitions,
+      deleteResource,
+    } as never,
+    deleted,
+    /** Every runModel call, in order. */
+    calls,
     written: (spec: string) =>
       t.getWrittenResources().filter((r) => r.specName === spec),
     one: (spec: string) => {
@@ -556,7 +770,7 @@ Deno.test("ctLocation reads the ct decoration without calling swamp", async () =
   assertEquals(
     await fleet.ctLocation(
       { host: "a", ct: { proxmoxNode: "pve", ctid: 301 } },
-      "/nonexistent",
+      CLI,
     ),
     { node: "pve", ctid: 301 },
   );
@@ -569,7 +783,7 @@ Deno.test("ctLocation falls back to the legacy proxmox model", async () => {
     }),
   }, async () => {
     assertEquals(
-      await fleet.ctLocation({ host: "a", proxmox: { model: "m" } }, "/r"),
+      await fleet.ctLocation({ host: "a", proxmox: { model: "m" } }, CLI),
       { node: "node2", ctid: 402 },
     );
   });
@@ -577,7 +791,7 @@ Deno.test("ctLocation falls back to the legacy proxmox model", async () => {
 
 Deno.test("ctLocation throws when no location can be found", async () => {
   await assertRejects(
-    () => fleet.ctLocation({ host: "a" }, "/r"),
+    () => fleet.ctLocation({ host: "a" }, CLI),
     Error,
     "no CT location",
   );
@@ -585,7 +799,7 @@ Deno.test("ctLocation throws when no location can be found", async () => {
     FAKE_SWAMP_MODEL_GET: JSON.stringify({ globalArguments: { node: "pve" } }),
   }, async () => {
     await assertRejects(
-      () => fleet.ctLocation({ host: "a", proxmox: { model: "m" } }, "/r"),
+      () => fleet.ctLocation({ host: "a", proxmox: { model: "m" } }, CLI),
       Error,
       "m: no node/ctid",
     );
@@ -599,15 +813,15 @@ Deno.test("resolveHealthChecks returns the machine's own checks first", async ()
       host: "a",
       health: own,
       source: { type: "community-script", model: "m" },
-    }, "/r"),
+    }, CLI),
     own,
   );
 });
 
 Deno.test("resolveHealthChecks is empty without checks or source", async () => {
-  assertEquals(await fleet.resolveHealthChecks({ host: "a" }, "/r"), []);
+  assertEquals(await fleet.resolveHealthChecks({ host: "a" }, CLI), []);
   assertEquals(
-    await fleet.resolveHealthChecks({ host: "a", health: [] }, "/r"),
+    await fleet.resolveHealthChecks({ host: "a", health: [] }, CLI),
     [],
   );
 });
@@ -625,7 +839,7 @@ Deno.test("resolveHealthChecks derives http + service checks from a community-sc
     const checks = await fleet.resolveHealthChecks({
       host: "valkey",
       source: { type: "community-script", model: "valkey-app" },
-    }, "/r");
+    }, CLI);
     assertEquals(checks, [
       {
         type: "http",
@@ -648,7 +862,7 @@ Deno.test("resolveHealthChecks: http check defaults to status 200; service-only 
     const checks = await fleet.resolveHealthChecks({
       host: "h",
       proxmox: { model: "legacy" }, // legacy reference still counts as a source
-    }, "/r");
+    }, CLI);
     assertEquals(checks.length, 1);
     assertEquals(checks[0].type === "http" && checks[0].expectStatus, 200);
   });
@@ -660,7 +874,7 @@ Deno.test("resolveHealthChecks: http check defaults to status 200; service-only 
     const checks = await fleet.resolveHealthChecks({
       host: "h",
       source: { type: "community-script", model: "m" },
-    }, "/r");
+    }, CLI);
     assertEquals(checks, [{
       type: "service",
       label: "caddy active",
@@ -676,15 +890,15 @@ Deno.test("resolveHealthChecks is empty when the source has no health data or ca
   };
   await withFake(
     { FAKE_SWAMP_MODEL_GET: JSON.stringify({ globalArguments: {} }) },
-    async () => assertEquals(await fleet.resolveHealthChecks(machine, "/r"), []),
+    async () => assertEquals(await fleet.resolveHealthChecks(machine, CLI), []),
   );
   await withFake(
     { FAKE_SWAMP_MODEL_GET: JSON.stringify({}) },
-    async () => assertEquals(await fleet.resolveHealthChecks(machine, "/r"), []),
+    async () => assertEquals(await fleet.resolveHealthChecks(machine, CLI), []),
   );
   await withFake(
     { FAKE_SWAMP_MODEL_GET: "", FAKE_SWAMP_GET_RC: "1" },
-    async () => assertEquals(await fleet.resolveHealthChecks(machine, "/r"), []),
+    async () => assertEquals(await fleet.resolveHealthChecks(machine, CLI), []),
   );
 });
 
@@ -701,7 +915,7 @@ Deno.test("runScript parses per-host artifacts and keeps partial results on fail
     }),
     FAKE_SWAMP_SCRIPT_RC: "1", // the method fails when any host fails
   }, async () => {
-    assertEquals(await fleet.runScript("ssh", ["a", "b", "c"], "true", 5, "/r"), [
+    assertEquals(await fleet.runScript("ssh", ["a", "b", "c"], "true", 5, CLI), [
       { host: "a", stdout: "out-a", exitCode: 0 },
       { host: "b", stdout: "out-b", exitCode: 2 },
       { host: "c", stdout: "", exitCode: -1 },
@@ -709,28 +923,193 @@ Deno.test("runScript parses per-host artifacts and keeps partial results on fail
   });
 });
 
-Deno.test("runScript returns [] when there are no artifacts and throws on non-JSON output", async () => {
+Deno.test("runScript returns [] when there are no artifacts and throws when the call fails with no host result", async () => {
   await withFake({ FAKE_SWAMP_SCRIPT_1: "{}" }, async () => {
-    assertEquals(await fleet.runScript("ssh", ["a"], "true", 5, "/r"), []);
+    assertEquals(await fleet.runScript("ssh", ["a"], "true", 5, CLI), []);
   });
-  await withFake({ FAKE_SWAMP_SCRIPT_1: "boom: not json" }, async () => {
-    await assertRejects(
-      () => fleet.runScript("ssh", ["a"], "true", 5, "/r"),
-      Error,
-      "Could not parse ssh script output",
-    );
+  await withFake(
+    { FAKE_SWAMP_SCRIPT_1: "boom: not json", FAKE_SWAMP_SCRIPT_RC: "1" },
+    async () => {
+      await assertRejects(
+        () => fleet.runScript("ssh", ["a"], "true", 5, CLI),
+        Error,
+        "ssh script failed: could not parse ssh script output: boom: not json",
+      );
+    },
+  );
+});
+
+Deno.test("methodRunArgv: strings as k=v, other values as k:json=, one argv element each", () => {
+  assertEquals(
+    fleet.methodRunArgv("ssh", "exec", {
+      hosts: ["a"],
+      command: "echo 'x y'; true",
+      captureOutput: true,
+      timeoutSec: 30,
+    }, "/repo"),
+    [
+      "model",
+      "method",
+      "run",
+      "ssh",
+      "exec",
+      "--json",
+      "--quiet",
+      "--repo-dir",
+      "/repo",
+      "--input",
+      'hosts:json=["a"]',
+      "--input",
+      "command=echo 'x y'; true",
+      "--input",
+      "captureOutput:json=true",
+      "--input",
+      "timeoutSec:json=30",
+    ],
+  );
+});
+
+Deno.test("checkSwamp: keeps the artifacts of a failed call and reports stderr", async () => {
+  await withFake({
+    FAKE_SWAMP_SCRIPT_1: scriptOut("a", "out-a"),
+    FAKE_SWAMP_SCRIPT_RC: "1",
+  }, async () => {
+    const res = await CLI.run("ssh", "script", { hosts: ["a"], script: "true" });
+    assertEquals(res.ok, false);
+    assertEquals(res.artifacts, [{ host: "a", stdout: "out-a", exitCode: 0 }]);
+  });
+  assertEquals(CLI.readData, undefined);
+});
+
+Deno.test("methodSwamp maps runModel success and failure, and omits empty arguments", async () => {
+  const seen: unknown[] = [];
+  const answers = [
+    {
+      ok: true as const,
+      resources: [
+        { name: "r1", attributes: { host: "a" } },
+        { name: "r2" }, // no attributes: {}
+      ],
+    },
+    { ok: false as const, error: { message: "Unknown argument(s): x" } },
+  ];
+  const swamp = fleet.methodSwamp({
+    runModel: (opts) => {
+      seen.push(opts);
+      return Promise.resolve(answers[seen.length - 1]);
+    },
+  });
+  assertEquals(await swamp.run("m", "go", { x: 1 }), {
+    ok: true,
+    artifacts: [{ host: "a" }, {}],
+    error: "",
+  });
+  assertEquals(await swamp.run("m", "go"), {
+    ok: false,
+    artifacts: [],
+    error: "Unknown argument(s): x",
+  });
+  assertEquals(seen, [
+    { definition: "m", method: "go", arguments: { x: 1 } },
+    { definition: "m", method: "go" },
+  ]);
+  // No readModelData in the context: no readData.
+  assertEquals(swamp.readData, undefined);
+  // No runModel at all (e.g. a remote execution): a failure, not an exception.
+  const none = await fleet.methodSwamp({}).run("m", "go");
+  assertEquals(none.ok, false);
+  assertStringIncludes(none.error, "runModel is not available");
+});
+
+Deno.test("globalArguments: null when the model does not exist or there is no definition repository", async () => {
+  await withFake({}, async () => {
+    assertEquals(await CLI.globalArguments("gone"), null);
+  });
+  await withFake({ FAKE_SWAMP_MODEL_GET: "{}", FAKE_SWAMP_GET_RC: "1" }, async () => {
+    assertEquals(await CLI.globalArguments("m"), null);
+  });
+  await withFake({ FAKE_SWAMP_MODEL_GET: JSON.stringify({ globalArguments: { a: 1 } }) }, async () => {
+    assertEquals(await CLI.globalArguments("m"), { a: 1 });
+  });
+  assertEquals(await fleet.methodSwamp({}).globalArguments("m"), null);
+  assertEquals(await fleet.checkSwamp({ repoDir: "/r" }).globalArguments("m"), null);
+});
+
+Deno.test("runScript: a failed call recovers fresh runResult records of the requested hosts and ignores a stale one", async () => {
+  const stale = "2020-01-01T00:00:00.000Z";
+  const fresh = () => new Date(Date.now() + 1000).toISOString();
+  const records = [
+    { name: "run-script-a", attributes: { host: "a", stdout: "out-a", exitCode: 0, startedAt: fresh() } },
+    { name: "run-script-b", attributes: { host: "b", stdout: "out-b", exitCode: 2, startedAt: fresh() } },
+    // stale: from an earlier run
+    { name: "run-script-c", attributes: { host: "c", stdout: "old", exitCode: 0, startedAt: stale } },
+    // not requested
+    { name: "run-script-z", attributes: { host: "z", stdout: "z", exitCode: 0, startedAt: fresh() } },
+    // another method
+    { name: "run-exec-a", attributes: { host: "a", stdout: "x", exitCode: 0, startedAt: fresh() } },
+  ];
+  const s = stubSwamp([{ ok: false, error: "script failed on 1/3 host(s): b (exit 2)" }], {
+    readData: (model, spec) => {
+      assertEquals([model, spec], ["ssh", "runResult"]);
+      return Promise.resolve(records);
+    },
+  });
+  const res = await fleet.runScriptOutcome("ssh", ["a", "b", "c"], "true", 5, s.api);
+  assertEquals(res.ok, false);
+  assertEquals(res.runs, [
+    { host: "a", stdout: "out-a", exitCode: 0 },
+    { host: "b", stdout: "out-b", exitCode: 2 },
+  ]);
+  assertStringIncludes(res.error, "b (exit 2)");
+  // Only stale records: nothing to recover, so the call's error is thrown.
+  const onlyStale = stubSwamp([{ ok: false, error: "script failed" }], {
+    readData: () => Promise.resolve([records[2]]),
+  });
+  await assertRejects(
+    () => fleet.runScript("ssh", ["c"], "true", 5, onlyStale.api),
+    Error,
+    "ssh script failed: script failed",
+  );
+});
+
+Deno.test("runScript through runModel: a partial failure keeps the hosts the ssh model recorded", async () => {
+  // The fake prints both hosts and exits 1, like @swamp/ssh when one host fails. The
+  // adapter stores them as runResult records and returns no handles, like runModel.
+  await withFake({
+    FAKE_SWAMP_SCRIPT_1: JSON.stringify({
+      dataArtifacts: [
+        { attributes: { host: "a", stdout: "out-a", exitCode: 0 } },
+        { attributes: { host: "b", stdout: "", exitCode: 1 } },
+      ],
+    }),
+    FAKE_SWAMP_SCRIPT_RC: "1",
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [] }, {
+      // A stale record of host c from an earlier run.
+      otherData: [{
+        model: "ssh",
+        spec: "runResult",
+        name: "run-script-c",
+        attributes: { host: "c", stdout: "old", exitCode: 0, startedAt: "2020-01-01T00:00:00.000Z" },
+      }],
+    });
+    const swamp = fleet.methodSwamp(t.ctx);
+    assertEquals(await fleet.runScript("ssh", ["a", "b", "c"], "true", 5, swamp), [
+      { host: "a", stdout: "out-a", exitCode: 0 },
+      { host: "b", stdout: "", exitCode: 1 },
+    ]);
   });
 });
 
 Deno.test("nodeExec strips the rc sentinel and returns the rc", async () => {
   await withFake({ FAKE_SWAMP_EXEC: execOut("hello world\n", 3) }, async () => {
-    assertEquals(await fleet.nodeExec("ssh", "a", "cmd", 5, "/r"), {
+    assertEquals(await fleet.nodeExec("ssh", "a", "cmd", 5, CLI), {
       rc: 3,
       out: "hello world",
     });
   });
   await withFake({ FAKE_SWAMP_EXEC: execOut("fine", 0) }, async () => {
-    assertEquals(await fleet.nodeExec("ssh", "a", "cmd", 5, "/r"), {
+    assertEquals(await fleet.nodeExec("ssh", "a", "cmd", 5, CLI), {
       rc: 0,
       out: "fine",
     });
@@ -743,13 +1122,13 @@ Deno.test("nodeExec falls back to exitCode when the sentinel is missing", async 
       dataArtifacts: [{ attributes: { stdout: "raw out", exitCode: 7 } }],
     }),
   }, async () => {
-    assertEquals(await fleet.nodeExec("ssh", "a", "cmd", 5, "/r"), {
+    assertEquals(await fleet.nodeExec("ssh", "a", "cmd", 5, CLI), {
       rc: 7,
       out: "raw out",
     });
   });
   await withFake({ FAKE_SWAMP_EXEC: "{}" }, async () => {
-    assertEquals(await fleet.nodeExec("ssh", "a", "cmd", 5, "/r"), {
+    assertEquals(await fleet.nodeExec("ssh", "a", "cmd", 5, CLI), {
       rc: -1,
       out: "",
     });
@@ -759,7 +1138,7 @@ Deno.test("nodeExec falls back to exitCode when the sentinel is missing", async 
 Deno.test("nodeExec throws when the ssh transport fails", async () => {
   await withFake({ FAKE_SWAMP_EXEC: "", FAKE_SWAMP_EXEC_RC: "1" }, async () => {
     await assertRejects(
-      () => fleet.nodeExec("ssh", "a", "cmd", 5, "/r"),
+      () => fleet.nodeExec("ssh", "a", "cmd", 5, CLI),
       Error,
       "ssh transport to a via ssh failed",
     );
@@ -771,7 +1150,7 @@ Deno.test("nodeExec throws when the ssh transport fails", async () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("evalHealth: no checks means healthy", async () => {
-  assertEquals(await fleet.evalHealth({ host: "a" }, [], "ssh", "/r"), {
+  assertEquals(await fleet.evalHealth({ host: "a" }, [], "ssh", CLI), {
     healthy: true,
     results: [],
   });
@@ -787,12 +1166,12 @@ Deno.test("evalHealth: http check passes on the expected status and fails otherw
         health: [{ type: "http", url: server.url }],
       }],
     }).machines[0].health;
-    const ok = await fleet.evalHealth({ host: "a" }, check, "ssh", "/r");
+    const ok = await fleet.evalHealth({ host: "a" }, check, "ssh", CLI);
     assertEquals(ok.healthy, true);
     assertEquals(ok.results[0].ok, true);
     assertEquals(ok.results[0].detail, "status 200");
     assertEquals(ok.results[0].label, `http 200 ${server.url}`);
-    const bad = await fleet.evalHealth({ host: "a" }, check, "ssh", "/r");
+    const bad = await fleet.evalHealth({ host: "a" }, check, "ssh", CLI);
     assertEquals(bad.healthy, false);
     assertEquals(bad.results[0].detail, "status 503");
     assertEquals(server.requests(), 2);
@@ -810,7 +1189,7 @@ Deno.test("evalHealth: http check honours expectStatus and a custom label", asyn
       url: server.url,
       expectStatus: 204,
       timeoutSec: 5,
-    }], "ssh", "/r");
+    }], "ssh", CLI);
     assertEquals(res.healthy, true);
     assertEquals(res.results[0].label, "my app");
   } finally {
@@ -824,28 +1203,34 @@ Deno.test("evalHealth: an unreachable http endpoint is unhealthy, not an excepti
     url: "http://127.0.0.1:1/",
     expectStatus: 200,
     timeoutSec: 5,
-  }], "ssh", "/r");
+  }], "ssh", CLI);
   assertEquals(res.healthy, false);
   assertMatch(res.results[0].detail, /^fetch failed: /);
 });
 
-Deno.test("evalHealth: service and command checks use the machine's transport", async () => {
-  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+Deno.test("evalHealth: service and command checks run in ONE batch on the machine's transport", async () => {
+  await withCallLog({ FAKE_SWAMP_HC: hcOut("a", 0, 0) }, async (calls) => {
     const res = await fleet.evalHealth({ host: "a" }, [
       { type: "service", name: "nginx" },
       { type: "command", run: "test -f /ok", timeoutSec: 5 },
-    ], "ssh", "/r");
+    ], "ssh", CLI);
     assertEquals(res.healthy, true);
     assertEquals(res.results, [
       { label: "service nginx active", ok: true, detail: "active" },
       { label: "command: test -f /ok", ok: true, detail: "rc 0" },
     ]);
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assert(all[0].startsWith("ssh script "));
+    assertStringIncludes(all[0], 'hosts:json=["a"]');
+    // Timeout = the command's timeoutSec + 30 per service check.
+    assertStringIncludes(all[0], "timeoutSec:json=35");
   });
-  await withFake({ FAKE_SWAMP_EXEC: execOut("", 1) }, async () => {
+  await withFake({ FAKE_SWAMP_HC: hcOut("a", 1, 1) }, async () => {
     const res = await fleet.evalHealth({ host: "a" }, [
       { type: "service", name: "nginx", label: "web" },
       { type: "command", run: "false", timeoutSec: 5 },
-    ], "ssh", "/r");
+    ], "ssh", CLI);
     assertEquals(res.healthy, false);
     assertEquals(res.results[0], {
       label: "web",
@@ -856,10 +1241,95 @@ Deno.test("evalHealth: service and command checks use the machine's transport", 
   });
 });
 
+Deno.test("evalHealth: each check gets its own rc, and a missing marker is 'no result'", async () => {
+  // Only checks 0 and 2 report; check 1 has no marker.
+  await withFake({
+    FAKE_SWAMP_HC: scriptOut("a", "@@PATCH-HC 0 rc=0\n@@PATCH-HC 2 rc=4\n"),
+  }, async () => {
+    const res = await fleet.evalHealth({ host: "a" }, [
+      { type: "service", name: "one" },
+      { type: "command", run: "two", timeoutSec: 5 },
+      { type: "command", run: "three", timeoutSec: 5 },
+    ], "ssh", CLI);
+    assertEquals(res.results.map((r) => [r.ok, r.detail]), [
+      [true, "active"],
+      [false, "no result"],
+      [false, "rc 4"],
+    ]);
+    assertEquals(res.healthy, false);
+  });
+});
+
+Deno.test("evalHealth: a CT's checks run through pct exec on its node, in one call", async () => {
+  await withCallLog({ FAKE_SWAMP_HC: hcOut("pve", 0, 3) }, async (calls) => {
+    const res = await fleet.evalHealth(
+      { host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } },
+      [
+        { type: "service", name: "caddy" },
+        { type: "command", run: "exit 3", timeoutSec: 5 },
+      ],
+      "ssh",
+      CLI,
+    );
+    assertEquals(res.results.map((r) => r.detail), ["active", "rc 3"]);
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], 'hosts:json=["pve"]');
+    assertStringIncludes(all[0], "script=pct exec 200 -- bash -c");
+  });
+});
+
+Deno.test("evalHealth: a transport failure of the batch is an exception (callers decide)", async () => {
+  await withFake({ FAKE_SWAMP_HC: "", FAKE_SWAMP_HC_RC: "1" }, async () => {
+    await assertRejects(
+      () =>
+        fleet.evalHealth({ host: "a" }, [{ type: "service", name: "x" }], "ssh", CLI),
+      Error,
+      "ssh script failed",
+    );
+  });
+});
+
+Deno.test("healthBatchScript: a bare exit in a check does not hide the next check's marker", async () => {
+  const script = fleet.healthBatchScript([
+    "exit 3",
+    "echo noise; true",
+    "cat >/dev/null; exit 0", // reads stdin: gets /dev/null, not the rest of the batch
+    "false",
+  ]);
+  // Feed the batch on stdin, as the ssh model does.
+  const proc = new Deno.Command("bash", {
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  const w = proc.stdin.getWriter();
+  await w.write(new TextEncoder().encode(script));
+  await w.close();
+  const out = new TextDecoder().decode((await proc.output()).stdout);
+  assertEquals([...fleet.parseHealthBatch(out).entries()], [
+    [0, 3],
+    [1, 0],
+    [2, 0],
+    [3, 1],
+  ]);
+  // The snippets' own output goes to /dev/null.
+  assertEquals(out.includes("noise"), false);
+});
+
+Deno.test("parseHealthBatch: reads only whole marker lines", () => {
+  assertEquals(
+    [...fleet.parseHealthBatch(
+      "x @@PATCH-HC 9 rc=0\n@@PATCH-HC 1 rc=2\n@@PATCH-HC 0 rc=0  \n",
+    ).entries()],
+    [[1, 2], [0, 0]],
+  );
+});
+
 Deno.test("evalHealth: every check must pass", async () => {
   const server = startServer(() => 200);
   try {
-    await withFake({ FAKE_SWAMP_EXEC: execOut("", 1) }, async () => {
+    await withFake({ FAKE_SWAMP_HC: hcOut("a", 1) }, async () => {
       const res = await fleet.evalHealth({ host: "a" }, [
         {
           type: "http",
@@ -868,7 +1338,7 @@ Deno.test("evalHealth: every check must pass", async () => {
           timeoutSec: 5,
         },
         { type: "service", name: "db" },
-      ], "ssh", "/r");
+      ], "ssh", CLI);
       assertEquals(res.healthy, false);
       assertEquals(res.results.map((r) => r.ok), [true, false]);
     });
@@ -878,17 +1348,17 @@ Deno.test("evalHealth: every check must pass", async () => {
 });
 
 Deno.test("evalHealth: a long command is labelled with its first 40 characters", async () => {
-  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+  await withFake({ FAKE_SWAMP_HC: hcOut("a", 0) }, async () => {
     const run = "x".repeat(60);
     const res = await fleet.evalHealth({ host: "a" }, [
       { type: "command", run, timeoutSec: 5 },
-    ], "ssh", "/r");
+    ], "ssh", CLI);
     assertEquals(res.results[0].label, `command: ${"x".repeat(40)}`);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Methods through createModelTestContext (swamp CLI replaced by the fake)
+// Methods through createModelTestContext (runModel backed by the fake)
 // ---------------------------------------------------------------------------
 
 Deno.test("scan: skips machines with os=false and writes nothing", async () => {
@@ -959,14 +1429,22 @@ Deno.test("scan: an ssh transport failure is recorded per host, not thrown", asy
   await withFake({ FAKE_SWAMP_SCRIPT_1: "not json" }, async () => {
     const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
     await model.methods.scan.execute({}, t.ctx);
-    assertMatch(String(t.one("inventory").error), /^ssh: Could not parse/);
+    assertEquals(t.one("inventory").error, "ssh: ssh script failed: not json");
   });
 });
 
+/** One CT's section in a CT batch's output, as ctBatchScript prints it. */
+function ctSection(ctid: number, stdout: string, rc = 0): string {
+  return `@@PATCH-CT ${ctid} BEGIN\n${stdout}\n@@PATCH-CT ${ctid} END rc=${rc}\n`;
+}
+
 Deno.test("scan: a reach=pct CT is scanned on its node and recorded as pct", async () => {
-  await withFake({
-    FAKE_SWAMP_SCRIPT_1: scriptOut("pve", collectorStdout({ hostname: "ct1" })),
-  }, async () => {
+  await withCallLog({
+    FAKE_SWAMP_PCT: scriptOut(
+      "pve",
+      ctSection(200, collectorStdout({ hostname: "ct1" })),
+    ),
+  }, async (calls) => {
     const t = mkCtx({
       sshModel: "ssh",
       machines: [{
@@ -980,13 +1458,18 @@ Deno.test("scan: a reach=pct CT is scanned on its node and recorded as pct", asy
     assertEquals(inv.hostname, "ct1");
     assertEquals(inv.reachMethod, "pct");
     assertEquals(t.written("inventory")[0].name, "ct1");
+    // reach=pct: no ssh collector call, one node call.
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], 'hosts:json=["pve"]');
   });
 });
 
 Deno.test("scan: a CT falls back to pct when ssh gives no inventory, and reports both errors when pct fails too", async () => {
-  // Fake answers ssh and pct with the same output: no marker anywhere.
+  // ssh answers with no marker; the node answers with no section for the CT.
   await withFake({
-    FAKE_SWAMP_SCRIPT_1: scriptOut("pve", "nothing\n", 0),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("ct1", "nothing\n", 0),
+    FAKE_SWAMP_PCT: scriptOut("pve", "nothing\n", 0),
   }, async () => {
     const t = mkCtx({
       sshModel: "ssh",
@@ -996,6 +1479,21 @@ Deno.test("scan: a CT falls back to pct when ssh gives no inventory, and reports
     assertEquals(
       t.one("inventory").error,
       "no inventory (exit 0); pct: no inventory",
+    );
+  });
+  // A section without the marker line reports the CT's exit code.
+  await withFake({
+    FAKE_SWAMP_SCRIPT_1: scriptOut("ct1", "nothing\n", 0),
+    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, "boom", 7)),
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    assertEquals(
+      t.one("inventory").error,
+      "no inventory (exit 0); pct: no inventory (exit 7)",
     );
   });
 });
@@ -1011,7 +1509,251 @@ Deno.test("scan: the scanned hosts keep their own record each", async () => {
     const result = await model.methods.scan.execute({}, t.ctx);
     assertEquals(result.dataHandles.length, 2);
     assertEquals(t.written("inventory").map((r) => r.name), ["a", "c"]);
+    // c has no result in the one batch call: it gets an error record.
+    assertEquals(t.written("inventory")[1].data.error, "no inventory");
   });
+});
+
+Deno.test("scan: ONE ssh script call collects every ssh host", async () => {
+  await withCallLog({
+    FAKE_SWAMP_SCRIPT_1: JSON.stringify({
+      dataArtifacts: [
+        { attributes: { host: "a", stdout: collectorStdout({ hostname: "a" }), exitCode: 0 } },
+        { attributes: { host: "b", stdout: "no marker", exitCode: 1 } },
+      ],
+    }),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "a" }, { host: "b" }, { host: "c" }, { host: "d", os: false }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertEquals(t.calls[0].arguments?.hosts, ["a", "b", "c"]);
+    assertEquals(t.calls[0].arguments?.timeoutSec, 240);
+    const inv = Object.fromEntries(
+      t.written("inventory").map((r) => [r.name, r.data]),
+    );
+    assertEquals(inv.a.reachMethod, "ssh");
+    assertEquals(inv.a.error, null);
+    assertEquals(inv.b.error, "no inventory (exit 1)");
+    assertEquals(inv.c.error, "no inventory");
+  });
+});
+
+Deno.test("scan: a partial ssh failure keeps the hosts that ran (recovered from runResult records)", async () => {
+  await withFake({
+    FAKE_SWAMP_SCRIPT_1: JSON.stringify({
+      dataArtifacts: [
+        { attributes: { host: "a", stdout: collectorStdout({ hostname: "a" }), exitCode: 0 } },
+        { attributes: { host: "b", stdout: "", exitCode: 255 } },
+      ],
+    }),
+    FAKE_SWAMP_SCRIPT_RC: "1",
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "a" }, { host: "b" }, { host: "c" }],
+    }, {
+      // A stale record of c from an earlier run must not be used.
+      otherData: [{
+        model: "ssh",
+        spec: "runResult",
+        name: "run-script-c",
+        attributes: {
+          host: "c",
+          stdout: collectorStdout({ hostname: "c" }),
+          exitCode: 0,
+          startedAt: "2020-01-01T00:00:00.000Z",
+        },
+      }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = Object.fromEntries(
+      t.written("inventory").map((r) => [r.name, r.data]),
+    );
+    assertEquals(inv.a.error, null);
+    assertEquals(inv.a.updatesCount, 3);
+    assertEquals(inv.b.error, "no inventory (exit 255)");
+    assertMatch(String(inv.c.error), /^ssh: /);
+    assertEquals(inv.c.updatesCount, null);
+  });
+});
+
+/** Two nodes' CT batch outputs in one fake answer; each node call picks its own host. */
+function twoNodePct(): string {
+  return JSON.stringify({
+    dataArtifacts: [
+      {
+        attributes: {
+          host: "pve",
+          // ctid 201 has no section: only ct2 gets an error record.
+          stdout: ctSection(200, collectorStdout({ hostname: "ct1" })),
+          exitCode: 0,
+        },
+      },
+      {
+        attributes: {
+          host: "pve2",
+          stdout: ctSection(300, collectorStdout({ hostname: "ct3" })),
+          exitCode: 0,
+        },
+      },
+    ],
+  });
+}
+
+const PCT_FLEET = {
+  sshModel: "ssh",
+  machines: [
+    { host: "ct1", reach: "pct", ct: { proxmoxNode: "pve", ctid: 200 } },
+    { host: "ct2", reach: "pct", ct: { proxmoxNode: "pve", ctid: 201 } },
+    { host: "ct3", reach: "pct", ct: { proxmoxNode: "pve2", ctid: 300 } },
+  ],
+};
+
+Deno.test("scan: the pct path is grouped per node: one call per node, sections parsed per CT", async () => {
+  await withFake({ FAKE_SWAMP_PCT: twoNodePct() }, async () => {
+    const t = mkCtx(PCT_FLEET);
+    await model.methods.scan.execute({}, t.ctx);
+    assertEquals(t.calls.length, 2);
+    assertEquals(t.calls.map((c) => c.arguments?.hosts), [["pve"], ["pve2"]]);
+    // Timeout = 240 per CT on the node.
+    assertEquals(t.calls.map((c) => c.arguments?.timeoutSec), [480, 240]);
+    const pveScript = String(t.calls[0].arguments?.script);
+    assertStringIncludes(pveScript, "@@PATCH-CT 200 BEGIN");
+    assertStringIncludes(pveScript, "@@PATCH-CT 201 BEGIN");
+    // The collector is sent once per node, not once per CT.
+    assertEquals(pveScript.split(fleet.utf8b64(fleet.COLLECTOR_SCRIPT)).length, 2);
+    const inv = Object.fromEntries(
+      t.written("inventory").map((r) => [r.name, r.data]),
+    );
+    assertEquals(inv.ct1.hostname, "ct1");
+    assertEquals(inv.ct1.reachMethod, "pct");
+    assertEquals(inv.ct2.error, "pct: no inventory");
+    assertEquals(inv.ct3.hostname, "ct3");
+    assertEquals(inv.ct3.reachMethod, "pct");
+  });
+});
+
+Deno.test("scan: a failing node does not affect the other node or the ssh hosts", async () => {
+  await withFake({
+    FAKE_SWAMP_PCT: twoNodePct(),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({ hostname: "web1" })),
+  }, async () => {
+    const t = mkCtx({
+      ...PCT_FLEET,
+      machines: [...PCT_FLEET.machines, { host: "web1" }],
+    });
+    const base = (t.ctx as { runModel: (o: unknown) => Promise<unknown> }).runModel;
+    // The node "pve" is down: its call fails with no result.
+    const runModel = (o: { arguments?: { hosts?: string[] } }) =>
+      o.arguments?.hosts?.[0] === "pve"
+        ? Promise.resolve({
+          ok: false,
+          error: { message: "script failed on 1/1 host(s): pve (exit 255)" },
+        })
+        : base(o);
+    await model.methods.scan.execute({}, { ...(t.ctx as object), runModel } as never);
+    const inv = Object.fromEntries(
+      t.written("inventory").map((r) => [r.name, r.data]),
+    );
+    assertStringIncludes(String(inv.ct1.error), "pct: ssh script failed: script failed on 1/1 host(s): pve");
+    assertStringIncludes(String(inv.ct2.error), "pct: ssh script failed");
+    assertEquals(inv.ct3.reachMethod, "pct");
+    assertEquals(inv.web1.reachMethod, "ssh");
+  });
+});
+
+Deno.test("scan: call budget for 10 machines (3 CTs on 2 nodes, 4 app sources, shell health everywhere) is at most 1 + 2 + 10 + 4", async () => {
+  const health = [{ type: "service", name: "sshd" }];
+  const machines = [
+    ...["h1", "h2", "h3", "h4", "h5", "h6", "h7"].map((host, i) => ({
+      host,
+      health,
+      ...(i < 3 ? { source: { type: "community-script", model: `app-${host}` } } : {}),
+    })),
+    { host: "ct1", reach: "pct", ct: { proxmoxNode: "pve", ctid: 200 }, health },
+    { host: "ct2", reach: "pct", ct: { proxmoxNode: "pve", ctid: 201 }, health },
+    {
+      host: "ct3",
+      reach: "pct",
+      ct: { proxmoxNode: "pve2", ctid: 300 },
+      source: { type: "community-script", model: "app-ct3" },
+      health,
+    },
+  ];
+  await withCallLog({
+    FAKE_SWAMP_SCRIPT_1: scriptOut("h1", collectorStdout({ hostname: "h1" })),
+    FAKE_SWAMP_PCT: twoNodePct(),
+    FAKE_SWAMP_HC: hcOut("h1", 0),
+  }, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", machines });
+    await model.methods.scan.execute({}, t.ctx);
+    const all = await calls();
+    assert(all.length <= 1 + 2 + 10 + 4, `${all.length} calls`);
+    assertEquals(all.length, 17);
+    const scripts = t.calls.filter((c) => c.method === "script");
+    const pct = scripts.filter((c) => String(c.arguments?.script).includes("@@PATCH-CT"));
+    const collector = scripts.filter((c) => c.arguments?.script === fleet.COLLECTOR_SCRIPT);
+    assertEquals(collector.length, 1);
+    assertEquals(collector[0].arguments?.hosts, ["h1", "h2", "h3", "h4", "h5", "h6", "h7"]);
+    assertEquals(pct.length, 2);
+    assertEquals(scripts.length - collector.length - pct.length, 10); // one health batch each
+    assertEquals(t.calls.filter((c) => c.method === "checkUpdate").length, 4);
+    assertEquals(t.written("inventory").length, 10);
+    assertStringIncludes(JSON.stringify(t.getLogsByLevel("info")), "17");
+  });
+});
+
+Deno.test("scan: when swamp's model-call cap is reached, ONE warn names the cap and the machine count", async () => {
+  const health = [{ type: "service", name: "sshd" }];
+  await withFake({
+    FAKE_SWAMP_SCRIPT_1: scriptOut("a", collectorStdout({ hostname: "a" })),
+    FAKE_SWAMP_HC: hcOut("a", 0),
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [
+        { host: "a", health },
+        { host: "b", health },
+        { host: "c", health },
+      ],
+    }, { maxRunModelCalls: 2 });
+    await model.methods.scan.execute({}, t.ctx);
+    const warns = t.getLogsByLevel("warning");
+    assertEquals(warns.length, 1);
+    const w = JSON.stringify(warns[0]);
+    assertStringIncludes(w, "cap of {cap} model calls");
+    assertStringIncludes(w, '"cap":100');
+    assertStringIncludes(w, '"count":3');
+    // Each machine still gets its record; the capped health checks are left unset.
+    assertEquals(t.written("inventory").length, 3);
+    assertEquals(t.written("inventory")[2].data.health, null);
+  });
+});
+
+Deno.test("parseCtSections: splits per CT; a cut-short section has rc null; a missing CT is absent", () => {
+  const out = "noise\n" + ctSection(200, "line-a\nline-b", 0) +
+    "@@PATCH-CT 201 BEGIN\npartial\n" + // no END: cut short
+    "@@PATCH-CT 202 BEGIN\nx\n@@PATCH-CT 202 END rc=3\n";
+  const s = fleet.parseCtSections(out);
+  assertEquals(s.get(200), { out: "line-a\nline-b", rc: 0 });
+  assertEquals(s.get(201), { out: "partial", rc: null });
+  assertEquals(s.get(202), { out: "x", rc: 3 });
+  assertEquals(s.has(203), false);
+});
+
+Deno.test("ctBatchScript: one collector copy, each CT delimited, pct exec reads /dev/null", () => {
+  const script = fleet.ctBatchScript([200, 201], "QUJD");
+  assertEquals(script.split("QUJD").length, 2);
+  assertStringIncludes(script, 'echo "@@PATCH-CT 200 BEGIN"');
+  assertStringIncludes(
+    script,
+    `pct exec 201 -- bash -c "echo '\${PATCH_COLLECTOR}' | base64 -d | bash" </dev/null`,
+  );
+  assertStringIncludes(script, "printf '\\n@@PATCH-CT %s END rc=%s\\n' 201 \"$?\"");
 });
 
 Deno.test("import: seeds a machines block from the ssh host list and Proxmox guests", async () => {
@@ -1021,15 +1763,18 @@ Deno.test("import: seeds a machines block from the ssh host list and Proxmox gue
         hosts: [{ name: "web1", tags: ["docker"] }, { name: "vm1" }],
       },
     }),
-    FAKE_SWAMP_DATA_GET: JSON.stringify({
-      content: JSON.stringify({
-        guests: [
-          { type: "qemu", vmid: 100, name: "vm1", node: "pve", ip: "192.0.2.5" },
-          { type: "lxc", vmid: 200, name: "ct1", node: "pve", ip: null },
-          { type: "lxc", vmid: 201, name: "ct2", node: "pve", ip: "192.0.2.9" },
-          { type: "other", vmid: 1, name: "skip", node: "pve", ip: null },
-        ],
-      }),
+    // listGuests writes the `guests` resource: its attributes hold the list.
+    FAKE_SWAMP_GUESTS: JSON.stringify({
+      dataArtifacts: [{
+        attributes: {
+          guests: [
+            { type: "qemu", vmid: 100, name: "vm1", node: "pve", ip: "192.0.2.5" },
+            { type: "lxc", vmid: 200, name: "ct1", node: "pve", ip: null },
+            { type: "lxc", vmid: 201, name: "ct2", node: "pve", ip: "192.0.2.9" },
+            { type: "other", vmid: 1, name: "skip", node: "pve", ip: null },
+          ],
+        },
+      }],
     }),
   }, async () => {
     const t = mkCtx({
@@ -1070,6 +1815,24 @@ Deno.test("import: records a read failure in the YAML instead of throwing", asyn
     assertEquals(seed.source, "ssh");
     assertEquals(seed.machineCount, 0);
     assertStringIncludes(String(seed.yaml), "# sshModel ssh read failed");
+  });
+});
+
+Deno.test("import: a failed listGuests is noted in the YAML, and the ssh hosts are still seeded", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: JSON.stringify({ globalArguments: { hosts: [{ name: "web1" }] } }),
+    FAKE_SWAMP_GUESTS: "",
+    FAKE_SWAMP_GUESTS_RC: "1",
+  }, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", proxmoxNodes: ["pve"], machines: [] });
+    await model.methods.import.execute({}, t.ctx);
+    const seed = t.one("seed");
+    assertEquals(seed.machineCount, 1);
+    // One model call (listGuests); the ssh host list is read from the definition.
+    assertEquals((await calls()).map((c) => c.split(" ").slice(0, 2).join(" ")), ["pve listGuests"]);
+    assertEquals(t.calls[0].arguments, undefined);
+    assertStringIncludes(String(seed.yaml), "  - host: web1");
+    assertEquals(String(seed.yaml).includes("Proxmox pve"), false); // no guests: no discovery block
   });
 });
 
@@ -1638,12 +2401,7 @@ Deno.test("safeOsUpdate: a source failure that is not about the argument is NOT 
 });
 
 Deno.test("isUnknownArgumentError: only an 'unknown input' error that names the argument counts", () => {
-  const fail = (stderr: string, stdout = "") => ({
-    ok: false,
-    rc: 1,
-    stdout,
-    stderr,
-  });
+  const fail = (error: string) => ({ ok: false, artifacts: [], error });
   assert(
     fleet.isUnknownArgumentError(
       fail(
@@ -1666,13 +2424,73 @@ Deno.test("isUnknownArgumentError: only an 'unknown input' error that names the 
   );
   assertEquals(
     fleet.isUnknownArgumentError(
-      { ok: true, rc: 0, stdout: "", stderr: "Unknown input snapshot" },
+      { ok: true, artifacts: [], error: "Unknown input snapshot" },
       "snapshot",
     ),
     false,
   );
 });
 
+Deno.test("isUnknownArgumentError: recognises runModel's 'Unknown argument(s)' message", () => {
+  const fail = (error: string) => ({ ok: false, artifacts: [], error });
+  assert(
+    fleet.isUnknownArgumentError(
+      fail("Unknown argument(s): snapshot. Valid arguments are: keepSnapshot, node"),
+      "snapshot",
+    ),
+  );
+  // Only the part before "Valid arguments" lists the rejected names.
+  assertEquals(
+    fleet.isUnknownArgumentError(
+      fail("Unknown argument(s): other. Valid arguments are: snapshot"),
+      "snapshot",
+    ),
+    false,
+  );
+});
+
+/** A SwampApi stub: `run` answers from `answers` in order and records each call. */
+function stubSwamp(
+  answers: Array<{ ok: boolean; artifacts?: Array<Record<string, unknown>>; error?: string }>,
+  extra: Partial<Pick<SwampApi, "readData" | "globalArguments">> = {},
+) {
+  const calls: Array<{ model: string; method: string; args?: Record<string, unknown> }> = [];
+  const api: SwampApi = {
+    run: (model, method, args) => {
+      calls.push({ model, method, args });
+      const a = answers[Math.min(calls.length - 1, answers.length - 1)];
+      return Promise.resolve({
+        ok: a.ok,
+        artifacts: a.artifacts ?? [],
+        error: a.error ?? "",
+      });
+    },
+    globalArguments: () => Promise.resolve(null),
+    ...extra,
+  };
+  return { api, calls };
+}
+
+Deno.test("runSourceSafeUpdate: runModel's 'Unknown argument(s)' answer is retried ONCE with no arguments", async () => {
+  const s = stubSwamp([
+    { ok: false, error: "Unknown argument(s): snapshot. Valid arguments are: keepSnapshot" },
+    { ok: true },
+  ]);
+  const l = collectLogger();
+  assertEquals(await fleet.runSourceSafeUpdate("app1", s.api, l.logger), true);
+  assertEquals(s.calls, [
+    { model: "app1", method: "safeUpdate", args: { snapshot: false } },
+    { model: "app1", method: "safeUpdate", args: {} },
+  ]);
+  assertStringIncludes(JSON.stringify(l.lines), "does not support snapshot:false");
+  // Any other failure is not retried, and is logged with its error.
+  const other = stubSwamp([{ ok: false, error: "update script exploded" }]);
+  const l2 = collectLogger();
+  assertEquals(await fleet.runSourceSafeUpdate("app1", other.api, l2.logger), false);
+  assertEquals(other.calls.length, 1);
+  assertEquals(l2.lines[0].msg, "{model} {method} failed: {error}");
+  assertEquals(l2.lines[0].props.error, "update script exploded");
+});
 // --- post-update health grace ---------------------------------------------------
 
 /** A fake clock for evalHealthWithGrace: sleeping moves the clock, nothing really waits. */
@@ -2183,6 +3001,52 @@ Deno.test("pruneSnapshots: a CT snapshot is deleted with pct over the node host"
   });
 });
 
+Deno.test("pruneSnapshots: the live gate of a CT scans it with pct on its node, not ssh to the CT", async () => {
+  await withCallLog({
+    FAKE_SWAMP_SCRIPT_1: scriptOut("node1", collectorStdout({ needsReboot: false })),
+    FAKE_SWAMP_EXEC: execOut("", 0),
+  }, async (calls) => {
+    const fleetCt = {
+      sshModel: "ssh",
+      machines: [{ host: "ct1", ct: { proxmoxNode: "node1", ctid: 200 } }],
+    };
+    const t = mkCtx(fleetCt, {
+      data: {
+        snapshot: [
+          snapDatum("s-ct", { host: "ct1", kind: "ct", vmid: 200, proxmoxNode: "node1" }),
+        ],
+      },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({ dryRun: true }),
+      t.ctx,
+    );
+    assertEquals((t.one("prune").pruned as unknown[]).length, 1);
+    assertEquals(t.one("prune").kept, []);
+    const scripts = (await calls()).filter((c) => c.startsWith("ssh script"));
+    assertEquals(scripts.length, 1);
+    assertStringIncludes(scripts[0], 'hosts:json=["node1"]');
+    assertStringIncludes(scripts[0], "pct exec 200");
+  });
+});
+
+Deno.test("pruneSnapshots: keeps the snapshot of a host that is not in the fleet", async () => {
+  await withCallLog({ FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW }, async (calls) => {
+    const t = mkCtx(FLEET, {
+      data: { snapshot: [snapDatum("s-old", { host: "old1" })] },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({ dryRun: true }),
+      t.ctx,
+    );
+    assertEquals(t.one("prune").pruned, []);
+    assertEquals(t.one("prune").kept, [
+      { host: "old1", name: "preupdate-1", reason: "host not in the fleet" },
+    ]);
+    assertEquals(await calls(), []);
+  });
+});
+
 Deno.test("pruneSnapshots: keeps a snapshot when the host is not healthy now or the delete fails", async () => {
   await withFake({
     FAKE_SWAMP_SCRIPT_1: scriptOut(
@@ -2360,6 +3224,7 @@ const MUTATING = [
   "rollback",
   "pruneSnapshots",
   "pruneImages",
+  "clearRetired",
 ];
 const READ_ONLY = ["scan", "import"];
 
@@ -2374,6 +3239,7 @@ function checkCtx(
   return {
     globalArgs: model.globalArguments.parse(globalArgs),
     repoDir: "/tmp/swamp-test",
+    definitionRepository: fakeDefinitions,
     methodName,
     unresolvedMethodArgs: args,
   };
@@ -2431,6 +3297,7 @@ Deno.test("checks: each check has a description, a known label and valid applies
     for (const m of c.appliesTo) assert(m in model.methods, `${name}: ${m}`);
   }
   assertEquals(model.checks["host-in-fleet"].labels, ["policy"]);
+  assertEquals(model.checks["host-retired"].labels, ["policy"]);
   assertEquals(model.checks["docker-configured"].labels, ["policy"]);
   assertEquals(model.checks["host-reachable"].labels, ["live"]);
   assertEquals(model.checks["baseline-healthy"].labels, ["live"]);
@@ -2649,7 +3516,7 @@ Deno.test("baseline-healthy: passes when the machine resolves no health checks",
 });
 
 Deno.test("baseline-healthy: passes when every health check passes", async () => {
-  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+  await withFake({ FAKE_SWAMP_HC: hcOut("hc", 0, 0) }, async () => {
     assertEquals(
       await runCheck(
         "baseline-healthy",
@@ -2661,8 +3528,8 @@ Deno.test("baseline-healthy: passes when every health check passes", async () =>
 });
 
 Deno.test("baseline-healthy: fails and names each failing health check label", async () => {
-  // Both commands run through the same fake; one failing rc makes both fail.
-  await withFake({ FAKE_SWAMP_EXEC: execOut("", 1) }, async () => {
+  // Both commands run in one batch; both report a failing rc.
+  await withFake({ FAKE_SWAMP_HC: hcOut("hc", 1, 1) }, async () => {
     const r = await runCheck(
       "baseline-healthy",
       checkCtx(CHECK_FLEET, "safeOsUpdate", { host: "hc" }),
@@ -2705,7 +3572,7 @@ Deno.test("baseline-healthy: only the failing label is named when one check pass
 });
 
 Deno.test("baseline-healthy: a transport failure while checking is a failed check, not an exception", async () => {
-  await withFake({ FAKE_SWAMP_EXEC_RC: "1" }, async () => {
+  await withFake({ FAKE_SWAMP_HC: "", FAKE_SWAMP_HC_RC: "1" }, async () => {
     const r = await runCheck(
       "baseline-healthy",
       checkCtx(CHECK_FLEET, "safeOsUpdate", { host: "hc" }),
@@ -2860,4 +3727,490 @@ Deno.test("snapshot-target-resolves: pruneSnapshots without a host filter passes
     ),
     { pass: true },
   );
+});
+
+// --- host-retired and clearRetired ------------------------------------------
+
+Deno.test("host-retired: applies to clearRetired only; host-in-fleet does not apply to it", () => {
+  assertEquals(model.checks["host-retired"].appliesTo, ["clearRetired"]);
+  assertEquals(
+    (model.checks["host-in-fleet"].appliesTo as string[]).includes(
+      "clearRetired",
+    ),
+    false,
+  );
+});
+
+Deno.test("host-retired: passes without a host, for a retired host, and for CEL text", async () => {
+  for (const args of [{}, { host: "gone" }, { host: "${{ inputs.host }}" }]) {
+    assertEquals(
+      await runCheck("host-retired", checkCtx(CHECK_FLEET, "clearRetired", args)),
+      { pass: true },
+    );
+  }
+});
+
+Deno.test("host-retired: fails for a host that is in the fleet and names the skip flags", async () => {
+  const r = await runCheck(
+    "host-retired",
+    checkCtx(CHECK_FLEET, "clearRetired", { host: "bare" }),
+  );
+  assertEquals(r.pass, false);
+  const msg = r.errors!.join(" ");
+  assertStringIncludes(msg, '"bare"');
+  assertStringIncludes(msg, "--skip-check host-retired");
+  assertStringIncludes(msg, "--skip-check-label policy");
+});
+
+/** A datum for a host-owned record. */
+function hostDatum(
+  name: string,
+  attributes: Record<string, unknown>,
+): ModelDatum {
+  return { name, isLatest: true, attributes };
+}
+
+/**
+ * Stored records of a fleet where only `node` is current. `node2` and `old1` are retired.
+ * The names `node` and `node2` make a prefix match fail the tests.
+ */
+function retiredData(): Record<string, ModelDatum[]> {
+  const run = (host: string, n: number) =>
+    hostDatum(`run-osUpdate-${host}-${n}`, { host, action: "osUpdate" });
+  return {
+    inventory: [
+      hostDatum("node", { hostname: "node" }),
+      hostDatum("node2", { hostname: "node2" }),
+      hostDatum("old1", { hostname: "old1" }),
+    ],
+    update: [
+      hostDatum("update-node", { host: "node" }),
+      hostDatum("update-node2", { host: "node2" }),
+    ],
+    osUpdate: [
+      hostDatum("os-update-node", { host: "node" }),
+      hostDatum("os-update-node2", { host: "node2" }),
+    ],
+    reboot: [hostDatum("reboot-node2", { host: "node2" })],
+    run: [run("node", 1), run("node2", 1), run("old1", 1)],
+    snapshot: [
+      hostDatum("snap-node-1", { host: "node", status: "active" }),
+      hostDatum("snap-node2-1", { host: "node2", status: "active" }),
+      hostDatum("snap-node2-0", { host: "node2", status: "pruned" }),
+    ],
+    image: [
+      hostDatum("image-node2-1-a", { host: "node2", status: "active" }),
+      hostDatum("image-node2-0-a", { host: "node2", status: "pruned" }),
+    ],
+  };
+}
+
+const RETIRED_FLEET = { sshModel: "ssh", machines: [{ host: "node" }] };
+
+type PruneRecord = {
+  kind: string;
+  dryRun: boolean;
+  pruned: Array<{ host: string; name: string; detail: string | null }>;
+  kept: Array<{ host: string; name: string; reason: string }>;
+};
+
+async function clearRetired(
+  globalArgs: unknown,
+  data: Record<string, ModelDatum[]>,
+  input: Record<string, unknown>,
+  opts: { deleteFails?: string[] } = {},
+) {
+  const t = mkCtx(globalArgs, { data, ...opts });
+  const result = await model.methods.clearRetired.execute(
+    model.methods.clearRetired.arguments.parse(input),
+    t.ctx,
+  );
+  return { t, result };
+}
+
+const names = (entries: Array<{ name: string }>) =>
+  entries.map((e) => e.name).sort();
+
+Deno.test("clearRetired: arguments default to a dry run that keeps nothing extra", () => {
+  assertEquals(model.methods.clearRetired.arguments.parse({}), {
+    dryRun: true,
+    keepHistory: false,
+    force: false,
+  });
+  assertEquals(
+    model.methods.clearRetired.arguments.safeParse({ host: "" }).success,
+    false,
+  );
+});
+
+Deno.test("clearRetired: PruneResult accepts the kind retired", () => {
+  assertEquals(
+    model.resources.prune.schema.safeParse({
+      scannedAt: "2026-10-04T00:00:00Z",
+      kind: "retired",
+      dryRun: true,
+      pruned: [],
+      kept: [],
+    }).success,
+    true,
+  );
+});
+
+Deno.test("clearRetired: a bare run is a dry run, deletes nothing and lists everything", async () => {
+  const { t, result } = await clearRetired(RETIRED_FLEET, retiredData(), {});
+  assertEquals(t.deleted, []);
+  assertEquals(result.dataHandles.length, 1);
+  const rec = t.one("prune") as PruneRecord;
+  assertEquals(rec.kind, "retired");
+  assertEquals(rec.dryRun, true);
+  assertEquals(names(rec.pruned), [
+    "old1",
+    "os-update-node2",
+    "node2",
+    "reboot-node2",
+    "run-osUpdate-old1-1",
+    "run-osUpdate-node2-1",
+    "snap-node2-0",
+    "image-node2-0-a",
+    "update-node2",
+  ].sort());
+  assertEquals(
+    rec.pruned.find((p) => p.name === "node2"),
+    { host: "node2", name: "node2", detail: "inventory" },
+  );
+  assertEquals(
+    rec.pruned.find((p) => p.name === "snap-node2-0")?.detail,
+    "snapshot",
+  );
+  // Active retention is kept, with a reason.
+  assertEquals(names(rec.kept), ["image-node2-1-a", "snap-node2-1"].sort());
+  for (const k of rec.kept) assertStringIncludes(k.reason, "force=true");
+});
+
+Deno.test("clearRetired: dryRun=false deletes status and history of every retired host", async () => {
+  const { t } = await clearRetired(RETIRED_FLEET, retiredData(), {
+    dryRun: false,
+  });
+  assertEquals(
+    [...t.deleted].sort(),
+    [
+      "image-node2-0-a",
+      "node2",
+      "old1",
+      "os-update-node2",
+      "reboot-node2",
+      "run-osUpdate-node2-1",
+      "run-osUpdate-old1-1",
+      "snap-node2-0",
+      "update-node2",
+    ],
+  );
+  const rec = t.one("prune") as PruneRecord;
+  assertEquals(rec.dryRun, false);
+  assertEquals(names(rec.pruned), [...t.deleted].sort());
+  assertStringIncludes(t.written("prune")[0].name, "prune-retired-");
+  // Records of the current host `node` are never touched.
+  for (const n of t.deleted) {
+    assert(!["node", "update-node", "os-update-node", "snap-node-1"].includes(n));
+    assert(!n.includes("-node-"), `${n} belongs to the current host`);
+  }
+});
+
+Deno.test("clearRetired: keepHistory deletes status records only", async () => {
+  const { t } = await clearRetired(RETIRED_FLEET, retiredData(), {
+    dryRun: false,
+    keepHistory: true,
+  });
+  assertEquals(
+    [...t.deleted].sort(),
+    ["node2", "old1", "os-update-node2", "reboot-node2", "update-node2"],
+  );
+  const rec = t.one("prune") as PruneRecord;
+  assertEquals(names(rec.kept), [
+    "image-node2-0-a",
+    "image-node2-1-a",
+    "run-osUpdate-node2-1",
+    "run-osUpdate-old1-1",
+    "snap-node2-0",
+    "snap-node2-1",
+  ]);
+  assertStringIncludes(
+    rec.kept.find((k) => k.name === "run-osUpdate-node2-1")!.reason,
+    "keepHistory",
+  );
+});
+
+Deno.test("clearRetired: force also deletes active snapshot and image records", async () => {
+  const { t } = await clearRetired(RETIRED_FLEET, retiredData(), {
+    dryRun: false,
+    force: true,
+  });
+  assert(t.deleted.includes("snap-node2-1"));
+  assert(t.deleted.includes("image-node2-1-a"));
+  assertEquals((t.one("prune") as PruneRecord).kept, []);
+  // force with keepHistory: active retention goes, pruned retention and runs stay.
+  const k = await clearRetired(RETIRED_FLEET, retiredData(), {
+    dryRun: false,
+    force: true,
+    keepHistory: true,
+  });
+  assert(k.t.deleted.includes("snap-node2-1"));
+  assert(!k.t.deleted.includes("snap-node2-0"));
+  assert(!k.t.deleted.includes("run-osUpdate-node2-1"));
+});
+
+Deno.test("clearRetired: the host argument limits the run to one retired host", async () => {
+  const { t } = await clearRetired(RETIRED_FLEET, retiredData(), {
+    dryRun: false,
+    host: "old1",
+  });
+  assertEquals([...t.deleted].sort(), ["old1", "run-osUpdate-old1-1"]);
+  const rec = t.one("prune") as PruneRecord;
+  assertEquals(rec.pruned.every((p) => p.host === "old1"), true);
+});
+
+Deno.test("clearRetired: node and node2 never match each other", async () => {
+  // node2 is current, node is retired.
+  const fleet = { sshModel: "ssh", machines: [{ host: "node2" }] };
+  const { t } = await clearRetired(fleet, retiredData(), {
+    dryRun: false,
+    host: "node",
+  });
+  assertEquals(
+    [...t.deleted].sort(),
+    ["node", "os-update-node", "run-osUpdate-node-1", "update-node"],
+  );
+  // The active snapshot of node is kept, the records of node2 are untouched.
+  assertEquals(
+    names((t.one("prune") as PruneRecord).kept),
+    ["snap-node-1"],
+  );
+  // And the other way: node current, node2 named explicitly.
+  const other = await clearRetired(RETIRED_FLEET, retiredData(), {
+    dryRun: false,
+    host: "node2",
+  });
+  assert(!other.t.deleted.includes("node"));
+  assert(!other.t.deleted.includes("old1"));
+});
+
+Deno.test("clearRetired: a host that is in the fleet is an error and deletes nothing", async () => {
+  const t = mkCtx(RETIRED_FLEET, { data: retiredData() });
+  await assertRejects(
+    () =>
+      model.methods.clearRetired.execute(
+        model.methods.clearRetired.arguments.parse({
+          host: "node",
+          dryRun: false,
+        }),
+        t.ctx,
+      ),
+    Error,
+    "is in globalArguments.machines",
+  );
+  assertEquals(t.deleted, []);
+  assertEquals(t.written("prune"), []);
+});
+
+Deno.test("clearRetired: a host with no stored records is an error and deletes nothing", async () => {
+  const t = mkCtx(RETIRED_FLEET, { data: retiredData() });
+  await assertRejects(
+    () =>
+      model.methods.clearRetired.execute(
+        model.methods.clearRetired.arguments.parse({
+          host: "ghost",
+          dryRun: false,
+        }),
+        t.ctx,
+      ),
+    Error,
+    'No stored records for host "ghost"',
+  );
+  assertEquals(t.deleted, []);
+  assertEquals(t.written("prune"), []);
+});
+
+Deno.test("clearRetired: an empty fleet is refused, so no host looks retired by mistake", async () => {
+  const t = mkCtx({ sshModel: "ssh", machines: [] }, { data: retiredData() });
+  await assertRejects(
+    () =>
+      model.methods.clearRetired.execute(
+        model.methods.clearRetired.arguments.parse({ dryRun: false }),
+        t.ctx,
+      ),
+    Error,
+    "machines is empty",
+  );
+  assertEquals(t.deleted, []);
+});
+
+Deno.test("clearRetired: a record that cannot be deleted is kept and reported", async () => {
+  const { t } = await clearRetired(
+    RETIRED_FLEET,
+    retiredData(),
+    { dryRun: false, host: "old1" },
+    { deleteFails: ["old1"] },
+  );
+  assertEquals(t.deleted, ["run-osUpdate-old1-1"]);
+  const rec = t.one("prune") as PruneRecord;
+  assertEquals(names(rec.pruned), ["run-osUpdate-old1-1"]);
+  assertStringIncludes(rec.kept[0].reason, "delete failed");
+});
+
+Deno.test("clearRetired: nothing retired gives an empty prune record", async () => {
+  const data = { inventory: [hostDatum("node", { hostname: "node" })] };
+  const { t } = await clearRetired(RETIRED_FLEET, data, { dryRun: false });
+  assertEquals(t.deleted, []);
+  const rec = t.one("prune") as PruneRecord;
+  assertEquals(rec.pruned, []);
+  assertEquals(rec.kept, []);
+});
+
+Deno.test("clearRetired: logs entry, one line per host, a warning per kept active record and completion", async () => {
+  const { t } = await clearRetired(RETIRED_FLEET, retiredData(), {});
+  const info = JSON.stringify(t.getLogsByLevel("info"));
+  assertStringIncludes(info, "Clearing retired machines");
+  assertStringIncludes(info, "Retired host");
+  assertStringIncludes(info, "Retired machines:");
+  assertEquals(t.getLogsByLevel("warning").length, 2);
+});
+
+Deno.test("recordHost: inventory by exact name, other records by their host field only", () => {
+  assertEquals(fleet.recordHost("inventory", "node2", {}), "node2");
+  assertEquals(fleet.recordHost("run", "run-osUpdate-node2-1", { host: "node" }), "node");
+  assertEquals(fleet.recordHost("run", "run-osUpdate-node2-1", {}), null);
+  assertEquals(fleet.recordHost("snapshot", "snap-node2-1", { host: "" }), null);
+});
+
+// --- records written before a model rename (old `modelName` tag) -------------------
+
+/** A datum written when the model had another name. readModelData would not find it. */
+const old = (d: ModelDatum): ModelDatum => ({ ...d, modelName: "old-fleet" });
+
+Deno.test("own data: clearRetired finds records tagged with an old model name", async () => {
+  const data = retiredData();
+  for (const rows of Object.values(data)) rows.forEach((r) => r.modelName = "old-fleet");
+  const { t } = await clearRetired(RETIRED_FLEET, data, { dryRun: false });
+  assertEquals(t.deleted.length, 9);
+  assert(t.deleted.includes("node2"));
+  assert(t.deleted.includes("old1"));
+});
+
+Deno.test("own data: pruneSnapshots finds a snapshot record tagged with an old model name", async () => {
+  await withFake({ FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW }, async () => {
+    const t = mkCtx(FLEET, { data: { snapshot: [old(snapDatum("s-1"))] } });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({}),
+      t.ctx,
+    );
+    assertEquals(t.one("prune").pruned, [
+      { host: "web1", name: "preupdate-1", detail: "vmid:100" },
+    ]);
+    assertEquals(t.one("snapshot").status, "pruned");
+  });
+});
+
+Deno.test("own data: pruneImages finds an image record tagged with an old model name", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("24.0.7", 0) }, async () => {
+    const t = mkCtx(FLEET, { data: { image: [old(imageDatum("i-1"))] } });
+    await model.methods.pruneImages.execute(
+      model.methods.pruneImages.arguments.parse({}),
+      t.ctx,
+    );
+    assertEquals((t.one("prune").pruned as unknown[]).length, 1);
+    assertEquals(t.one("image").status, "pruned");
+  });
+});
+
+Deno.test("own data: rollback finds a snapshot record tagged with an old model name", async () => {
+  const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, {
+    data: { snapshot: [old(snapDatum("snap-web1-1", { name: "first" }))] },
+  });
+  await model.methods.rollback.execute(
+    model.methods.rollback.arguments.parse({ host: "web1" }),
+    t.ctx,
+  );
+  assertEquals(t.one("run").snapshot, "first");
+});
+
+Deno.test("own data: reboot confirms a snapshot record tagged with an old model name", async () => {
+  await withFake(
+    {
+      FAKE_SWAMP_EXEC: execOut("", 0),
+      FAKE_SWAMP_SCRIPT_1: scriptOut("pve", collectorStdout({ needsReboot: false })),
+    },
+    async () => {
+      const t = mkCtx(
+        {
+          sshModel: "ssh",
+          machines: [{ host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } }],
+        },
+        {
+          data: {
+            snapshot: [old(snapDatum("snap-ct1-1", { host: "ct1", name: "pre" }))],
+          },
+        },
+      );
+      await model.methods.reboot.execute(
+        model.methods.reboot.arguments.parse({
+          host: "ct1",
+          force: true,
+          waitTimeoutSec: 20,
+        }),
+        t.ctx,
+      );
+      assertEquals(t.one("reboot").outcome, "rebooted");
+      const snap = t.one("snapshot");
+      assertEquals(snap.rebootConfirmed, true);
+      assertEquals(t.written("snapshot")[0].name, "snap-ct1-1");
+    },
+  );
+});
+
+Deno.test("own data: readOwnRecords reads by model id, filters by specName tag, skips deleted and non-JSON records", async () => {
+  const calls: string[] = [];
+  const enc = (v: string) => new TextEncoder().encode(v);
+  const content: Record<string, string> = {
+    a: '{"x":1}',
+    b: '{"x":2}',
+    c: "not json",
+    d: '{"x":4}',
+  };
+  const ctx = {
+    modelType: TEST_MODEL_TYPE,
+    modelId: TEST_MODEL_ID,
+    dataRepository: {
+      findAllForModel: (_t: unknown, id: string) => {
+        calls.push(`findAllForModel ${id}`);
+        return Promise.resolve<
+          Array<{
+            name: string;
+            version: number;
+            tags: Record<string, string>;
+            isDeleted?: boolean;
+          }>
+        >([
+          { name: "a", version: 3, tags: { specName: "snapshot" } },
+          { name: "b", version: 1, tags: { specName: "image" } },
+          { name: "c", version: 1, tags: { specName: "snapshot" } },
+          { name: "d", version: 1, tags: { specName: "snapshot" }, isDeleted: true },
+          { name: "e", version: 1, tags: {} },
+        ]);
+      },
+      getContent: (_t: unknown, _id: string, name: string, version?: number) => {
+        calls.push(`getContent ${name} v${version}`);
+        return Promise.resolve(content[name] ? enc(content[name]) : null);
+      },
+    },
+  };
+  const rows = await fleet.readOwnRecords(ctx, "snapshot");
+  assertEquals(rows.map((r) => [r.name, r.attributes]), [["a", { x: 1 }]]);
+  assertEquals(rows[0].isLatest, true);
+  assertEquals(calls, [
+    `findAllForModel ${TEST_MODEL_ID}`,
+    "getContent a v3",
+    "getContent c v1",
+  ]);
+  const both = await fleet.readOwnRecords(ctx, ["snapshot", "image"]);
+  assertEquals(both.map((r) => r.name), ["a", "b"]);
 });

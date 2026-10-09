@@ -305,7 +305,12 @@ Deno.test("history report: a host with a pending app update shows the upward arr
 Deno.test("history report: location comes from the machine decoration", async () => {
   const res = await run(
     [inventory("vm1"), inventory("plain")],
-    { machines: [{ host: "vm1", vm: { proxmoxNode: "pve", vmid: 100 } }] },
+    {
+      machines: [
+        { host: "vm1", vm: { proxmoxNode: "pve", vmid: 100 } },
+        { host: "plain" },
+      ],
+    },
   );
   assertStringIncludes(res.markdown, "Proxmox VM · vmid 100 on pve");
   assertStringIncludes(res.markdown, "host / VPS");
@@ -341,4 +346,118 @@ Deno.test("history report: json summary carries per-host runs", async () => {
     rolledBack: false,
     timestamp: "2026-09-30T11:00:00Z",
   });
+});
+
+// --- Retired machines ---------------------------------------------------------
+
+const fleetOf = (...hosts: string[]) => ({
+  machines: hosts.map((host) => ({ host })),
+});
+
+Deno.test("history report: a retired host gets no detail section of its own, only the Retired block", async () => {
+  const res = await run(
+    [
+      inventory("web1"),
+      runRecord("web1", "a"),
+      inventory("old1", { updatesCount: 4, securityUpdatesCount: 2 }),
+      runRecord("old1", "b", { timestamp: "2026-08-02T00:00:00Z" }),
+    ],
+    fleetOf("web1"),
+  );
+  const md = res.markdown;
+  assertStringIncludes(md, "## web1");
+  assertEquals(md.split("\n").includes("## old1"), false);
+  assertStringIncludes(md, "**1 host(s)** · **1 recorded run(s)**");
+  assertStringIncludes(md, "## Retired machines");
+  assertStringIncludes(md, "### old1");
+  assertStringIncludes(md, "clearRetired");
+  // Last status line.
+  assertStringIncludes(
+    md,
+    "**Debian GNU/Linux 12** · apt · last scanned 2026-09-30 10:00 UTC · 4 updates · 🔒 2 security",
+  );
+  // Run history is collapsed.
+  assertStringIncludes(
+    md,
+    "<details><summary>Run history (1 run(s))</summary>",
+  );
+  assertStringIncludes(md, "| 2026-08-02 00:00 UTC | 📦 osUpdate | updated |");
+  // The retired block comes after the current hosts.
+  assertEquals(md.indexOf("## web1") < md.indexOf("## Retired machines"), true);
+});
+
+Deno.test("history report: json lists the retired hosts with their runs", async () => {
+  const res = await run(
+    [
+      inventory("web1"),
+      inventory("old1"),
+      runRecord("old1", "b"),
+    ],
+    fleetOf("web1"),
+  );
+  const retired = res.json.retired as Array<
+    { host: string; lastScanned: string; runs: unknown[] }
+  >;
+  assertEquals(retired.length, 1);
+  assertEquals(retired[0].host, "old1");
+  assertEquals(retired[0].lastScanned, "2026-09-30T10:00:00Z");
+  assertEquals(retired[0].runs.length, 1);
+  assertEquals(
+    (res.json.hosts as Array<{ host: string }>).map((h) => h.host),
+    ["web1"],
+  );
+});
+
+Deno.test("history report: a retired host with only runs says no inventory is kept", async () => {
+  const res = await run(
+    [inventory("web1"), runRecord("old1", "b")],
+    fleetOf("web1"),
+  );
+  assertStringIncludes(res.markdown, "_No inventory record kept._");
+});
+
+Deno.test("history report: a retired host known only from a retention record is still listed", async () => {
+  const res = await run(
+    [
+      inventory("web1"),
+      { name: "snap-old1-1", body: { host: "old1", status: "active" } },
+    ],
+    fleetOf("web1"),
+  );
+  assertStringIncludes(res.markdown, "### old1");
+  assertStringIncludes(res.markdown, "_No runs recorded._");
+});
+
+Deno.test("history report: no Retired block when every host is in the fleet", async () => {
+  const res = await run([inventory("web1")], fleetOf("web1"));
+  assertEquals(res.markdown.includes("Retired machines"), false);
+  assertEquals(res.json.retired, []);
+});
+
+Deno.test("history report: node is never mistaken for node2", async () => {
+  const res = await run(
+    [inventory("node"), inventory("node2"), runRecord("node2", "x")],
+    fleetOf("node"),
+  );
+  assertStringIncludes(res.markdown, "## node\n");
+  assertStringIncludes(res.markdown, "### node2");
+  assertEquals(
+    (res.json.retired as Array<{ host: string }>).map((r) => r.host),
+    ["node2"],
+  );
+});
+
+Deno.test("history report: without machines in the context every host gets a detail section (fallback)", async () => {
+  for (const globalArgs of [{}, { machines: [] }]) {
+    const res = await run([inventory("web1"), inventory("old1")], globalArgs);
+    assertStringIncludes(res.markdown, "## old1");
+    assertEquals(res.markdown.includes("Retired machines"), false);
+    assertEquals(res.json.retired, []);
+  }
+});
+
+Deno.test("history report: when no current host has data the retired block still renders", async () => {
+  const res = await run([inventory("old1")], fleetOf("web1"));
+  assertStringIncludes(res.markdown, "## Retired machines");
+  assertEquals(res.json.status === "no-data", false);
 });

@@ -32,11 +32,16 @@ function artifacts(seeds: Seed[]) {
   }));
 }
 
-async function run(seeds: Seed[]) {
+async function run(
+  seeds: Seed[],
+  globalArgs?: Record<string, unknown>,
+) {
   const { context } = createReportTestContext({
     scope: "model",
     modelType: MODEL_TYPE,
     modelId: MODEL_ID,
+    definition: { name: "fleet" },
+    ...(globalArgs ? { globalArgs } : {}),
     dataArtifacts: artifacts(seeds),
   });
   return await report.execute(context as never);
@@ -315,4 +320,159 @@ Deno.test("status report: unreadable records are skipped, not fatal", async () =
     { name: "junk", body: null, raw: "{not json" },
   ]);
   assertEquals(res.json.nodes, 1);
+});
+
+// --- Retired machines ---------------------------------------------------------
+
+const machines = (...hosts: string[]) => ({
+  machines: hosts.map((host) => ({ host })),
+});
+
+/** A fleet of `web1`, with `old1` retired (it still has records). */
+function retiredSeeds(): Seed[] {
+  return [
+    inventory("web1", { updatesCount: 2, securityUpdatesCount: 1 }),
+    inventory("old1", {
+      updatesCount: 16,
+      securityUpdatesCount: 11,
+      needsReboot: true,
+      distUpgradeRequired: true,
+      scannedAt: "2026-08-01T09:30:00Z",
+      dockerEngine: "27.0",
+      dockerImages: [
+        { container: "gone", image: "gone:1", updateAvailable: true },
+      ],
+    }),
+    { name: "update-old1", body: { host: "old1" } },
+    { name: "run-osUpdate-old1-1", body: { host: "old1" } },
+    { name: "snap-old1-1", body: { host: "old1", status: "active" } },
+    { name: "snap-old1-0", body: { host: "old1", status: "pruned" } },
+    { name: "image-old1-1-a", body: { host: "old1", status: "active" } },
+    { name: "snap-web1-1", body: { host: "web1", status: "active" } },
+    { name: "image-web1-1-a", body: { host: "web1", status: "active" } },
+  ];
+}
+
+Deno.test("status report: a retired host is left out of the node table and every total", async () => {
+  const res = await run(retiredSeeds(), machines("web1"));
+  const md = res.markdown;
+  assertEquals(
+    md.split("\n").some((l) =>
+      l.startsWith("| old1 |") && l.includes("Debian")
+    ),
+    false,
+  );
+  assertStringIncludes(md, "**Nodes**: 1 ·");
+  assertStringIncludes(
+    md,
+    "**Retained snapshots**: 1 · **Retained images**: 1",
+  );
+  assertStringIncludes(md, "2 update(s) pending");
+  assertStringIncludes(md, "1 node(s) with security updates");
+  assertEquals(md.includes("need dist-upgrade"), false);
+  assertEquals(md.includes("need reboot"), false);
+  assertEquals(md.includes("container image(s) with updates"), false);
+  assertEquals(res.json.nodes, 1);
+  assertEquals(res.json.totalPendingUpdates, 2);
+  assertEquals(res.json.nodesWithSecurityUpdates, ["web1"]);
+  assertEquals(res.json.nodesRequiringDistUpgrade, []);
+  assertEquals(res.json.nodesNeedingReboot, []);
+  assertEquals(res.json.containerImagesWithUpdates, []);
+  assertEquals(res.json.retainedSnapshots, 1);
+  assertEquals(res.json.retainedImages, 1);
+});
+
+Deno.test("status report: the Retired machines section lists last scanned, records and active retention", async () => {
+  const res = await run(retiredSeeds(), machines("web1"));
+  const md = res.markdown;
+  assertStringIncludes(md, "## Retired machines");
+  assertStringIncludes(
+    md,
+    "| Host | Last scanned | Records | Active retention |",
+  );
+  // old1: inventory, update, run, 2 snaps, 1 image = 6 records; 2 active retention.
+  assertStringIncludes(md, "| old1 | 2026-08-01 09:30 UTC | 6 | 2 |");
+  assertStringIncludes(md, "`swamp model method run fleet clearRetired`");
+  assertStringIncludes(
+    md,
+    "`swamp model method run fleet clearRetired --input dryRun=false`",
+  );
+  assertEquals(res.json.retired, [{
+    host: "old1",
+    lastScanned: "2026-08-01T09:30:00Z",
+    records: 6,
+    activeRetention: 2,
+  }]);
+});
+
+Deno.test("status report: a retired host with no inventory shows a dash for last scanned", async () => {
+  const res = await run(
+    [inventory("web1"), {
+      name: "run-osUpdate-old1-1",
+      body: { host: "old1" },
+    }],
+    machines("web1"),
+  );
+  assertStringIncludes(res.markdown, "| old1 | — | 1 | 0 |");
+});
+
+Deno.test("status report: no Retired section when every host is in the fleet", async () => {
+  const res = await run(
+    [inventory("web1"), inventory("web2")],
+    machines("web1", "web2"),
+  );
+  assertEquals(res.markdown.includes("Retired machines"), false);
+  assertEquals(res.json.retired, []);
+});
+
+Deno.test("status report: node is never mistaken for node2", async () => {
+  const res = await run(
+    [
+      inventory("node"),
+      inventory("node2", { updatesCount: 9 }),
+      { name: "snap-node2-1", body: { host: "node2", status: "active" } },
+      { name: "snap-node-1", body: { host: "node", status: "active" } },
+    ],
+    machines("node"),
+  );
+  assertStringIncludes(res.markdown, "**Nodes**: 1 ·");
+  assertStringIncludes(res.markdown, "**Retained snapshots**: 1");
+  assertStringIncludes(res.markdown, "| node2 | ");
+  assertEquals(res.json.totalPendingUpdates, 0);
+  assertEquals(
+    (res.json.retired as Array<{ host: string; records: number }>).map((
+      r,
+    ) => [r.host, r.records]),
+    [["node2", 2]],
+  );
+});
+
+Deno.test("status report: an app of a retired host stays out of the LXC totals", async () => {
+  const res = await run(
+    [
+      inventory("web1"),
+      inventory("retired1"),
+      updateCheck("m1", { name: "Retired1", updateAvailable: true }),
+      updateCheck("m2", { name: "Valkey", updateAvailable: true }),
+    ],
+    machines("web1"),
+  );
+  assertEquals(res.json.lxcAppsWithUpdates, ["Valkey"]);
+});
+
+Deno.test("status report: without machines in the context every host is shown (fallback)", async () => {
+  for (const globalArgs of [undefined, {}, { machines: [] }]) {
+    const res = await run(retiredSeeds(), globalArgs);
+    assertEquals(res.json.nodes, 2);
+    assertEquals(res.markdown.includes("Retired machines"), false);
+    assertEquals(res.json.retired, []);
+    assertStringIncludes(res.markdown, "| old1 |");
+  }
+});
+
+Deno.test("status report: when no current host has inventory the retired hosts are still listed", async () => {
+  const res = await run([inventory("old1")], machines("web1"));
+  assertStringIncludes(res.markdown, "_No inventory yet");
+  assertStringIncludes(res.markdown, "## Retired machines");
+  assertEquals(res.json.status, "no-data");
 });

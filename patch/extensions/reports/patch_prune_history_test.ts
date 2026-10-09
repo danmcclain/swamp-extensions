@@ -158,3 +158,52 @@ Deno.test("prune history report: only the latest version of a run is used; other
   assertEquals(res.json.totalRuns, 1);
   assertEquals(res.json.totalRetired, 1);
 });
+
+Deno.test("prune history report: a retired run renders deleted records and kept records with reasons", async () => {
+  const live = {
+    scannedAt: "2026-10-04T12:00:00.000Z",
+    kind: "retired",
+    dryRun: false,
+    pruned: [
+      { host: "old1", name: "old1", detail: "inventory" },
+      { host: "old1", name: "run-osUpdate-old1-1", detail: "run" },
+    ],
+    kept: [
+      {
+        host: "old1",
+        name: "snap-old1-1",
+        reason: "active snapshot record: the snapshot may still exist",
+      },
+    ],
+  };
+  const dry = { ...live, scannedAt: "2026-10-03T12:00:00.000Z", dryRun: true };
+  const res = await run([
+    { name: "prune-retired-2026-10-04T12-00-00-000Z", body: live },
+    { name: "prune-retired-2026-10-03T12-00-00-000Z", body: dry },
+  ]);
+  const md = res.markdown;
+  assertStringIncludes(
+    md,
+    "| 2026-10-04 12:00 UTC | retired | live | **2** | 1 |",
+  );
+  assertStringIncludes(
+    md,
+    "| 2026-10-03 12:00 UTC | retired | dry-run | **2** | 1 |",
+  );
+  assertStringIncludes(
+    md,
+    "<details><summary>2026-10-04 12:00 — retired (live)</summary>",
+  );
+  assertStringIncludes(md, "**Deleted**");
+  assertStringIncludes(md, "**Would delete**");
+  assertStringIncludes(md, "| Host | Record | Spec |");
+  assertStringIncludes(md, "| old1 | run-osUpdate-old1-1 | run |");
+  assertStringIncludes(
+    md,
+    "| old1 | snap-old1-1 | active snapshot record: the snapshot may still exist |",
+  );
+  assertEquals(
+    (res.json.runs as Array<{ kind: string }>).map((r) => r.kind),
+    ["retired", "retired"],
+  );
+});
