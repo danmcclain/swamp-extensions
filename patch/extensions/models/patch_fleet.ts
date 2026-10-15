@@ -254,8 +254,8 @@ const Machine = z.object({
   os: z.boolean().default(true).describe("Collect OS package status"),
   health: z.array(HealthCheck).default([]).describe(
     "Health checks used as the healthyAfter verdict for OS update / reboot / docker. " +
-      "Every listed check must pass. Empty = reachability fallback. A source:community-script " +
-      "CT with no checks derives them from its updater model (healthUrl + service).",
+      "Every listed check must pass. Empty = reachability fallback. A machine with no checks " +
+      "but a `source` updater derives them from that updater model's healthUrl + service globalArgs.",
   ),
   reach: z.enum(["ssh", "pct"]).optional().describe(
     "How to run the OS scan: ssh (via sshModel) or pct (via the node, for CTs). " +
@@ -269,14 +269,33 @@ const Machine = z.object({
     "Marks a Proxmox CT and its location for pct exec — scan, OS update (with capture), and reboot. " +
       "A plain CT needs only this; no app source required.",
   ),
+  // ── Pluggable app updater ───────────────────────────────────────────────
+  // `source.model` names ANY model instance that implements the updater
+  // contract; @dmc/patch delegates to it by name via runModel and never needs
+  // its type. Consumers add their own update mechanism without changing
+  // @dmc/patch. Updater contract — the referenced model MUST expose:
+  //   • checkUpdate()                   — `scan` fires this to report availability.
+  //   • safeUpdate({ snapshot?: bool }) — guarded app update. When @dmc/patch
+  //       owns the snapshot it passes { snapshot: false } so the updater takes
+  //       none of its own; an updater that ignores the arg still works.
+  // Optional, for health derivation when the machine lists no `health`:
+  //   • globalArguments.healthUrl / healthExpectStatus / service
   source: z.object({
-    type: z.enum(["community-script"]).describe("App update mechanism"),
+    type: z.string().min(1).optional().describe(
+      "Optional label for the update mechanism (e.g. \"community-script\", " +
+        "\"swamp-binary\"). Documentation only — @dmc/patch does not branch on it.",
+    ),
     model: z.string().min(1).describe(
-      "The updater instance (e.g. a @dmc/proxmox/community-script)",
+      "The updater model instance to delegate to. ANY model that implements the " +
+        "updater contract works: a `checkUpdate` method, a `safeUpdate({ snapshot? })` " +
+        "method, and optionally `healthUrl`/`healthExpectStatus`/`service` globalArgs " +
+        "for health derivation. E.g. a @dmc/proxmox/community-script instance.",
     ),
   }).optional().describe(
-    "Optional in-CT app updater on top of the OS lifecycle: version check + safe app update. " +
-      "Its presence is what triggers app-update delegation — not merely being a CT.",
+    "Optional app updater on top of the OS lifecycle: version check + safe app " +
+      "update, delegated to `source.model`. Its presence is what triggers " +
+      "app-update delegation — not merely being a CT. The model is reached by name; " +
+      "its type is irrelevant, so you can plug in your own updater.",
   ),
   proxmox: z.object({
     model: z.string().min(1).describe(
@@ -1014,7 +1033,7 @@ export function utf8b64(s: string): string {
 export interface MachineShape {
   host: string;
   ct?: { proxmoxNode: string; ctid: number };
-  source?: { type: string; model: string };
+  source?: { type?: string; model: string };
   proxmox?: { model: string };
   vm?: { proxmoxNode: string; vmid: number };
   reach?: "ssh" | "pct";
@@ -1026,9 +1045,12 @@ export function isCtMachine(m: MachineShape): boolean {
   return !!m.ct || (!m.vm && (m.reach === "pct" || !!m.proxmox?.model));
 }
 
-/** The community-script app-updater instance for a machine, or null. */
+/** The app-updater model instance for a machine, or null. Any `source.model` is
+ *  honoured regardless of `source.type` (the type is a documentation label only),
+ *  so consumers can plug in their own updater. The legacy `proxmox.model` ref is
+ *  still accepted as a fallback. */
 export function appSource(m: MachineShape): string | null {
-  if (m.source?.type === "community-script") return m.source.model;
+  if (m.source?.model) return m.source.model;
   if (m.proxmox?.model) return m.proxmox.model; // legacy
   return null;
 }

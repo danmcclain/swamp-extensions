@@ -528,18 +528,30 @@ Deno.test("schema: bad ct, source, reach, vm and host values are rejected", () =
   assertThrows(() =>
     parseMachine({ host: "c", ct: { proxmoxNode: "pve", ctid: 1.5 } })
   );
-  assertThrows(() =>
-    parseMachine({ host: "c", source: { type: "github-release", model: "m" } })
-  );
+  // An empty updater model is still rejected (model is required, min(1)) ...
   assertThrows(() =>
     parseMachine({ host: "c", source: { type: "community-script", model: "" } })
   );
+  assertThrows(() => parseMachine({ host: "c", source: { model: "" } }));
   assertThrows(() => parseMachine({ host: "c", reach: "winrm" }));
   assertThrows(() =>
     parseMachine({ host: "v", vm: { proxmoxNode: "pve", vmid: "100" } })
   );
   assertThrows(() => parseMachine({ host: "" }));
   assertThrows(() => parseMachine({}));
+});
+
+Deno.test("schema: source is pluggable — any updater type/model is accepted, type optional", () => {
+  // A non-community-script updater is valid; `source.model` is reached by name.
+  const a = parseMachine({
+    host: "c",
+    source: { type: "swamp-binary", model: "serve-updater" },
+  });
+  assertEquals(a.source?.model, "serve-updater");
+  // `type` is an optional documentation label.
+  const b = parseMachine({ host: "c", source: { model: "any-updater" } });
+  assertEquals(b.source?.model, "any-updater");
+  assertEquals(b.source?.type, undefined);
 });
 
 Deno.test("schema: docker decoration defaults healthExpectStatus to 200", () => {
@@ -759,11 +771,13 @@ Deno.test("appSource prefers source, falls back to legacy proxmox, else null", (
     fleet.appSource({ host: "a", ct: { proxmoxNode: "pve", ctid: 1 } }),
     null,
   );
-  // An unknown source type gives no source.
+  // Any source.model is honoured regardless of type (pluggable updater).
   assertEquals(
     fleet.appSource({ host: "a", source: { type: "other", model: "m" } }),
-    null,
+    "m",
   );
+  // ...and with no type label at all.
+  assertEquals(fleet.appSource({ host: "a", source: { model: "m2" } }), "m2");
 });
 
 Deno.test("ctLocation reads the ct decoration without calling swamp", async () => {
