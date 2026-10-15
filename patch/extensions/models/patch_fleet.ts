@@ -1220,6 +1220,9 @@ export async function evalHealth(
         });
         ok = res.status === c.expectStatus;
         detail = `status ${res.status}`;
+        // We only need the status; cancel the body so the connection does not
+        // leak (also satisfies the test leak sanitizer).
+        await res.body?.cancel();
       } catch (e) {
         detail = `fetch failed: ${(e as Error).message.slice(0, 60)}`;
       } finally {
@@ -2380,7 +2383,10 @@ export const model = {
                 signal: ctrl.signal,
                 redirect: "manual",
               });
-              return r.status === dcfg.healthExpectStatus ? true : null;
+              const healthy = r.status === dcfg.healthExpectStatus;
+              // Cancel the body so the connection does not leak.
+              await r.body?.cancel();
+              return healthy ? true : null;
             } catch {
               return null;
             } finally {
