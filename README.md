@@ -15,6 +15,7 @@ loads independently.
 | `@dmc/unifi-networks`  | model + reports | Query UniFi Network sites (VLANs, firewall zones/policies, clients, WiFi) via the official integration API, mapped together, with firewall-summary and zone-matrix reports. See [unifi-networks/README.md](unifi-networks/README.md). |
 | `@dmc/proxmox`         | models        | Proxmox VE VM/LXC lifecycle operations, cloud-image storage, and snapshot-guarded updates for community-scripts LXCs, extending the `@keeb/proxmox` family. See [proxmox/README.md](proxmox/README.md). |
 | `@dmc/fastmail`        | model + reports | Fastmail email-organization pipeline over JMAP — scan senders (flagging bulk/newsletter mail), generate Sieve scripts sorting senders into folders, and plan/apply moves, with audit, coverage, and plan reports. See [fastmail/README.md](fastmail/README.md). |
+| `@dmc/patch`           | model + reports | Agentless fleet patch management over `@swamp/ssh` — scan Proxmox VMs/CTs, bare metal and VPSs for pending updates, apply them snapshot-guarded and health-checked with automatic rollback, and keep an auditable history. App updaters and snapshotters are pluggable: bring your own model without upstreaming it. See [patch/README.md](patch/README.md). |
 
 ## Layout
 
@@ -41,6 +42,13 @@ swamp-extensions/            # this repo (umbrella container)
     extensions/
       models/                # fastmail.ts
       reports/               # fastmail_audit.ts, fastmail_coverage.ts, fastmail_plan.ts
+  patch/                     # model + reports (fleet patching; depends on @swamp/ssh, @dmc/proxmox, @keeb/proxmox)
+    .swamp.yaml
+    manifest.yaml
+    README.md  LICENSE.md  deno.json
+    extensions/
+      models/                # patch_fleet.ts (+ testdata/fake_swamp.sh for its tests)
+      reports/               # patch_status.ts, patch_history.ts, patch_prune_history.ts
   <next-extension>/          # add more extensions the same way
 ```
 
