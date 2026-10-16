@@ -4228,3 +4228,423 @@ Deno.test("own data: readOwnRecords reads by model id, filters by specName tag, 
   const both = await fleet.readOwnRecords(ctx, ["snapshot", "image"]);
   assertEquals(both.map((r) => r.name), ["a", "b"]);
 });
+
+// --- pluggable snapshotter ------------------------------------------------------
+// Snapshot, rollback and cleanup are one contract. The built-in proxmox-vm / proxmox-ct
+// snapshotters are covered by the safeOsUpdate / rollback / pruneSnapshots tests above
+// (they pin the exact Proxmox calls). These cover the selection rules and the pluggable
+// `snapshotter` model.
+
+/** A record of a snapshot taken by the snapshotter model "zfs". */
+const MODEL_SNAP = {
+  kind: "model",
+  vmid: null,
+  proxmoxNode: null,
+  snapshotter: { kind: "model", model: "zfs" },
+};
+
+Deno.test("schema: a machine takes a snapshotter decoration; its model must be non-empty", () => {
+  const m = parseMachine({ host: "b", snapshotter: { model: "zfs" } });
+  assertEquals(m.snapshotter?.model, "zfs");
+  assertThrows(() => parseMachine({ host: "b", snapshotter: { model: "" } }));
+});
+
+Deno.test("snapshotterRefFor: an explicit snapshotter wins, then vm, then a CT location, else none", () => {
+  const vm = { proxmoxNode: "pve", vmid: 100 };
+  assertEquals(
+    fleet.snapshotterRefFor({ host: "a", vm, snapshotter: { model: "zfs" } }),
+    { kind: "model", model: "zfs" },
+  );
+  assertEquals(fleet.snapshotterRefFor({ host: "a", vm }), {
+    kind: "proxmox-vm",
+    node: "pve",
+    vmid: 100,
+  });
+  assertEquals(
+    fleet.snapshotterRefFor({ host: "a" }, { node: "pve", ctid: 200 }),
+    { kind: "proxmox-ct", node: "pve", ctid: 200 },
+  );
+  assertEquals(fleet.snapshotterRefFor({ host: "a" }), null);
+});
+
+Deno.test("snapshotterRefFromRecord: a recorded snapshotter wins; older vm/ct records map from their fields", () => {
+  const rec = (over: Record<string, unknown>) =>
+    model.resources.snapshot.schema.parse({ ...SNAPSHOT, ...over });
+  assertEquals(fleet.snapshotterRefFromRecord(rec(MODEL_SNAP)), {
+    kind: "model",
+    model: "zfs",
+  });
+  assertEquals(fleet.snapshotterRefFromRecord(rec({})), {
+    kind: "proxmox-vm",
+    node: "pve",
+    vmid: 100,
+  });
+  assertEquals(
+    fleet.snapshotterRefFromRecord(
+      rec({ kind: "ct", vmid: 200, proxmoxNode: "node1" }),
+    ),
+    { kind: "proxmox-ct", node: "node1", ctid: 200 },
+  );
+  // A model record that lost its snapshotter names nothing to dispatch to.
+  assertThrows(() =>
+    fleet.snapshotterRefFromRecord(
+      rec({ kind: "model", vmid: null, proxmoxNode: null }),
+    )
+  );
+});
+
+Deno.test("snapshotRecordLocation: every snapshotter writes a valid record that leads back to it", () => {
+  for (
+    const ref of [
+      { kind: "proxmox-vm" as const, node: "pve", vmid: 100 },
+      { kind: "proxmox-ct" as const, node: "pve", ctid: 200 },
+      { kind: "model" as const, model: "zfs" },
+    ]
+  ) {
+    const a = model.resources.snapshot.schema.parse({
+      ...SNAPSHOT,
+      ...fleet.snapshotRecordLocation(ref),
+    });
+    assertEquals(fleet.snapshotterRefFromRecord(a), ref);
+  }
+  // Proxmox records keep the plain location fields.
+  assertEquals(
+    fleet.snapshotRecordLocation({ kind: "proxmox-ct", node: "pve", ctid: 200 }),
+    {
+      kind: "ct",
+      vmid: 200,
+      proxmoxNode: "pve",
+      snapshotter: { kind: "proxmox-ct", node: "pve", ctid: 200 },
+    },
+  );
+});
+
+Deno.test("snapshotterFor(model): drives the snapshotter contract by name with { host, name }", async () => {
+  const s = stubSwamp([
+    { ok: true },
+    { ok: true },
+    { ok: true },
+    {
+      ok: true,
+      artifacts: [{
+        snapshots: [{ name: "preupdate-1" }, { name: "current" }],
+      }],
+    },
+  ]);
+  const snapper = fleet.snapshotterFor(
+    { kind: "model", model: "zfs" },
+    { sshModel: "ssh", swamp: s.api, host: "web1" },
+  );
+  assertEquals(await snapper.snapshot("preupdate-1"), true);
+  assertEquals(await snapper.rollback("preupdate-1"), true);
+  assertEquals(await snapper.delete("preupdate-1"), true);
+  assertEquals(await snapper.list(), ["preupdate-1"]);
+  const args = { host: "web1", name: "preupdate-1" };
+  assertEquals(s.calls, [
+    { model: "zfs", method: "snapshot", args },
+    { model: "zfs", method: "rollback", args },
+    { model: "zfs", method: "deleteSnapshot", args },
+    { model: "zfs", method: "listSnapshots", args: { host: "web1" } },
+  ]);
+  assertStringIncludes(snapper.where, 'snapshotter model "zfs"');
+});
+
+Deno.test("snapshotterFor(model): a failed run is false and warned; a failed list throws", async () => {
+  const s = stubSwamp([{ ok: false, error: "pool is full" }]);
+  const l = collectLogger();
+  const snapper = fleet.snapshotterFor(
+    { kind: "model", model: "zfs" },
+    { sshModel: "ssh", swamp: s.api, host: "web1", logger: l.logger },
+  );
+  assertEquals(await snapper.snapshot("p"), false);
+  assertStringIncludes(JSON.stringify(l.lines), "pool is full");
+  await assertRejects(() => snapper.list(), Error, "pool is full");
+});
+
+Deno.test("snapshotterFor(proxmox-vm): issues snapshotVm / rollbackVm / deleteVmSnapshot on the node model", async () => {
+  const s = stubSwamp([{ ok: true }]);
+  const snapper = fleet.snapshotterFor(
+    { kind: "proxmox-vm", node: "pve", vmid: 100 },
+    { sshModel: "ssh", swamp: s.api, host: "web1" },
+  );
+  await snapper.snapshot("p");
+  await snapper.rollback("p");
+  await snapper.delete("p");
+  assertEquals(s.calls.map((c) => [c.model, c.method, c.args]), [
+    ["pve", "snapshotVm", { vmid: 100, name: "p" }],
+    ["pve", "rollbackVm", { vmid: 100, name: "p" }],
+    ["pve", "deleteVmSnapshot", { vmid: 100, name: "p" }],
+  ]);
+});
+
+Deno.test("safeOsUpdate: a snapshotter guards bare metal — the model takes the snapshot and the record names it", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog(osUpdateEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          snapshotter: { model: "zfs" },
+          health: [{ type: "http", url: server.url }],
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const all = await calls();
+      const taken = all.filter((c) => c.startsWith("zfs snapshot "));
+      assertEquals(taken.length, 1);
+      assertStringIncludes(taken[0], "--input host=web1");
+      assertStringIncludes(taken[0], "--input name=preupdate-");
+      assertEquals(
+        all.some((c) => c.includes(" snapshotVm ") || c.includes("pct snapshot")),
+        false,
+      );
+      const os = t.one("osUpdate");
+      assertEquals(os.kind, "bare-metal");
+      assertEquals(os.snapshotKept, true);
+      assertEquals(os.rolledBack, false);
+      const rec = t.one("snapshot");
+      assertEquals(rec.kind, "model");
+      assertEquals(rec.vmid, null);
+      assertEquals(rec.snapshotter, { kind: "model", model: "zfs" });
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate: a VM with a snapshotter is snapshotted and rolled back by the model, not the node", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withCallLog(osUpdateEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          vm: { proxmoxNode: "pve", vmid: 100 },
+          snapshotter: { model: "zfs" },
+          health: [{ type: "http", url: server.url }],
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const all = await calls();
+      assertEquals(all.filter((c) => c.startsWith("zfs snapshot ")).length, 1);
+      assertEquals(all.filter((c) => c.startsWith("zfs rollback ")).length, 1);
+      assertEquals(
+        all.some((c) => c.includes(" snapshotVm ") || c.includes(" rollbackVm ")),
+        false,
+      );
+      assertEquals(t.one("osUpdate").outcome, "rolled-back");
+      assertEquals(t.one("osUpdate").rolledBack, true);
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate: a failed snapshotter snapshot aborts the update before the upgrade", async () => {
+  await withCallLog(
+    { ...osUpdateEnv(), FAKE_SWAMP_SNAPSHOT_RC: "1" },
+    async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{ host: "web1", snapshotter: { model: "zfs" } }],
+      });
+      await assertRejects(
+        () =>
+          model.methods.safeOsUpdate.execute(
+            model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+            t.ctx,
+          ),
+        Error,
+        'snapshotter model "zfs" failed to snapshot web1',
+      );
+      assertEquals(
+        (await calls()).some((c) => c.includes("apt-get -y upgrade")),
+        false,
+      );
+    },
+  );
+});
+
+Deno.test("safeOsUpdate: a CT with a snapshotter snapshots via the model, not pct, and the app source still runs", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog(ctAppEnv(), async (calls) => {
+      const base = ctAppFleet(server.url);
+      const t = mkCtx({
+        ...base,
+        machines: [{ ...base.machines[0], snapshotter: { model: "zfs" } }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({ host: "ct1" }),
+        t.ctx,
+      );
+      const all = await calls();
+      assertEquals(all.filter((c) => c.startsWith("zfs snapshot ")).length, 1);
+      assertEquals(all.some((c) => c.includes("pct snapshot")), false);
+      // One snapshot guards both: the app source is still told not to snapshot.
+      assertEquals(appCalls(all).length, 1);
+      assertEquals(t.one("snapshot").snapshotter, {
+        kind: "model",
+        model: "zfs",
+      });
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("rollback: a snapshot is rolled back by the snapshotter that took it, from the record", async () => {
+  // The machine is no longer decorated with the snapshotter; the record still names it.
+  await withCallLog({}, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, {
+      data: { snapshot: [snapDatum("s-m", MODEL_SNAP)] },
+    });
+    await model.methods.rollback.execute(
+      model.methods.rollback.arguments.parse({ host: "web1" }),
+      t.ctx,
+    );
+    const rb = (await calls()).filter((c) => c.startsWith("zfs rollback "));
+    assertEquals(rb.length, 1);
+    assertStringIncludes(rb[0], "--input host=web1");
+    assertStringIncludes(rb[0], "--input name=preupdate-1");
+    assertEquals(t.one("run").rolledBack, true);
+  });
+});
+
+Deno.test("pruneSnapshots: a snapshotter model's snapshot is deleted by that model (deleteSnapshot)", async () => {
+  await withCallLog({ FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW }, async (calls) => {
+    const dry = mkCtx(FLEET, {
+      data: { snapshot: [snapDatum("s-m", MODEL_SNAP)] },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({ dryRun: true }),
+      dry.ctx,
+    );
+    assertEquals(dry.one("prune").pruned, [
+      { host: "web1", name: "preupdate-1", detail: "model:zfs" },
+    ]);
+
+    const t = mkCtx(FLEET, {
+      data: { snapshot: [snapDatum("s-m", MODEL_SNAP)] },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({}),
+      t.ctx,
+    );
+    const del = (await calls()).filter((c) =>
+      c.startsWith("zfs deleteSnapshot ")
+    );
+    assertEquals(del.length, 1);
+    assertStringIncludes(del[0], "--input name=preupdate-1");
+    assertEquals(t.one("prune").pruned, [
+      { host: "web1", name: "preupdate-1", detail: "model:zfs" },
+    ]);
+    assertEquals(t.one("snapshot").status, "pruned");
+  });
+});
+
+// --- pluggable updater on every machine kind -----------------------------------
+
+Deno.test("runSourceSafeUpdate: on an unguarded machine the updater is called with no arguments, once", async () => {
+  const s = stubSwamp([{ ok: true }]);
+  const l = collectLogger();
+  assertEquals(
+    await fleet.runSourceSafeUpdate("upd", s.api, l.logger, {
+      patchOwnsSnapshot: false,
+    }),
+    true,
+  );
+  assertEquals(s.calls, [{ model: "upd", method: "safeUpdate", args: {} }]);
+});
+
+/** safeOsUpdate of `web1` over ssh with an updater; returns the updater's call lines. */
+async function sshUpdaterCalls(machine: Record<string, unknown>) {
+  const server = startServer(() => 200);
+  try {
+    return await withCallLog(osUpdateEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          source: { type: "swamp-binary", model: "upd" },
+          health: [{ type: "http", url: server.url }],
+          ...machine,
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      assertStringIncludes(String(t.one("osUpdate").logs), "app upd: ok");
+      return (await calls()).filter((c) => c.startsWith("upd safeUpdate "));
+    });
+  } finally {
+    await server.stop();
+  }
+}
+
+Deno.test("safeOsUpdate: a VM's source updater runs under the VM snapshot, told snapshot:false", async () => {
+  const app = await sshUpdaterCalls({ vm: { proxmoxNode: "pve", vmid: 100 } });
+  assertEquals(app.length, 1);
+  assertStringIncludes(app[0], "--input snapshot:json=false");
+});
+
+Deno.test("safeOsUpdate: a bare-metal source updater with a snapshotter is told snapshot:false", async () => {
+  const app = await sshUpdaterCalls({ snapshotter: { model: "zfs" } });
+  assertEquals(app.length, 1);
+  assertStringIncludes(app[0], "--input snapshot:json=false");
+});
+
+Deno.test("safeOsUpdate: an unguarded bare-metal source updater is called with no snapshot argument", async () => {
+  const app = await sshUpdaterCalls({});
+  assertEquals(app.length, 1);
+  assertEquals(app[0].includes("snapshot"), false);
+});
+
+Deno.test("snapshot-target-resolves: a snapshotter is checked with its listSnapshots, also on bare metal", async () => {
+  const withSnapper = {
+    sshModel: "ssh",
+    machines: [{ host: "b", snapshotter: { model: "zfs" } }],
+  };
+  await withFake({ FAKE_SWAMP_SNAPLIST: snaps("preupdate-1") }, async () => {
+    for (const method of ["safeOsUpdate", "pruneSnapshots", "rollback"]) {
+      assertEquals(
+        await runCheck(
+          "snapshot-target-resolves",
+          checkCtx(withSnapper, method, { host: "b" }),
+        ),
+        { pass: true },
+      );
+    }
+    const r = await runCheck(
+      "snapshot-target-resolves",
+      checkCtx(withSnapper, "rollback", { host: "b", snapshot: "missing" }),
+    );
+    assertEquals(r.pass, false);
+  });
+  await withFake({ FAKE_SWAMP_SNAPLIST_RC: "1" }, async () => {
+    const r = await runCheck(
+      "snapshot-target-resolves",
+      checkCtx(withSnapper, "safeOsUpdate", { host: "b" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(r.errors!.join(" "), 'snapshotter model "zfs"');
+  });
+});
