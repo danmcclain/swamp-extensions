@@ -2865,7 +2865,9 @@ export const model = {
             "How long the pre-update snapshot is retained as a rollback point before pruneSnapshots may delete it (default 7 days). The snapshot is never auto-deleted.",
           ),
         rollbackOnFailure: z.boolean().default(true).describe(
-          "Roll back when the machine is unhealthy after the upgrade",
+          "Roll back to the pre-update snapshot when the machine is unhealthy after the " +
+            "update, whatever the upgrade's exit code. Applies to every machine kind that " +
+            "has a snapshot guard. false = keep the unhealthy machine as-is (outcome failed).",
         ),
         healthGraceSec: z.number().int().min(0).default(120).describe(
           "Grace window for the post-update health check. While the machine is unhealthy, re-check every 10 s until healthy or this many seconds have passed (a docker-ce upgrade restarts every container). 0 = check once.",
@@ -3041,7 +3043,9 @@ export const model = {
           if (src) {
             // This method owns the snapshot (taken above) and the rollback, so the
             // source must not take a second, untracked snapshot.
-            const ok = await runSourceSafeUpdate(src, swamp, context.logger);
+            const ok = await runSourceSafeUpdate(src, swamp, context.logger, {
+              patchOwnsSnapshot: true,
+            });
             appNote = `; app ${src}: ${ok ? "ok" : "failed"}`;
             log(`app source ${src} safeUpdate: ${ok ? "ok" : "failed"}`);
           }
@@ -3057,27 +3061,34 @@ export const model = {
             : null;
           if (pkgs) log(`packages changed: ${pkgs.length}`);
 
+          // Outcome — the same decision as the VM / bare-metal path (see there).
           let ctOutcome: z.infer<typeof OsUpdateResult>["outcome"];
           let rolledBack = false;
-          if (!healthy) {
+          if (!healthy && args.rollbackOnFailure) {
             log(`unhealthy after update — rolling back to ${snap}`);
             rolledBack = await snapper.rollback(snap);
             ctOutcome = "rolled-back";
             log(
               rolledBack
                 ? `rolled back to ${snap}`
-                : `ROLLBACK FAILED — snapshot ${snap} kept`,
+                : `ROLLBACK FAILED — snapshot ${snap} kept for manual recovery`,
             );
+          } else if (!healthy) {
+            ctOutcome = "failed";
+            log("unhealthy — rollback disabled; snapshot retained");
           } else if (up.rc !== 0) {
-            ctOutcome = "failed"; // upgrade failed but CT is up — no rollback, snapshot retained
+            ctOutcome = "failed";
             log(
-              "upgrade command failed — CT healthy, no rollback; snapshot retained",
+              "upgrade command failed — machine healthy, no rollback; snapshot retained",
             );
           } else {
+            // `after` can be null while health checks pass (the rescan failed, the app
+            // answers): count it as no updates left, like the VM / bare-metal path.
             ctOutcome =
-              (before.updatesCount ?? 0) !== (after!.updatesCount ?? 0)
+              (before.updatesCount ?? 0) !== (after?.updatesCount ?? 0)
                 ? "updated"
                 : "no-change";
+            log(`healthy after (${after?.updatesCount ?? "?"} updates left)`);
           }
 
           const runTs = new Date().toISOString();
@@ -3092,7 +3103,8 @@ export const model = {
               mode: args.mode,
               outcome: ctOutcome,
               snapshot: snap,
-              snapshotKept: !rolledBack,
+              // A rollback reverts to the snapshot; it does not delete it.
+              snapshotKept: true,
               beforeUpdates: before.updatesCount ?? null,
               afterUpdates: after?.updatesCount ?? null,
               healthyAfter: healthy,
@@ -3122,29 +3134,28 @@ export const model = {
               },
             ),
           ];
-          // Track the CT snapshot for retention/prune (unless a rollback already consumed it).
-          if (!rolledBack) {
-            dataHandles.push(
-              await context.writeResource(
-                "snapshot",
-                `snap-${args.host}-${snapCreatedAt.replace(/[:.]/g, "-")}`,
-                {
-                  host: args.host,
-                  ...snapshotRecordLocation(snapper.ref),
-                  name: snap,
-                  reason: "safeOsUpdate",
-                  createdAt: snapCreatedAt,
-                  retainUntil,
-                  healthConfirmed: healthy,
-                  rebootRequired: after?.needsReboot ?? false,
-                  rebootConfirmed: false,
-                  status: "active",
-                  prunedAt: null,
-                },
-              ),
-            );
-            log(`snapshot ${snap} retained until ${retainUntil}`);
-          }
+          // Track the snapshot for retention/prune — also after a rollback: rolling back
+          // does not delete the snapshot, and an untracked snapshot is never pruned.
+          dataHandles.push(
+            await context.writeResource(
+              "snapshot",
+              `snap-${args.host}-${snapCreatedAt.replace(/[:.]/g, "-")}`,
+              {
+                host: args.host,
+                ...snapshotRecordLocation(snapper.ref),
+                name: snap,
+                reason: "safeOsUpdate",
+                createdAt: snapCreatedAt,
+                retainUntil,
+                healthConfirmed: healthy,
+                rebootRequired: after?.needsReboot ?? false,
+                rebootConfirmed: false,
+                status: "active",
+                prunedAt: null,
+              },
+            ),
+          );
+          log(`snapshot ${snap} retained until ${retainUntil}`);
           if (after) {
             dataHandles.push(
               await context.writeResource("inventory", args.host, {
@@ -3262,18 +3273,13 @@ export const model = {
         const after = await scanHost();
         const healthy = await afterHealthy(after !== null);
 
-        if (up.rc !== 0) {
-          // The upgrade command failed but the host is still up — do NOT roll back.
-          outcome = "failed";
-          log(
-            "upgrade command failed — host left as-is, no rollback; snapshot retained",
-          );
-        } else if (healthy) {
-          outcome = (before.updatesCount ?? 0) !== (after?.updatesCount ?? 0)
-            ? "updated"
-            : "no-change";
-          log(`healthy after (${after?.updatesCount ?? "?"} updates left)`);
-        } else if (snapper && snap && args.rollbackOnFailure) {
+        // Outcome — health first, the same for every machine kind (the CT path too):
+        //   unhealthy + snapshot + rollbackOnFailure → roll back       → rolled-back
+        //   unhealthy, otherwise                     → keep as-is      → failed
+        //   healthy, but the upgrade command failed  → no rollback     → failed
+        //   healthy                                  → updated / no-change
+        // An unhealthy machine is rolled back whatever the upgrade's exit code.
+        if (!healthy && snapper && snap && args.rollbackOnFailure) {
           log(`unhealthy after upgrade — rolling back to ${snap}`);
           rolledBack = await snapper.rollback(snap);
           outcome = "rolled-back";
@@ -3282,13 +3288,25 @@ export const model = {
               ? `rolled back to ${snap}`
               : `ROLLBACK FAILED — snapshot ${snap} kept for manual recovery`,
           );
-        } else {
+        } else if (!healthy) {
           outcome = "failed";
           log(
             snapper
               ? "unhealthy — rollback disabled; snapshot retained"
               : "unhealthy after upgrade (bare metal, no snapshot)",
           );
+        } else if (up.rc !== 0) {
+          outcome = "failed";
+          log(
+            `upgrade command failed — machine healthy, no rollback${
+              snapper ? "; snapshot retained" : ""
+            }`,
+          );
+        } else {
+          outcome = (before.updatesCount ?? 0) !== (after?.updatesCount ?? 0)
+            ? "updated"
+            : "no-change";
+          log(`healthy after (${after?.updatesCount ?? "?"} updates left)`);
         }
 
         // What changed: diff the installed-package manifest before vs after.

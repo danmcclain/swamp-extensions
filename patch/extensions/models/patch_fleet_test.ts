@@ -4557,6 +4557,187 @@ Deno.test("pruneSnapshots: a snapshotter model's snapshot is deleted by that mod
   });
 });
 
+// --- safeOsUpdate outcome: the CT path decides exactly like the VM / bare path -----
+// Health first: unhealthy + snapshot + rollbackOnFailure → rolled-back; unhealthy
+// otherwise → failed; healthy but the upgrade failed → failed; healthy → updated.
+
+/** A plain CT (no app source) with one http health check. */
+function plainCtFleet(healthUrl: string) {
+  return {
+    sshModel: "ssh",
+    machines: [{
+      host: "ct1",
+      ct: { proxmoxNode: "pve", ctid: 200 },
+      health: [{ type: "http", label: "app", url: healthUrl }],
+    }],
+  };
+}
+
+/**
+ * Run safeOsUpdate on the plain CT against a health server answering `status`.
+ * The CT path's script calls alternate _1/_2: before-scan, package list, upgrade,
+ * after-scan, package list. So _1 carries the upgrade's exit code (`upgradeRc`) and
+ * _2 the after-scan (`after`; pass a marker-less stdout to make the rescan fail).
+ */
+async function ctOutcome(
+  status: number,
+  args: Record<string, unknown> = {},
+  opts: { upgradeRc?: number; after?: string } = {},
+) {
+  const server = startServer(() => status);
+  try {
+    return await withCallLog({
+      FAKE_SWAMP_SCRIPT_1: scriptOut(
+        "pve",
+        collectorStdout(),
+        opts.upgradeRc ?? 0,
+      ),
+      FAKE_SWAMP_SCRIPT_2: scriptOut(
+        "pve",
+        opts.after ?? collectorStdout({ updatesCount: 0 }),
+      ),
+      FAKE_SWAMP_EXEC: execOut(""),
+    }, async (calls) => {
+      const t = mkCtx(plainCtFleet(server.url));
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "ct1",
+          healthGraceSec: 0,
+          ...args,
+        }),
+        t.ctx,
+      );
+      const all = await calls();
+      const snaps = t.written("snapshot");
+      return {
+        os: t.one("osUpdate"),
+        snapshotRecords: snaps.length,
+        snap: (snaps[0]?.data ?? {}) as Record<string, unknown>,
+        rollbacks: all.filter((c) => c.includes("pct rollback 200 preupdate-")),
+      };
+    });
+  } finally {
+    await server.stop();
+  }
+}
+
+Deno.test("safeOsUpdate CT: healthy after the update → updated, snapshot retained and health-confirmed", async () => {
+  const r = await ctOutcome(200);
+  assertEquals(r.os.outcome, "updated");
+  assertEquals(r.os.rolledBack, false);
+  assertEquals(r.rollbacks.length, 0);
+  assertEquals(r.snap.healthConfirmed, true);
+  assertStringIncludes(String(r.os.logs), "healthy after (0 updates left)");
+});
+
+Deno.test("safeOsUpdate CT: unhealthy → rolled back, and the snapshot is still tracked", async () => {
+  const r = await ctOutcome(503);
+  assertEquals(r.os.outcome, "rolled-back");
+  assertEquals(r.os.rolledBack, true);
+  assertEquals(r.rollbacks.length, 1);
+  // A rollback reverts to the snapshot but does not delete it: keep tracking it,
+  // or it is never pruned.
+  assertEquals(r.os.snapshotKept, true);
+  assertEquals(r.snapshotRecords, 1);
+  assertEquals(r.snap.healthConfirmed, false);
+  assertEquals(r.snap.status, "active");
+});
+
+Deno.test("safeOsUpdate CT: unhealthy with rollbackOnFailure=false → failed, NOT rolled back", async () => {
+  const r = await ctOutcome(503, { rollbackOnFailure: false });
+  assertEquals(r.os.outcome, "failed");
+  assertEquals(r.os.rolledBack, false);
+  assertEquals(r.rollbacks.length, 0);
+  assertStringIncludes(String(r.os.logs), "rollback disabled; snapshot retained");
+  assertEquals(r.snap.healthConfirmed, false);
+});
+
+Deno.test("safeOsUpdate CT: healthy but the upgrade command failed → failed, no rollback", async () => {
+  const r = await ctOutcome(200, {}, { upgradeRc: 1 });
+  assertEquals(r.os.outcome, "failed");
+  assertEquals(r.os.rolledBack, false);
+  assertEquals(r.rollbacks.length, 0);
+  assertStringIncludes(String(r.os.logs), "machine healthy, no rollback");
+});
+
+Deno.test("safeOsUpdate CT: unhealthy after a failed upgrade → rolled back (health decides first)", async () => {
+  const r = await ctOutcome(503, {}, { upgradeRc: 1 });
+  assertEquals(r.os.outcome, "rolled-back");
+  assertEquals(r.rollbacks.length, 1);
+});
+
+Deno.test("safeOsUpdate CT: healthy while the rescan fails does not crash", async () => {
+  const r = await ctOutcome(200, {}, { after: "no inventory here" });
+  assertEquals(r.os.healthyAfter, true);
+  assertEquals(r.os.rolledBack, false);
+  assertEquals(r.os.afterUpdates, null);
+});
+
+Deno.test("safeOsUpdate VM: unhealthy after a failed upgrade → rolled back (health decides first)", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withCallLog(
+      { ...osUpdateEnv(), FAKE_SWAMP_EXEC: execOut("", 1) },
+      async (calls) => {
+        const t = mkCtx({
+          sshModel: "ssh",
+          machines: [{
+            host: "web1",
+            vm: { proxmoxNode: "pve", vmid: 100 },
+            health: [{ type: "http", url: server.url }],
+          }],
+        });
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({
+            host: "web1",
+            healthGraceSec: 0,
+          }),
+          t.ctx,
+        );
+        assertEquals(t.one("osUpdate").outcome, "rolled-back");
+        assertEquals(
+          (await calls()).some((c) => c.includes(" rollbackVm ")),
+          true,
+        );
+      },
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate bare metal: a failed upgrade on an unguarded host does not claim a snapshot", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withFake(
+      { ...osUpdateEnv(), FAKE_SWAMP_EXEC: execOut("", 1) },
+      async () => {
+        const t = mkCtx({
+          sshModel: "ssh",
+          machines: [{
+            host: "web1",
+            health: [{ type: "http", url: server.url }],
+          }],
+        });
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({
+            host: "web1",
+            healthGraceSec: 0,
+          }),
+          t.ctx,
+        );
+        const os = t.one("osUpdate");
+        assertEquals(os.outcome, "failed");
+        assertEquals(os.snapshotKept, false);
+        assertStringIncludes(String(os.logs), "machine healthy, no rollback");
+        assertEquals(String(os.logs).includes("snapshot retained"), false);
+      },
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
 // --- pluggable updater on every machine kind -----------------------------------
 
 Deno.test("runSourceSafeUpdate: on an unguarded machine the updater is called with no arguments, once", async () => {

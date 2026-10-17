@@ -497,8 +497,8 @@ methods: {
 
 Arguments: `host`, `mode` (`safe` = `apt upgrade` / `full` = `apt full-upgrade`;
 dnf/apk always upgrade), `retentionHours` (default 168 = 7 days),
-`rollbackOnFailure` (default true), `healthGraceSec` (default 120, see
-[Health checks](#health-checks)).
+`rollbackOnFailure` (default true; applies to every machine kind with a snapshot
+guard), `healthGraceSec` (default 120, see [Health checks](#health-checks)).
 
 Before the method runs, its [pre-flight checks](#pre-flight-checks) gate it:
 `host-in-fleet`, `host-reachable`, `baseline-healthy` (health checks pass now) and
@@ -526,9 +526,21 @@ Flow, per machine type:
    take its own extra, untracked snapshot. Any other failure of the source is not
    retried.
 4. **Post-update health** — `healthyAfter` from the `health` checks (or
-   reachability when none), with the `healthGraceSec` grace window. Unhealthy
-   after the window → **roll back** through the same snapshotter; healthy →
-   **retain** the snapshot with the retention window.
+   reachability when none), with the `healthGraceSec` grace window. Then the
+   outcome, **health first**, the same for every machine kind (VM, CT, bare
+   metal):
+
+   | After the update | Action | `outcome` |
+   | ---------------- | ------ | --------- |
+   | Unhealthy, has a snapshot, `rollbackOnFailure` (default) | Roll back through the same snapshotter | `rolled-back` |
+   | Unhealthy, otherwise (`rollbackOnFailure: false`, or no snapshot guard) | Keep the machine as-is | `failed` |
+   | Healthy, but the upgrade command failed | No rollback | `failed` |
+   | Healthy | Keep | `updated` / `no-change` |
+
+   An unhealthy machine is rolled back whatever the upgrade's exit code. The
+   snapshot record is written in every case — also after a rollback, because a
+   rollback reverts to the snapshot but does not delete it. `pruneSnapshots`
+   deletes it later (only once it is health-confirmed).
 5. **Reboot is never automatic** — `needsReboot` is reported; you call `reboot`.
 
 ### Pre-flight checks
