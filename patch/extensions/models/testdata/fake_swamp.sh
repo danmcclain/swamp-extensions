@@ -19,6 +19,10 @@
 #       command with "dpkg-query"         prints FAKE_SWAMP_PKGS_1, then _2
 #   model method run M listVmSnapshots ...  prints FAKE_SWAMP_VMSNAPS, exit FAKE_SWAMP_VMSNAPS_RC (0)
 #   model method run M listGuests ...       prints FAKE_SWAMP_GUESTS, exit FAKE_SWAMP_GUESTS_RC (0)
+#   model method run M listSnapshots ...    (a pluggable snapshotter model) prints
+#                                           FAKE_SWAMP_SNAPLIST, exit FAKE_SWAMP_SNAPLIST_RC (0)
+#   model method run M snapshot ...         (a pluggable snapshotter model) exit
+#                                           FAKE_SWAMP_SNAPSHOT_RC (0)
 #   model method run M safeUpdate ... (the app source's updater; the test reads the call log)
 #       with "snapshot:json=false" and FAKE_SWAMP_APP_REJECT_SNAPSHOT set: prints swamp's
 #           "Unknown method input(s): snapshot" error on stderr, exit 1
@@ -128,6 +132,13 @@ if [ "$1" = "model" ] && [ "$2" = "method" ] && [ "$3" = "run" ]; then
     listGuests)
       printf '%s\n' "${FAKE_SWAMP_GUESTS-}"
       exit "${FAKE_SWAMP_GUESTS_RC:-0}"
+      ;;
+    listSnapshots)
+      printf '%s\n' "${FAKE_SWAMP_SNAPLIST-}"
+      exit "${FAKE_SWAMP_SNAPLIST_RC:-0}"
+      ;;
+    snapshot)
+      exit "${FAKE_SWAMP_SNAPSHOT_RC:-0}"
       ;;
     *)
       exit "${FAKE_SWAMP_METHOD_RC:-0}"

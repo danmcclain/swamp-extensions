@@ -19,6 +19,10 @@ containers) through a single `@swamp/ssh` model.
 - [The fleet model — `@dmc/patch/fleet`](#the-fleet-model--dmcpatchfleet)
   - [Machine decorations](#machine-decorations)
   - [Health checks](#health-checks)
+- [Extending `@dmc/patch` — your own updater and snapshotter](#extending-dmcpatch--your-own-updater-and-snapshotter)
+  - [Updater contract (`source`)](#updater-contract-source)
+  - [Snapshotter contract (`snapshotter`)](#snapshotter-contract-snapshotter)
+  - [Example](#example)
 - [Methods](#methods)
   - [Retired machines and `clearRetired`](#retired-machines-and-clearretired)
 - [Resources (data)](#resources-data)
@@ -41,7 +45,7 @@ model's methods act on it:
 | Layer | What it patches | Owned by |
 | ----- | --------------- | -------- |
 | **OS packages** | apt / dnf / apk inside the host or container | `@dmc/patch` (`ct` / `vm` / bare-metal path) |
-| **App version** | a versioned app inside a CT (e.g. Forgejo, a cache server) | a `source` updater (e.g. `@dmc/proxmox/community-script`) |
+| **App version** | a versioned app on the machine (e.g. Forgejo in a CT, a binary on a VM) | a `source` updater (e.g. `@dmc/proxmox/community-script`, or [your own](#extending-dmcpatch--your-own-updater-and-snapshotter)) |
 | **Docker images** | running compose containers | `@dmc/patch` (`docker` path) |
 
 The three layers are complementary — an app updater bumps the app binary, but the
@@ -68,6 +72,10 @@ give a full, queryable history.
 
 CTs are snapshot-guarded via `pct` directly (no node-model method needed).
 
+None of these is required for a mechanism you bring yourself: an app updater or a
+snapshotter can be any model that implements the contract — see
+[Extending `@dmc/patch`](#extending-dmcpatch--your-own-updater-and-snapshotter).
+
 ---
 
 ## How `@dmc/patch` reaches other models
@@ -75,8 +83,10 @@ CTs are snapshot-guarded via `pct` directly (no node-model method needed).
 The fleet does no ssh or Proxmox work itself. It calls the methods of other
 models: `<sshModel> exec` / `script`, the `vm.proxmoxNode` model
 (`snapshotVm`, `rollbackVm`, `listVmSnapshots`, `deleteVmSnapshot`), the
-`proxmoxNodes` models (`listGuests`, for `import`), and the `source` updater
-(`checkUpdate`, `safeUpdate`).
+`proxmoxNodes` models (`listGuests`, for `import`), the `source` updater
+(`checkUpdate`, `safeUpdate`), and the `snapshotter` model (`snapshot`,
+`rollback`, `deleteSnapshot`, `listSnapshots`). Updaters and snapshotters are
+reached by instance name; their type does not matter.
 
 **Methods** use swamp's in-process API. They never start the swamp CLI:
 
@@ -108,10 +118,11 @@ swamp model method run <model> <method> --json --quiet --repo-dir <repoDir> --in
 | ----- | ------------------------ |
 | `host-reachable` | `<sshModel> exec` (`true` on the host, or `pct status <ctid>` on the node of a CT) |
 | `baseline-healthy` | `<sshModel> script` (the machine's batched health checks; on the node through `pct exec` for a CT) |
-| `snapshot-target-resolves` | `<vm.proxmoxNode> listVmSnapshots` for a VM; `<sshModel> exec` (`pct listsnapshot <ctid>` on the node) for a CT |
+| `snapshot-target-resolves` | `<snapshotter.model> listSnapshots` when a `snapshotter` is set; else `<vm.proxmoxNode> listVmSnapshots` for a VM, or `<sshModel> exec` (`pct listsnapshot <ctid>` on the node) for a CT |
 
 - The model names come from the fleet's own `globalArguments` (`sshModel`,
-  `machines[].vm.proxmoxNode`). They are zod-validated strings.
+  `machines[].vm.proxmoxNode`, `machines[].snapshotter.model`). They are
+  zod-validated strings.
 - Every value is passed as a separate argv element (a string as `k=<v>`, any
   other value as `k:json=<JSON>`). No shell is involved.
 - No secret is passed. The arguments are host names, ids, timeouts and the
@@ -182,10 +193,15 @@ declares its nature:
     ctid: 701
   # (a plain host / VPS needs neither vm nor ct)
 
-  # --- optional app updater on top of the OS lifecycle ---
+  # --- optional app updater on top of the OS lifecycle (any machine kind) ---
   source:
-    type: community-script    # currently the only type
-    model: my-app             # a @dmc/proxmox/community-script instance
+    type: community-script    # optional label for readers; the fleet does not read it
+    model: my-app             # ANY model that implements the updater contract,
+                              # e.g. a @dmc/proxmox/community-script instance
+
+  # --- optional pluggable snapshot guard (overrides the built-in VM/CT snapshot) ---
+  snapshotter:
+    model: my-snapshots       # ANY model that implements the snapshotter contract
 
   # --- optional docker inspection / update ---
   docker:
@@ -207,7 +223,12 @@ Notes:
   are different kinds of reference.
 - A **plain CT** needs only `ct` — it gets scan + OS-patch-with-capture + reboot,
   no `source` required.
-- **`source`** is what triggers app-update delegation — *being a CT does not*.
+- **`source`** is what triggers app-update delegation — *being a CT does not*. It
+  works on every machine kind (VM, CT, bare metal), and the model can be any
+  updater you write ([updater contract](#updater-contract-source)).
+- **`snapshotter`** replaces the built-in snapshot guard (VM node model / CT
+  `pct`) with any model you write, and lets a bare-metal machine be
+  snapshot-guarded ([snapshotter contract](#snapshotter-contract-snapshotter)).
 - The deprecated **`proxmox: { model }`** is a legacy field that supplied both a
   CT's location and its app updater from one reference; still honoured as a
   fallback, but prefer `ct` + `source`.
@@ -276,9 +297,185 @@ read at check time and never enters the config, git, or logs. Example (a cache s
   run: 'cache-cli -a "$(cat /root/app.creds)" ping 2>/dev/null | grep -q PONG'
 ```
 
-**Deriving from a `source`:** a `source: community-script` CT with no explicit
-`health` derives `[http(healthUrl), service(service)]` from its updater model, so
-existing setups work without extra config, and you can override anytime.
+**Deriving from a `source`:** a machine with a `source` and no explicit `health`
+derives `[http(healthUrl), service(service)]` from the updater model's
+`healthUrl` / `healthExpectStatus` / `service` globalArguments (a
+community-script instance has them; your own updater may too), so existing setups
+work without extra config, and you can override anytime.
+
+---
+
+## Extending `@dmc/patch` — your own updater and snapshotter
+
+`@dmc/patch` has two extension points. Each one is a **contract**: you name a
+model instance on a machine, and the fleet calls that model's methods **by name**
+(through `runModel`). The fleet never needs the model's type. So you can add your
+own update or snapshot mechanism in your own repo, without changing or
+upstreaming anything to `@dmc/patch`.
+
+| Decoration | What it plugs in | Contract (methods your model exposes) |
+| ---------- | ---------------- | ------------------------------------- |
+| `source: { model }` | The app-update step, on top of the OS update | `checkUpdate`, `safeUpdate({ snapshot? })` |
+| `snapshotter: { model }` | The snapshot guard: snapshot → rollback → cleanup | `snapshot`, `rollback`, `deleteSnapshot`, `listSnapshots` |
+
+The built-in behavior is the same code path: the Proxmox VM and CT snapshots are
+two snapshotter implementations inside the fleet, and
+`@dmc/proxmox/community-script` is one updater.
+
+### Updater contract (`source`)
+
+| Method | Arguments | Called by | Your model must |
+| ------ | --------- | --------- | --------------- |
+| `checkUpdate` | none | `scan`, for every machine with a `source` | Record whether an update is available. Best-effort: a failure only logs a warning. |
+| `safeUpdate` | `snapshot?: boolean` | `safeOsUpdate`, after the OS upgrade, on any machine kind | Apply the update. A failed method run counts as a failed update. |
+
+The `snapshot` argument tells the updater who guards the machine:
+
+- **`snapshot: false`** — `@dmc/patch` already took a snapshot (the machine has a
+  `vm`, a `ct`, or a `snapshotter`). That one snapshot guards the OS update **and**
+  the app update, so take no snapshot of your own. If the machine is unhealthy
+  after the update, `@dmc/patch` rolls the whole machine back to it.
+- **no argument** — the machine is unguarded (bare metal with no `snapshotter`).
+  Guard yourself if you can.
+- Declare `snapshot` as an optional boolean. An updater that does not declare it
+  is retried once with no arguments (and a warning is logged), so it still works.
+
+Optional globalArguments: `healthUrl`, `healthExpectStatus`, `service`. A machine
+with a `source` and no `health` checks derives its health checks from them (see
+[Health checks](#health-checks)).
+
+`source.type` is an optional free-text label for readers (for example
+`community-script` or `swamp-binary`). The fleet does not read it.
+
+### Snapshotter contract (`snapshotter`)
+
+A snapshot, its rollback and its cleanup act on one artifact. So they are **one
+contract**: the implementation that takes a snapshot must also roll it back and
+delete it.
+
+| Method | Arguments | Called by | Your model must |
+| ------ | --------- | --------- | --------------- |
+| `snapshot` | `host`, `name` | `safeOsUpdate`, before the upgrade | Take a snapshot of `host` called `name`. A failed run **aborts the update** before anything changes. |
+| `rollback` | `host`, `name` | `safeOsUpdate` (unhealthy after the update, with `rollbackOnFailure`), and the `rollback` method | Revert `host` to snapshot `name`. |
+| `deleteSnapshot` | `host`, `name` | `pruneSnapshots` (past retention, health- and reboot-confirmed, healthy now) | Remove snapshot `name`. A failed run keeps the record (reason `delete call failed`). |
+| `listSnapshots` | `host` | the `snapshot-target-resolves` pre-flight check | Write one resource whose attributes hold `snapshots: [{ name }]`. |
+
+Rules:
+
+- **`@dmc/patch` chooses every snapshot name** (`preupdate-<timestamp>`). Your
+  model must find a snapshot again by that name — for example, store it as a tag
+  on a cloud snapshot.
+- **`host`** is the machine's host, so one snapshotter instance can serve many
+  machines.
+- **Success is the method run succeeding.** Report a failure by failing the run.
+
+Which snapshotter a machine uses, in order:
+
+1. **`snapshotter: { model }`** — always wins. It overrides the built-in VM/CT
+   snapshot.
+2. **`vm`** — built-in **proxmox-vm**: the node model's `snapshotVm`,
+   `rollbackVm`, `deleteVmSnapshot` and `listVmSnapshots`.
+3. **a CT** (`ct`) — built-in **proxmox-ct**: `pct snapshot | rollback |
+   delsnapshot | listsnapshot` on the node.
+4. **none** — the update is unguarded (bare metal). Add a `snapshotter` to guard
+   bare metal.
+
+**Each snapshot record remembers its snapshotter.** A `snapshot` record stores
+the snapshotter that took it (`snapshotter: { kind: proxmox-vm | proxmox-ct |
+model, … }`). `rollback` and `pruneSnapshots` dispatch from the **record**, not
+from the machine's current decorations. So when you change a machine's
+snapshotter, its older snapshots are still rolled back and deleted by the
+implementation that took them. Records written before this release have no
+`snapshotter` field; they map from `kind` / `vmid` / `proxmoxNode`.
+
+### Example
+
+A machine that updates its own app binary on a VM, guarded by your own
+snapshotter:
+
+```yaml
+machines:
+  - host: app-vm
+    vm: { proxmoxNode: proxmox-node, vmid: 310 }  # location: scan, reboot
+    snapshotter:
+      model: zfs-snapshots     # your model — overrides the built-in VM snapshot
+    source:
+      type: app-binary         # label only
+      model: app-updater       # your model
+    health:
+      - type: http
+        url: https://app.example.net/health
+```
+
+A snapshotter is an ordinary swamp model. A minimal outline (add your own
+backend calls where the comments are):
+
+```ts
+import { z } from "npm:zod@4";
+
+const Target = z.object({ host: z.string(), name: z.string() });
+const done = { dataHandles: [] };
+
+export const model = {
+  type: "@you/zfs-snapshots",
+  version: "2026.10.16.1",
+  globalArguments: z.object({ dataset: z.string() }),
+  resources: {
+    snapshots: {
+      description: "Snapshot names of a host",
+      schema: z.object({ snapshots: z.array(z.object({ name: z.string() })) }),
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
+    },
+  },
+  methods: {
+    snapshot: {
+      description: "Take snapshot `name` of `host`",
+      arguments: Target,
+      execute: async (a, ctx) => done, // e.g. zfs snapshot <dataset>@<name>
+    },
+    rollback: {
+      description: "Revert `host` to snapshot `name`",
+      arguments: Target,
+      execute: async (a, ctx) => done, // e.g. zfs rollback -r <dataset>@<name>
+    },
+    deleteSnapshot: {
+      description: "Remove snapshot `name` of `host`",
+      arguments: Target,
+      execute: async (a, ctx) => done, // e.g. zfs destroy <dataset>@<name>
+    },
+    listSnapshots: {
+      description: "List the snapshots of `host`",
+      arguments: z.object({ host: z.string() }),
+      execute: async (a, ctx) => {
+        const names: string[] = []; // e.g. from zfs list -t snapshot
+        const h = await ctx.writeResource("snapshots", a.host, {
+          snapshots: names.map((name) => ({ name })),
+        });
+        return { dataHandles: [h] };
+      },
+    },
+  },
+};
+```
+
+An updater needs only two methods:
+
+```ts
+methods: {
+  checkUpdate: {
+    description: "Record whether a newer version is available",
+    arguments: z.object({}),
+    execute: async (_a, ctx) => ({ dataHandles: [/* a version record */] }),
+  },
+  safeUpdate: {
+    description: "Apply the update",
+    arguments: z.object({ snapshot: z.boolean().optional() }),
+    // snapshot === false → @dmc/patch owns the snapshot; take none of your own.
+    execute: async (a, ctx) => ({ dataHandles: [] }),
+  },
+},
+```
 
 ---
 
@@ -291,8 +488,8 @@ existing setups work without extra config, and you can override anytime.
 | `safeOsUpdate` | Snapshot-guarded OS update for one machine (see below). |
 | `safeUpdate` | Health-checked, rollback-capable **docker** update: record image ids → pull + `up -d` → wait for health → roll back to the prior image on failure. Replaced images are retained for `retentionHours` (pruned by `pruneImages`). |
 | `reboot` | Graceful reboot: `systemctl reboot` (ssh, scheduled via `systemd-run` so the call returns before the link drops) or `pct reboot` (CT). Guarded on `needsReboot` unless `force`; waits for return; runs health as **detection** (with the `healthGraceSec` grace window, default 120 s). |
-| `rollback` | Deliberately revert a machine to its newest retained pre-update snapshot (VM snapshot rollback / `pct rollback`), or a named one. The recovery for a reboot/update that left a host unhealthy. |
-| `pruneSnapshots` | Delete retained pre-update snapshots past their retention window that are health-confirmed, reboot-confirmed (when a reboot was needed), and pass a fresh check: the host answers a scan (over `pct` on its node for a CT, over ssh otherwise) and has no reboot pending. A snapshot of a host that is no longer in the fleet is kept. `dryRun` to preview. VM → node-model delete; CT → `pct delsnapshot`. |
+| `rollback` | Deliberately revert a machine to its newest retained pre-update snapshot, or a named one, through the snapshotter that took it (VM snapshot rollback / `pct rollback` / your `snapshotter`'s `rollback`). The recovery for a reboot/update that left a host unhealthy. |
+| `pruneSnapshots` | Delete retained pre-update snapshots past their retention window that are health-confirmed, reboot-confirmed (when a reboot was needed), and pass a fresh check: the host answers a scan (over `pct` on its node for a CT, over ssh otherwise) and has no reboot pending. A snapshot of a host that is no longer in the fleet is kept. `dryRun` to preview. Each snapshot is deleted by the snapshotter that took it: VM → node-model delete; CT → `pct delsnapshot`; your `snapshotter` → `deleteSnapshot`. |
 | `pruneImages` | Delete retained previous docker images past their retention window (via `docker rmi`, which refuses if still in use). `dryRun` to preview. |
 | `clearRetired` | Delete the stored records of **retired machines** (hosts with records that are no longer in `globalArguments.machines`). **A bare run is a preview** (`dryRun` defaults to `true`). See [Retired machines and `clearRetired`](#retired-machines-and-clearretired). |
 
@@ -300,8 +497,8 @@ existing setups work without extra config, and you can override anytime.
 
 Arguments: `host`, `mode` (`safe` = `apt upgrade` / `full` = `apt full-upgrade`;
 dnf/apk always upgrade), `retentionHours` (default 168 = 7 days),
-`rollbackOnFailure` (default true), `healthGraceSec` (default 120, see
-[Health checks](#health-checks)).
+`rollbackOnFailure` (default true; applies to every machine kind with a snapshot
+guard), `healthGraceSec` (default 120, see [Health checks](#health-checks)).
 
 Before the method runs, its [pre-flight checks](#pre-flight-checks) gate it:
 `host-in-fleet`, `host-reachable`, `baseline-healthy` (health checks pass now) and
@@ -314,20 +511,39 @@ swamp model method run fleet safeOsUpdate --input host=node1 --skip-check baseli
 
 Flow, per machine type:
 
-1. **Snapshot** — VM via the node model; CT via `pct snapshot`; bare-metal none.
+1. **Snapshot** — through the machine's snapshotter: your `snapshotter` model
+   when set; else a VM via the node model, a CT via `pct snapshot`; bare metal
+   none. A failed snapshot aborts the update.
 2. **Upgrade** — apt/dnf/apk, over ssh (VM/bare) or `pct exec` (CT), capturing an
-   installed-package **before/after diff** (`{name, from, to}`).
-3. **App update** (CTs with a `source`) — delegate to the `source` updater on top
-   of the OS update. **One snapshot guards both**: the method calls the source's
-   `safeUpdate` with `{ snapshot: false }`, so the updater takes no snapshot of
-   its own. This needs `@dmc/proxmox` >= 2026.10.01.1. An older `@dmc/proxmox`
-   rejects the argument; the method then retries once with no arguments and logs
-   a `warn`. That older updater takes its own extra, untracked snapshot (the
-   old behavior). Any other failure of the source is not retried.
+   installed-package **before/after diff** (`{name, from, to}`). The "after" list is
+   read before any rollback, so a rolled-back run still records what the update
+   changed. When either list cannot be read, the run records no diff (`packages:
+   null`) rather than a misleading one; it never aborts the update.
+3. **App update** (any machine with a `source`) — delegate to the `source`
+   updater on top of the OS update. **One snapshot guards both**: when the
+   fleet took a snapshot, it calls the source's `safeUpdate` with
+   `{ snapshot: false }`, so the updater takes no snapshot of its own (an
+   unguarded machine calls it with no arguments). A community-script source needs
+   `@dmc/proxmox` >= 2026.10.01.1 for this. An updater that rejects the argument
+   is retried once with no arguments and a `warn` is logged; such an updater may
+   take its own extra, untracked snapshot. Any other failure of the source is not
+   retried.
 4. **Post-update health** — `healthyAfter` from the `health` checks (or
-   reachability when none), with the `healthGraceSec` grace window. Unhealthy
-   after the window → **roll back** the snapshot (VM / `pct`); healthy →
-   **retain** it with the retention window.
+   reachability when none), with the `healthGraceSec` grace window. Then the
+   outcome, **health first**, the same for every machine kind (VM, CT, bare
+   metal):
+
+   | After the update | Action | `outcome` |
+   | ---------------- | ------ | --------- |
+   | Unhealthy, has a snapshot, `rollbackOnFailure` (default) | Roll back through the same snapshotter | `rolled-back` |
+   | Unhealthy, otherwise (`rollbackOnFailure: false`, or no snapshot guard) | Keep the machine as-is | `failed` |
+   | Healthy, but the upgrade command failed | No rollback | `failed` |
+   | Healthy | Keep | `updated` / `no-change` |
+
+   An unhealthy machine is rolled back whatever the upgrade's exit code. The
+   snapshot record is written in every case — also after a rollback, because a
+   rollback reverts to the snapshot but does not delete it. `pruneSnapshots`
+   deletes it later (only once it is health-confirmed).
 5. **Reboot is never automatic** — `needsReboot` is reported; you call `reboot`.
 
 ### Pre-flight checks
@@ -343,7 +559,7 @@ run before anything changes. Each check is cheap and read-only. `scan` and
 | `host-reachable` | `live` | `safeUpdate`, `safeOsUpdate`, `reboot` | The machine answers: ssh `true` through the `sshModel`, or `pct status <ctid>` on the node for a CT. Not run for `rollback`, because a broken host is the reason to roll back. |
 | `baseline-healthy` | `live` | `safeUpdate`, `safeOsUpdate` | The machine's [health checks](#health-checks) pass now. The failing labels are named. A machine with no health checks passes. |
 | `host-retired` | `policy` | `clearRetired` | The `host` argument is **not** in `globalArguments.machines` (the opposite of `host-in-fleet`). Without a `host`, it passes. |
-| `snapshot-target-resolves` | `live` | `safeOsUpdate`, `rollback`, `pruneSnapshots` | The VM or CT location resolves and its Proxmox node answers. For `rollback`, a snapshot also exists (the named one, if you pass `snapshot`). A machine with no `vm` or `ct` passes. |
+| `snapshot-target-resolves` | `live` | `safeOsUpdate`, `rollback`, `pruneSnapshots` | The machine's snapshotter answers a list: your `snapshotter`'s `listSnapshots`, or the VM/CT location resolves and its Proxmox node answers. For `rollback`, a snapshot also exists (the named one, if you pass `snapshot`). A machine with no `snapshotter`, `vm` or `ct` passes. |
 
 The prune methods keep their per-host skip behavior. Only `host-in-fleet`
 (and, with a `host` filter, `snapshot-target-resolves`) checks them.
@@ -442,7 +658,7 @@ All are versioned model data (`swamp data list fleet`, `swamp data query`).
 | ---- | ---------- | -------- |
 | `inventory` | scan / safeOsUpdate | Per-host OS status, docker engine + image drift, reachMethod, **health** verdict. Keyed by host (latest = current). |
 | `run` | every mutating method | Append-only audit row (`run-<action>-<host>-<ts>`): action, outcome, before/after counts, **package** and **image** diffs, snapshot, rolledBack, needsReboot. |
-| `snapshot` | safeOsUpdate | Lifecycle of a retained snapshot (`kind` vm/ct, retainUntil, healthConfirmed, rebootConfirmed, status). |
+| `snapshot` | safeOsUpdate | Lifecycle of a retained snapshot (`snapshotter` that took it, `kind` vm/ct/model, retainUntil, healthConfirmed, rebootConfirmed, status). |
 | `image` | safeUpdate | A retained previous docker image (rollback point) with a retention window. |
 | `osUpdate` / `update` / `reboot` | the respective method | Latest result per host for that operation. |
 | `prune` | pruneSnapshots / pruneImages / clearRetired | What each prune run retired vs kept (and why). Kind `retired` = records deleted by `clearRetired`. |
@@ -524,7 +740,9 @@ catch a late-surfacing problem (a bad kernel only shows up on the reboot):
 3. `pruneSnapshots` / `pruneImages` delete only what is **past retention**,
    **health-confirmed**, **reboot-confirmed** (when required), and **healthy on a
    fresh check** — and CT snapshots refuse via `pct`/`docker rmi` if still needed.
-4. `rollback` reverts a host to its retained snapshot when you decide to.
+   Each snapshot is deleted by the snapshotter that took it.
+4. `rollback` reverts a host to its retained snapshot when you decide to, through
+   the snapshotter that took it.
 
 ---
 
@@ -568,9 +786,23 @@ swamp model method run fleet clearRetired --input dryRun=false
   `$SUDO VAR=val cmd` (which breaks when `$SUDO` is non-empty).
 - **A reboot can't be rolled back** (the disk is unchanged); reboot health is
   detection, and recovery is the explicit `rollback` to the pre-update snapshot.
-- **Community-script CTs take ONE snapshot** — the fleet's guarding snapshot. The
-  app step calls the updater with `snapshot: false` (needs `@dmc/proxmox` >=
-  2026.10.01.1; an older one takes its own extra snapshot and a `warn` is logged).
+- **One snapshot guards the OS and the app** — the fleet's guarding snapshot. The
+  app step calls the updater with `snapshot: false` (a community-script updater
+  needs `@dmc/proxmox` >= 2026.10.01.1; an updater that rejects the argument takes
+  its own extra snapshot and a `warn` is logged).
+- **Snapshot, rollback and cleanup are one contract.** Only the implementation
+  that took a snapshot can roll it back or delete it, so the `snapshot` record
+  stores its snapshotter and `rollback` / `pruneSnapshots` dispatch from the
+  record. Changing a machine's `snapshotter` never orphans its older snapshots.
+- **Both extension points are reached by name, never by type**, so a consumer
+  adds an updater or snapshotter in their own repo without upstreaming it.
+- **Every per-machine operation goes through a transport.** `safeOsUpdate`,
+  `reboot`, the health checks, `pruneSnapshots`' live gate and the
+  `host-reachable` check reach a machine only through a `Transport`: **ssh** (the
+  ssh model's `script` / `exec` on the host) or **pct** (`pct exec` / `pct
+  status` / `pct reboot` on a CT's node). None of them branches on ssh-vs-pct, so
+  every machine kind runs the same flow. `scan` keeps its own batched fan-out to
+  stay under the runModel call budget.
 - **Health checks share a definition** with `@dmc/proxmox/community-script`
   (a shared contract, since swamp extensions bundle independently).
 

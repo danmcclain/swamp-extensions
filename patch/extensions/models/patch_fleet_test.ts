@@ -528,18 +528,30 @@ Deno.test("schema: bad ct, source, reach, vm and host values are rejected", () =
   assertThrows(() =>
     parseMachine({ host: "c", ct: { proxmoxNode: "pve", ctid: 1.5 } })
   );
-  assertThrows(() =>
-    parseMachine({ host: "c", source: { type: "github-release", model: "m" } })
-  );
+  // An empty updater model is still rejected (model is required, min(1)) ...
   assertThrows(() =>
     parseMachine({ host: "c", source: { type: "community-script", model: "" } })
   );
+  assertThrows(() => parseMachine({ host: "c", source: { model: "" } }));
   assertThrows(() => parseMachine({ host: "c", reach: "winrm" }));
   assertThrows(() =>
     parseMachine({ host: "v", vm: { proxmoxNode: "pve", vmid: "100" } })
   );
   assertThrows(() => parseMachine({ host: "" }));
   assertThrows(() => parseMachine({}));
+});
+
+Deno.test("schema: source is pluggable — any updater type/model is accepted, type optional", () => {
+  // A non-community-script updater is valid; `source.model` is reached by name.
+  const a = parseMachine({
+    host: "c",
+    source: { type: "swamp-binary", model: "serve-updater" },
+  });
+  assertEquals(a.source?.model, "serve-updater");
+  // `type` is an optional documentation label.
+  const b = parseMachine({ host: "c", source: { model: "any-updater" } });
+  assertEquals(b.source?.model, "any-updater");
+  assertEquals(b.source?.type, undefined);
 });
 
 Deno.test("schema: docker decoration defaults healthExpectStatus to 200", () => {
@@ -759,11 +771,13 @@ Deno.test("appSource prefers source, falls back to legacy proxmox, else null", (
     fleet.appSource({ host: "a", ct: { proxmoxNode: "pve", ctid: 1 } }),
     null,
   );
-  // An unknown source type gives no source.
+  // Any source.model is honoured regardless of type (pluggable updater).
   assertEquals(
     fleet.appSource({ host: "a", source: { type: "other", model: "m" } }),
-    null,
+    "m",
   );
+  // ...and with no type label at all.
+  assertEquals(fleet.appSource({ host: "a", source: { model: "m2" } }), "m2");
 });
 
 Deno.test("ctLocation reads the ct decoration without calling swamp", async () => {
@@ -4213,4 +4227,842 @@ Deno.test("own data: readOwnRecords reads by model id, filters by specName tag, 
   ]);
   const both = await fleet.readOwnRecords(ctx, ["snapshot", "image"]);
   assertEquals(both.map((r) => r.name), ["a", "b"]);
+});
+
+// --- pluggable snapshotter ------------------------------------------------------
+// Snapshot, rollback and cleanup are one contract. The built-in proxmox-vm / proxmox-ct
+// snapshotters are covered by the safeOsUpdate / rollback / pruneSnapshots tests above
+// (they pin the exact Proxmox calls). These cover the selection rules and the pluggable
+// `snapshotter` model.
+
+/** A record of a snapshot taken by the snapshotter model "zfs". */
+const MODEL_SNAP = {
+  kind: "model",
+  vmid: null,
+  proxmoxNode: null,
+  snapshotter: { kind: "model", model: "zfs" },
+};
+
+Deno.test("schema: a machine takes a snapshotter decoration; its model must be non-empty", () => {
+  const m = parseMachine({ host: "b", snapshotter: { model: "zfs" } });
+  assertEquals(m.snapshotter?.model, "zfs");
+  assertThrows(() => parseMachine({ host: "b", snapshotter: { model: "" } }));
+});
+
+Deno.test("snapshotterRefFor: an explicit snapshotter wins, then vm, then a CT location, else none", () => {
+  const vm = { proxmoxNode: "pve", vmid: 100 };
+  assertEquals(
+    fleet.snapshotterRefFor({ host: "a", vm, snapshotter: { model: "zfs" } }),
+    { kind: "model", model: "zfs" },
+  );
+  assertEquals(fleet.snapshotterRefFor({ host: "a", vm }), {
+    kind: "proxmox-vm",
+    node: "pve",
+    vmid: 100,
+  });
+  assertEquals(
+    fleet.snapshotterRefFor({ host: "a" }, { node: "pve", ctid: 200 }),
+    { kind: "proxmox-ct", node: "pve", ctid: 200 },
+  );
+  assertEquals(fleet.snapshotterRefFor({ host: "a" }), null);
+});
+
+Deno.test("snapshotterRefFromRecord: a recorded snapshotter wins; older vm/ct records map from their fields", () => {
+  const rec = (over: Record<string, unknown>) =>
+    model.resources.snapshot.schema.parse({ ...SNAPSHOT, ...over });
+  assertEquals(fleet.snapshotterRefFromRecord(rec(MODEL_SNAP)), {
+    kind: "model",
+    model: "zfs",
+  });
+  assertEquals(fleet.snapshotterRefFromRecord(rec({})), {
+    kind: "proxmox-vm",
+    node: "pve",
+    vmid: 100,
+  });
+  assertEquals(
+    fleet.snapshotterRefFromRecord(
+      rec({ kind: "ct", vmid: 200, proxmoxNode: "node1" }),
+    ),
+    { kind: "proxmox-ct", node: "node1", ctid: 200 },
+  );
+  // A model record that lost its snapshotter names nothing to dispatch to.
+  assertThrows(() =>
+    fleet.snapshotterRefFromRecord(
+      rec({ kind: "model", vmid: null, proxmoxNode: null }),
+    )
+  );
+});
+
+Deno.test("snapshotRecordLocation: every snapshotter writes a valid record that leads back to it", () => {
+  for (
+    const ref of [
+      { kind: "proxmox-vm" as const, node: "pve", vmid: 100 },
+      { kind: "proxmox-ct" as const, node: "pve", ctid: 200 },
+      { kind: "model" as const, model: "zfs" },
+    ]
+  ) {
+    const a = model.resources.snapshot.schema.parse({
+      ...SNAPSHOT,
+      ...fleet.snapshotRecordLocation(ref),
+    });
+    assertEquals(fleet.snapshotterRefFromRecord(a), ref);
+  }
+  // Proxmox records keep the plain location fields.
+  assertEquals(
+    fleet.snapshotRecordLocation({ kind: "proxmox-ct", node: "pve", ctid: 200 }),
+    {
+      kind: "ct",
+      vmid: 200,
+      proxmoxNode: "pve",
+      snapshotter: { kind: "proxmox-ct", node: "pve", ctid: 200 },
+    },
+  );
+});
+
+Deno.test("snapshotterFor(model): drives the snapshotter contract by name with { host, name }", async () => {
+  const s = stubSwamp([
+    { ok: true },
+    { ok: true },
+    { ok: true },
+    {
+      ok: true,
+      artifacts: [{
+        snapshots: [{ name: "preupdate-1" }, { name: "current" }],
+      }],
+    },
+  ]);
+  const snapper = fleet.snapshotterFor(
+    { kind: "model", model: "zfs" },
+    { sshModel: "ssh", swamp: s.api, host: "web1" },
+  );
+  assertEquals(await snapper.snapshot("preupdate-1"), true);
+  assertEquals(await snapper.rollback("preupdate-1"), true);
+  assertEquals(await snapper.delete("preupdate-1"), true);
+  assertEquals(await snapper.list(), ["preupdate-1"]);
+  const args = { host: "web1", name: "preupdate-1" };
+  assertEquals(s.calls, [
+    { model: "zfs", method: "snapshot", args },
+    { model: "zfs", method: "rollback", args },
+    { model: "zfs", method: "deleteSnapshot", args },
+    { model: "zfs", method: "listSnapshots", args: { host: "web1" } },
+  ]);
+  assertStringIncludes(snapper.where, 'snapshotter model "zfs"');
+});
+
+Deno.test("snapshotterFor(model): a failed run is false and warned; a failed list throws", async () => {
+  const s = stubSwamp([{ ok: false, error: "pool is full" }]);
+  const l = collectLogger();
+  const snapper = fleet.snapshotterFor(
+    { kind: "model", model: "zfs" },
+    { sshModel: "ssh", swamp: s.api, host: "web1", logger: l.logger },
+  );
+  assertEquals(await snapper.snapshot("p"), false);
+  assertStringIncludes(JSON.stringify(l.lines), "pool is full");
+  await assertRejects(() => snapper.list(), Error, "pool is full");
+});
+
+Deno.test("snapshotterFor(proxmox-vm): issues snapshotVm / rollbackVm / deleteVmSnapshot on the node model", async () => {
+  const s = stubSwamp([{ ok: true }]);
+  const snapper = fleet.snapshotterFor(
+    { kind: "proxmox-vm", node: "pve", vmid: 100 },
+    { sshModel: "ssh", swamp: s.api, host: "web1" },
+  );
+  await snapper.snapshot("p");
+  await snapper.rollback("p");
+  await snapper.delete("p");
+  assertEquals(s.calls.map((c) => [c.model, c.method, c.args]), [
+    ["pve", "snapshotVm", { vmid: 100, name: "p" }],
+    ["pve", "rollbackVm", { vmid: 100, name: "p" }],
+    ["pve", "deleteVmSnapshot", { vmid: 100, name: "p" }],
+  ]);
+});
+
+Deno.test("safeOsUpdate: a snapshotter guards bare metal — the model takes the snapshot and the record names it", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog(osUpdateEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          snapshotter: { model: "zfs" },
+          health: [{ type: "http", url: server.url }],
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const all = await calls();
+      const taken = all.filter((c) => c.startsWith("zfs snapshot "));
+      assertEquals(taken.length, 1);
+      assertStringIncludes(taken[0], "--input host=web1");
+      assertStringIncludes(taken[0], "--input name=preupdate-");
+      assertEquals(
+        all.some((c) => c.includes(" snapshotVm ") || c.includes("pct snapshot")),
+        false,
+      );
+      const os = t.one("osUpdate");
+      assertEquals(os.kind, "bare-metal");
+      assertEquals(os.snapshotKept, true);
+      assertEquals(os.rolledBack, false);
+      const rec = t.one("snapshot");
+      assertEquals(rec.kind, "model");
+      assertEquals(rec.vmid, null);
+      assertEquals(rec.snapshotter, { kind: "model", model: "zfs" });
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate: a VM with a snapshotter is snapshotted and rolled back by the model, not the node", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withCallLog(osUpdateEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          vm: { proxmoxNode: "pve", vmid: 100 },
+          snapshotter: { model: "zfs" },
+          health: [{ type: "http", url: server.url }],
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const all = await calls();
+      assertEquals(all.filter((c) => c.startsWith("zfs snapshot ")).length, 1);
+      assertEquals(all.filter((c) => c.startsWith("zfs rollback ")).length, 1);
+      assertEquals(
+        all.some((c) => c.includes(" snapshotVm ") || c.includes(" rollbackVm ")),
+        false,
+      );
+      assertEquals(t.one("osUpdate").outcome, "rolled-back");
+      assertEquals(t.one("osUpdate").rolledBack, true);
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate: a failed snapshotter snapshot aborts the update before the upgrade", async () => {
+  await withCallLog(
+    { ...osUpdateEnv(), FAKE_SWAMP_SNAPSHOT_RC: "1" },
+    async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{ host: "web1", snapshotter: { model: "zfs" } }],
+      });
+      await assertRejects(
+        () =>
+          model.methods.safeOsUpdate.execute(
+            model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+            t.ctx,
+          ),
+        Error,
+        'snapshotter model "zfs" failed to snapshot web1',
+      );
+      assertEquals(
+        (await calls()).some((c) => c.includes("apt-get -y upgrade")),
+        false,
+      );
+    },
+  );
+});
+
+Deno.test("safeOsUpdate: a CT with a snapshotter snapshots via the model, not pct, and the app source still runs", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog(ctAppEnv(), async (calls) => {
+      const base = ctAppFleet(server.url);
+      const t = mkCtx({
+        ...base,
+        machines: [{ ...base.machines[0], snapshotter: { model: "zfs" } }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({ host: "ct1" }),
+        t.ctx,
+      );
+      const all = await calls();
+      assertEquals(all.filter((c) => c.startsWith("zfs snapshot ")).length, 1);
+      assertEquals(all.some((c) => c.includes("pct snapshot")), false);
+      // One snapshot guards both: the app source is still told not to snapshot.
+      assertEquals(appCalls(all).length, 1);
+      assertEquals(t.one("snapshot").snapshotter, {
+        kind: "model",
+        model: "zfs",
+      });
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("rollback: a snapshot is rolled back by the snapshotter that took it, from the record", async () => {
+  // The machine is no longer decorated with the snapshotter; the record still names it.
+  await withCallLog({}, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, {
+      data: { snapshot: [snapDatum("s-m", MODEL_SNAP)] },
+    });
+    await model.methods.rollback.execute(
+      model.methods.rollback.arguments.parse({ host: "web1" }),
+      t.ctx,
+    );
+    const rb = (await calls()).filter((c) => c.startsWith("zfs rollback "));
+    assertEquals(rb.length, 1);
+    assertStringIncludes(rb[0], "--input host=web1");
+    assertStringIncludes(rb[0], "--input name=preupdate-1");
+    assertEquals(t.one("run").rolledBack, true);
+  });
+});
+
+Deno.test("pruneSnapshots: a snapshotter model's snapshot is deleted by that model (deleteSnapshot)", async () => {
+  await withCallLog({ FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW }, async (calls) => {
+    const dry = mkCtx(FLEET, {
+      data: { snapshot: [snapDatum("s-m", MODEL_SNAP)] },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({ dryRun: true }),
+      dry.ctx,
+    );
+    assertEquals(dry.one("prune").pruned, [
+      { host: "web1", name: "preupdate-1", detail: "model:zfs" },
+    ]);
+
+    const t = mkCtx(FLEET, {
+      data: { snapshot: [snapDatum("s-m", MODEL_SNAP)] },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({}),
+      t.ctx,
+    );
+    const del = (await calls()).filter((c) =>
+      c.startsWith("zfs deleteSnapshot ")
+    );
+    assertEquals(del.length, 1);
+    assertStringIncludes(del[0], "--input name=preupdate-1");
+    assertEquals(t.one("prune").pruned, [
+      { host: "web1", name: "preupdate-1", detail: "model:zfs" },
+    ]);
+    assertEquals(t.one("snapshot").status, "pruned");
+  });
+});
+
+// --- safeOsUpdate outcome: the CT path decides exactly like the VM / bare path -----
+// Health first: unhealthy + snapshot + rollbackOnFailure → rolled-back; unhealthy
+// otherwise → failed; healthy but the upgrade failed → failed; healthy → updated.
+
+/** A plain CT (no app source) with one http health check. */
+function plainCtFleet(healthUrl: string) {
+  return {
+    sshModel: "ssh",
+    machines: [{
+      host: "ct1",
+      ct: { proxmoxNode: "pve", ctid: 200 },
+      health: [{ type: "http", label: "app", url: healthUrl }],
+    }],
+  };
+}
+
+/**
+ * Run safeOsUpdate on the plain CT against a health server answering `status`.
+ * The CT path's script calls alternate _1/_2: before-scan, package list, upgrade,
+ * after-scan, package list. So _1 carries the upgrade's exit code (`upgradeRc`) and
+ * _2 the after-scan (`after`; pass a marker-less stdout to make the rescan fail).
+ */
+async function ctOutcome(
+  status: number,
+  args: Record<string, unknown> = {},
+  opts: { upgradeRc?: number; after?: string } = {},
+) {
+  const server = startServer(() => status);
+  try {
+    return await withCallLog({
+      FAKE_SWAMP_SCRIPT_1: scriptOut(
+        "pve",
+        collectorStdout(),
+        opts.upgradeRc ?? 0,
+      ),
+      FAKE_SWAMP_SCRIPT_2: scriptOut(
+        "pve",
+        opts.after ?? collectorStdout({ updatesCount: 0 }),
+      ),
+      FAKE_SWAMP_EXEC: execOut(""),
+    }, async (calls) => {
+      const t = mkCtx(plainCtFleet(server.url));
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "ct1",
+          healthGraceSec: 0,
+          ...args,
+        }),
+        t.ctx,
+      );
+      const all = await calls();
+      const snaps = t.written("snapshot");
+      return {
+        os: t.one("osUpdate"),
+        snapshotRecords: snaps.length,
+        snap: (snaps[0]?.data ?? {}) as Record<string, unknown>,
+        rollbacks: all.filter((c) => c.includes("pct rollback 200 preupdate-")),
+      };
+    });
+  } finally {
+    await server.stop();
+  }
+}
+
+Deno.test("safeOsUpdate CT: healthy after the update → updated, snapshot retained and health-confirmed", async () => {
+  const r = await ctOutcome(200);
+  assertEquals(r.os.outcome, "updated");
+  assertEquals(r.os.rolledBack, false);
+  assertEquals(r.rollbacks.length, 0);
+  assertEquals(r.snap.healthConfirmed, true);
+  assertStringIncludes(String(r.os.logs), "healthy after (0 updates left)");
+});
+
+Deno.test("safeOsUpdate CT: unhealthy → rolled back, and the snapshot is still tracked", async () => {
+  const r = await ctOutcome(503);
+  assertEquals(r.os.outcome, "rolled-back");
+  assertEquals(r.os.rolledBack, true);
+  assertEquals(r.rollbacks.length, 1);
+  // A rollback reverts to the snapshot but does not delete it: keep tracking it,
+  // or it is never pruned.
+  assertEquals(r.os.snapshotKept, true);
+  assertEquals(r.snapshotRecords, 1);
+  assertEquals(r.snap.healthConfirmed, false);
+  assertEquals(r.snap.status, "active");
+});
+
+Deno.test("safeOsUpdate CT: unhealthy with rollbackOnFailure=false → failed, NOT rolled back", async () => {
+  const r = await ctOutcome(503, { rollbackOnFailure: false });
+  assertEquals(r.os.outcome, "failed");
+  assertEquals(r.os.rolledBack, false);
+  assertEquals(r.rollbacks.length, 0);
+  assertStringIncludes(String(r.os.logs), "rollback disabled; snapshot retained");
+  assertEquals(r.snap.healthConfirmed, false);
+});
+
+Deno.test("safeOsUpdate CT: healthy but the upgrade command failed → failed, no rollback", async () => {
+  const r = await ctOutcome(200, {}, { upgradeRc: 1 });
+  assertEquals(r.os.outcome, "failed");
+  assertEquals(r.os.rolledBack, false);
+  assertEquals(r.rollbacks.length, 0);
+  assertStringIncludes(String(r.os.logs), "machine healthy, no rollback");
+});
+
+Deno.test("safeOsUpdate CT: unhealthy after a failed upgrade → rolled back (health decides first)", async () => {
+  const r = await ctOutcome(503, {}, { upgradeRc: 1 });
+  assertEquals(r.os.outcome, "rolled-back");
+  assertEquals(r.rollbacks.length, 1);
+});
+
+Deno.test("safeOsUpdate CT: healthy while the rescan fails does not crash", async () => {
+  const r = await ctOutcome(200, {}, { after: "no inventory here" });
+  assertEquals(r.os.healthyAfter, true);
+  assertEquals(r.os.rolledBack, false);
+  assertEquals(r.os.afterUpdates, null);
+});
+
+Deno.test("safeOsUpdate VM: unhealthy after a failed upgrade → rolled back (health decides first)", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withCallLog(
+      { ...osUpdateEnv(), FAKE_SWAMP_EXEC: execOut("", 1) },
+      async (calls) => {
+        const t = mkCtx({
+          sshModel: "ssh",
+          machines: [{
+            host: "web1",
+            vm: { proxmoxNode: "pve", vmid: 100 },
+            health: [{ type: "http", url: server.url }],
+          }],
+        });
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({
+            host: "web1",
+            healthGraceSec: 0,
+          }),
+          t.ctx,
+        );
+        assertEquals(t.one("osUpdate").outcome, "rolled-back");
+        assertEquals(
+          (await calls()).some((c) => c.includes(" rollbackVm ")),
+          true,
+        );
+      },
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeOsUpdate bare metal: a failed upgrade on an unguarded host does not claim a snapshot", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withFake(
+      { ...osUpdateEnv(), FAKE_SWAMP_EXEC: execOut("", 1) },
+      async () => {
+        const t = mkCtx({
+          sshModel: "ssh",
+          machines: [{
+            host: "web1",
+            health: [{ type: "http", url: server.url }],
+          }],
+        });
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({
+            host: "web1",
+            healthGraceSec: 0,
+          }),
+          t.ctx,
+        );
+        const os = t.one("osUpdate");
+        assertEquals(os.outcome, "failed");
+        assertEquals(os.snapshotKept, false);
+        assertStringIncludes(String(os.logs), "machine healthy, no rollback");
+        assertEquals(String(os.logs).includes("snapshot retained"), false);
+      },
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
+// --- pluggable updater on every machine kind -----------------------------------
+
+Deno.test("runSourceSafeUpdate: on an unguarded machine the updater is called with no arguments, once", async () => {
+  const s = stubSwamp([{ ok: true }]);
+  const l = collectLogger();
+  assertEquals(
+    await fleet.runSourceSafeUpdate("upd", s.api, l.logger, {
+      patchOwnsSnapshot: false,
+    }),
+    true,
+  );
+  assertEquals(s.calls, [{ model: "upd", method: "safeUpdate", args: {} }]);
+});
+
+/** safeOsUpdate of `web1` over ssh with an updater; returns the updater's call lines. */
+async function sshUpdaterCalls(machine: Record<string, unknown>) {
+  const server = startServer(() => 200);
+  try {
+    return await withCallLog(osUpdateEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          source: { type: "swamp-binary", model: "upd" },
+          health: [{ type: "http", url: server.url }],
+          ...machine,
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      assertStringIncludes(String(t.one("osUpdate").logs), "app upd: ok");
+      return (await calls()).filter((c) => c.startsWith("upd safeUpdate "));
+    });
+  } finally {
+    await server.stop();
+  }
+}
+
+Deno.test("safeOsUpdate: a VM's source updater runs under the VM snapshot, told snapshot:false", async () => {
+  const app = await sshUpdaterCalls({ vm: { proxmoxNode: "pve", vmid: 100 } });
+  assertEquals(app.length, 1);
+  assertStringIncludes(app[0], "--input snapshot:json=false");
+});
+
+Deno.test("safeOsUpdate: a bare-metal source updater with a snapshotter is told snapshot:false", async () => {
+  const app = await sshUpdaterCalls({ snapshotter: { model: "zfs" } });
+  assertEquals(app.length, 1);
+  assertStringIncludes(app[0], "--input snapshot:json=false");
+});
+
+Deno.test("safeOsUpdate: an unguarded bare-metal source updater is called with no snapshot argument", async () => {
+  const app = await sshUpdaterCalls({});
+  assertEquals(app.length, 1);
+  assertEquals(app[0].includes("snapshot"), false);
+});
+
+Deno.test("snapshot-target-resolves: a snapshotter is checked with its listSnapshots, also on bare metal", async () => {
+  const withSnapper = {
+    sshModel: "ssh",
+    machines: [{ host: "b", snapshotter: { model: "zfs" } }],
+  };
+  await withFake({ FAKE_SWAMP_SNAPLIST: snaps("preupdate-1") }, async () => {
+    for (const method of ["safeOsUpdate", "pruneSnapshots", "rollback"]) {
+      assertEquals(
+        await runCheck(
+          "snapshot-target-resolves",
+          checkCtx(withSnapper, method, { host: "b" }),
+        ),
+        { pass: true },
+      );
+    }
+    const r = await runCheck(
+      "snapshot-target-resolves",
+      checkCtx(withSnapper, "rollback", { host: "b", snapshot: "missing" }),
+    );
+    assertEquals(r.pass, false);
+  });
+  await withFake({ FAKE_SWAMP_SNAPLIST_RC: "1" }, async () => {
+    const r = await runCheck(
+      "snapshot-target-resolves",
+      checkCtx(withSnapper, "safeOsUpdate", { host: "b" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(r.errors!.join(" "), 'snapshotter model "zfs"');
+  });
+});
+
+// --- transports -------------------------------------------------------------------
+// safeOsUpdate, reboot, the health checks, prune's live gate and the host-reachable
+// check reach a machine only through a Transport. The method tests above pin the calls
+// each transport makes end to end; these pin the transports themselves.
+
+/** A stub `exec` answer: stdout plus the rc sentinel line, as the ssh model returns it. */
+const execAnswer = (stdout: string, rc = 0) => ({
+  ok: true,
+  artifacts: [{
+    host: "x",
+    stdout: `${stdout}\n${fleet.RC_SENTINEL}=${rc}\n`,
+    exitCode: 0,
+  }],
+});
+
+Deno.test("transportVia / transportFor: a CT that is not a VM goes through pct on its node; all else over ssh", async () => {
+  const ct = { proxmoxNode: "pve", ctid: 200 };
+  assertEquals(fleet.transportVia({ host: "a" }), "ssh");
+  assertEquals(
+    fleet.transportVia({ host: "a", vm: { proxmoxNode: "pve", vmid: 1 } }),
+    "ssh",
+  );
+  assertEquals(fleet.transportVia({ host: "a", ct }), "pct");
+  const deps = { sshModel: "ssh", swamp: stubSwamp([{ ok: true }]).api };
+  const t = await fleet.transportFor({ host: "a", ct }, deps);
+  assertEquals(t.via, "pct");
+  assertEquals(t.ct, { node: "pve", ctid: 200 });
+  assertEquals((await fleet.transportFor({ host: "a" }, deps)).via, "ssh");
+});
+
+Deno.test("pctTransport: scripts AND single commands are shipped base64 into pct exec on the node", async () => {
+  const s = stubSwamp([{
+    ok: true,
+    artifacts: [{ host: "pve", stdout: "out", exitCode: 0 }],
+  }]);
+  const t = fleet.pctTransport("ct1", { node: "pve", ctid: 200 }, {
+    sshModel: "ssh",
+    swamp: s.api,
+  });
+  assertEquals(await t.script("echo hi", 60), { rc: 0, out: "out" });
+  assertEquals(await t.exec("uptime", 60), { rc: 0, out: "out" });
+  const shipped = (cmd: string) =>
+    `pct exec 200 -- bash -c "echo '${fleet.utf8b64(cmd)}' | base64 -d | bash"`;
+  assertEquals(
+    s.calls.map((c) => [c.model, c.method, c.args?.hosts, c.args?.script]),
+    [
+      ["ssh", "script", ["pve"], shipped("echo hi")],
+      ["ssh", "script", ["pve"], shipped("uptime")],
+    ],
+  );
+});
+
+Deno.test("pctTransport: probe needs pct status 'running'; reboot runs pct reboot on the node", async () => {
+  const at = (answer: ReturnType<typeof execAnswer>) => {
+    const s = stubSwamp([answer]);
+    const t = fleet.pctTransport("ct1", { node: "pve", ctid: 200 }, {
+      sshModel: "ssh",
+      swamp: s.api,
+    });
+    return { s, t };
+  };
+  const running = at(execAnswer("status: running"));
+  assertEquals(await running.t.probe(), null);
+  assertEquals(running.s.calls[0].args?.hosts, ["pve"]);
+  assertStringIncludes(String(running.s.calls[0].args?.command), "pct status 200");
+  assertStringIncludes(
+    String(await at(execAnswer("status: stopped")).t.probe()),
+    'CT "ct1" (ctid 200) is not running on node "pve"',
+  );
+  const rb = at(execAnswer(""));
+  assertEquals(await rb.t.reboot(), 0);
+  assertStringIncludes(String(rb.s.calls[0].args?.command), "pct reboot 200");
+  assertEquals(rb.t.rebootLabel, "pct reboot 200 on pve");
+});
+
+Deno.test("sshTransport: script uses the ssh model's script on the host; exec, probe and reboot use exec", async () => {
+  const s = stubSwamp([
+    { ok: true, artifacts: [{ host: "web1", stdout: "out", exitCode: 0 }] },
+    execAnswer(""),
+    execAnswer(""),
+  ]);
+  const t = fleet.sshTransport("web1", { sshModel: "ssh", swamp: s.api });
+  assertEquals(await t.script("echo hi", 60), { rc: 0, out: "out" });
+  assertEquals(await t.probe(), null);
+  assertEquals(await t.reboot(), 0);
+  assertEquals(s.calls.map((c) => [c.method, c.args?.hosts]), [
+    ["script", ["web1"]],
+    ["exec", ["web1"]],
+    ["exec", ["web1"]],
+  ]);
+  assertEquals(s.calls[0].args?.script, "echo hi");
+  assertStringIncludes(String(s.calls[2].args?.command), "systemd-run");
+});
+
+Deno.test("sshTransport: a host that does not answer is reported with its ssh model", async () => {
+  const t = fleet.sshTransport("web1", {
+    sshModel: "ssh",
+    swamp: stubSwamp([execAnswer("", 255)]).api,
+  });
+  assertStringIncludes(
+    String(await t.probe()),
+    'Host "web1" did not answer over ssh (rc 255)',
+  );
+});
+
+Deno.test("transport.scan: parses the collector's marker line; no marker or no answer is null", async () => {
+  const ok = stubSwamp([{
+    ok: true,
+    artifacts: [{ host: "web1", stdout: collectorStdout(), exitCode: 0 }],
+  }]);
+  const inv = await fleet.sshTransport("web1", { sshModel: "ssh", swamp: ok.api })
+    .scan();
+  assertEquals(inv?.updatesCount, 3);
+  assertEquals(ok.calls[0].args?.script, fleet.COLLECTOR_SCRIPT);
+  for (
+    const answer of [
+      { ok: true, artifacts: [{ host: "web1", stdout: "no marker", exitCode: 0 }] },
+      { ok: false, error: "link down" },
+    ]
+  ) {
+    const t = fleet.sshTransport("web1", {
+      sshModel: "ssh",
+      swamp: stubSwamp([answer]).api,
+    });
+    assertEquals(await t.scan(), null);
+  }
+});
+
+Deno.test("transport.packages: an unreadable package list is null (unknown) on both transports — never an empty list", async () => {
+  const at = (answer: { ok: boolean; error?: string }) => [
+    fleet.sshTransport("web1", {
+      sshModel: "ssh",
+      swamp: stubSwamp([answer]).api,
+    }),
+    fleet.pctTransport("ct1", { node: "pve", ctid: 200 }, {
+      sshModel: "ssh",
+      swamp: stubSwamp([answer]).api,
+    }),
+  ];
+  // The run fails: no exception escapes, the list is unknown.
+  for (const t of at({ ok: false, error: "link down" })) {
+    assertEquals(await t.packages(), null);
+  }
+  // The command exits non-zero: also unknown, not a list parsed from its error text.
+  const ssh = fleet.sshTransport("web1", {
+    sshModel: "ssh",
+    swamp: stubSwamp([execAnswer("dpkg-query: error", 2)]).api,
+  });
+  assertEquals(await ssh.packages(), null);
+});
+
+Deno.test("safeOsUpdate: an unreadable package list records NO diff, not a fake one", async () => {
+  // Before-read fails, after-read works: a naive diff would list every package as added.
+  await withFake(
+    { ...osUpdateEnv(), FAKE_SWAMP_PKGS_1: execOut("", 1) },
+    async () => {
+      const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const run = t.one("run");
+      assertEquals(run.packages, null);
+      assertEquals(run.packagesChanged, null);
+      assertStringIncludes(
+        String(t.one("osUpdate").logs),
+        "package list unreadable",
+      );
+    },
+  );
+});
+
+Deno.test("pruneSnapshots: a record that names no snapshotter is kept with the reason; the others still prune", async () => {
+  await withFake({ FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW }, async () => {
+    const t = mkCtx(FLEET, {
+      data: {
+        snapshot: [
+          snapDatum("s-bad", {
+            name: "bad",
+            kind: "model",
+            vmid: null,
+            proxmoxNode: null,
+          }),
+          snapDatum("s-ok", { name: "ok" }),
+        ],
+      },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({}),
+      t.ctx,
+    );
+    const prune = t.one("prune");
+    assertEquals(
+      (prune.pruned as Array<{ name: string }>).map((p) => p.name),
+      ["ok"],
+    );
+    const kept = prune.kept as Array<{ name: string; reason: string }>;
+    assertEquals(kept.map((k) => k.name), ["bad"]);
+    assertStringIncludes(kept[0].reason, "names no snapshotter");
+  });
+});
+
+Deno.test("safeOsUpdate: the after-update package list is read BEFORE a rollback, on a VM too", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withCallLog(osUpdateEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          vm: { proxmoxNode: "pve", vmid: 100 },
+          health: [{ type: "http", url: server.url }],
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const all = await calls();
+      const lastPkgRead = all.map((c, i) => c.includes("dpkg-query") ? i : -1)
+        .filter((i) => i >= 0).pop()!;
+      const rollback = all.findIndex((c) => c.includes(" rollbackVm "));
+      assert(rollback > lastPkgRead, "package diff read before the rollback");
+      // So the run record still shows what the update changed.
+      assert((t.one("run").packages as unknown[]).length > 0);
+    });
+  } finally {
+    await server.stop();
+  }
 });

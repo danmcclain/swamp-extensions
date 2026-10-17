@@ -254,8 +254,8 @@ const Machine = z.object({
   os: z.boolean().default(true).describe("Collect OS package status"),
   health: z.array(HealthCheck).default([]).describe(
     "Health checks used as the healthyAfter verdict for OS update / reboot / docker. " +
-      "Every listed check must pass. Empty = reachability fallback. A source:community-script " +
-      "CT with no checks derives them from its updater model (healthUrl + service).",
+      "Every listed check must pass. Empty = reachability fallback. A machine with no checks " +
+      "but a `source` updater derives them from that updater model's healthUrl + service globalArgs.",
   ),
   reach: z.enum(["ssh", "pct"]).optional().describe(
     "How to run the OS scan: ssh (via sshModel) or pct (via the node, for CTs). " +
@@ -269,14 +269,33 @@ const Machine = z.object({
     "Marks a Proxmox CT and its location for pct exec — scan, OS update (with capture), and reboot. " +
       "A plain CT needs only this; no app source required.",
   ),
+  // ── Pluggable app updater ───────────────────────────────────────────────
+  // `source.model` names ANY model instance that implements the updater
+  // contract; @dmc/patch delegates to it by name via runModel and never needs
+  // its type. Consumers add their own update mechanism without changing
+  // @dmc/patch. Updater contract — the referenced model MUST expose:
+  //   • checkUpdate()                   — `scan` fires this to report availability.
+  //   • safeUpdate({ snapshot?: bool }) — guarded app update. When @dmc/patch
+  //       owns the snapshot it passes { snapshot: false } so the updater takes
+  //       none of its own; an updater that ignores the arg still works.
+  // Optional, for health derivation when the machine lists no `health`:
+  //   • globalArguments.healthUrl / healthExpectStatus / service
   source: z.object({
-    type: z.enum(["community-script"]).describe("App update mechanism"),
+    type: z.string().min(1).optional().describe(
+      'Optional label for the update mechanism (e.g. "community-script", ' +
+        '"swamp-binary"). Documentation only — @dmc/patch does not branch on it.',
+    ),
     model: z.string().min(1).describe(
-      "The updater instance (e.g. a @dmc/proxmox/community-script)",
+      "The updater model instance to delegate to. ANY model that implements the " +
+        "updater contract works: a `checkUpdate` method, a `safeUpdate({ snapshot? })` " +
+        "method, and optionally `healthUrl`/`healthExpectStatus`/`service` globalArgs " +
+        "for health derivation. E.g. a @dmc/proxmox/community-script instance.",
     ),
   }).optional().describe(
-    "Optional in-CT app updater on top of the OS lifecycle: version check + safe app update. " +
-      "Its presence is what triggers app-update delegation — not merely being a CT.",
+    "Optional app updater on top of the OS lifecycle: version check + safe app " +
+      "update, delegated to `source.model`. Its presence is what triggers " +
+      "app-update delegation — not merely being a CT. The model is reached by name; " +
+      "its type is irrelevant, so you can plug in your own updater.",
   ),
   proxmox: z.object({
     model: z.string().min(1).describe(
@@ -293,6 +312,32 @@ const Machine = z.object({
     vmid: z.number().int().describe("Proxmox VM id"),
   }).optional().describe(
     "Marks a Proxmox VM so an OS update can snapshot it first",
+  ),
+  // ── Pluggable snapshotter ───────────────────────────────────────────────
+  // Snapshot, rollback and cleanup act on ONE artifact, so they are ONE contract:
+  // whatever takes a snapshot must also roll it back and delete it. @dmc/patch ships
+  // two built-in snapshotters — proxmox-vm (the `vm` node model) and proxmox-ct
+  // (`pct` on the CT's node) — and `snapshotter.model` plugs in any other, reached by
+  // name via runModel. Snapshotter contract — the referenced model MUST expose:
+  //   • snapshot({ host, name })       — take a snapshot named `name` of `host`.
+  //   • rollback({ host, name })       — revert `host` to that snapshot.
+  //   • deleteSnapshot({ host, name }) — remove it (pruneSnapshots, after retention).
+  //   • listSnapshots({ host })        — write one resource whose attributes hold
+  //                                      `snapshots: [{ name }]` (pre-flight check).
+  // @dmc/patch chooses every name (`preupdate-<timestamp>`); the model must be able to
+  // find a snapshot again by that name. Success = the method run succeeds.
+  snapshotter: z.object({
+    model: z.string().min(1).describe(
+      "The snapshotter model instance. ANY model that implements the snapshotter " +
+        "contract works: snapshot({ host, name }), rollback({ host, name }), " +
+        "deleteSnapshot({ host, name }), and listSnapshots({ host }) writing a resource " +
+        "with `snapshots: [{ name }]`. @dmc/patch chooses the snapshot names.",
+    ),
+  }).optional().describe(
+    "Optional pluggable snapshot guard for safeOsUpdate, rollback and pruneSnapshots. " +
+      "When set it replaces the built-in proxmox-vm / proxmox-ct snapshotter, and it " +
+      "also lets a bare-metal machine be snapshot-guarded. The record of each snapshot " +
+      "remembers the snapshotter, so rollback and cleanup reach the one that took it.",
   ),
 });
 
@@ -447,16 +492,48 @@ export function runName(action: string, host: string, ts: string): string {
   return `run-${action}-${host}-${ts.replace(/[:.]/g, "-")}`;
 }
 
-// Tracks the lifecycle of a pre-update Proxmox VM snapshot: it is kept through
-// the reboot, health-verified, and only pruned after a retention window.
+// Which snapshotter implementation owns a snapshot, and where it lives. Persisted on
+// the SnapshotRecord, because `rollback` and `pruneSnapshots` run later, from the
+// record — and only the implementation that took a snapshot can roll it back or delete it.
+const SnapshotterRefSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("proxmox-vm"),
+    node: z.string().describe("Proxmox node model that holds the VM"),
+    vmid: z.number().int(),
+  }),
+  z.object({
+    kind: z.literal("proxmox-ct"),
+    node: z.string().describe(
+      "ssh host (in sshModel) that runs pct for the CT",
+    ),
+    ctid: z.number().int(),
+  }),
+  z.object({
+    kind: z.literal("model"),
+    model: z.string().describe(
+      "Snapshotter model instance (implements the snapshotter contract)",
+    ),
+  }),
+]);
+
+// Tracks the lifecycle of a pre-update snapshot (from any snapshotter): it is kept
+// through the reboot, health-verified, and only pruned after a retention window.
 const SnapshotRecord = z.object({
   host: z.string(),
-  kind: z.enum(["vm", "ct"]).default("vm").describe(
-    "vm → node-model snapshot API; ct → pct snapshot on the node host",
+  kind: z.enum(["vm", "ct", "model"]).default("vm").describe(
+    "vm → node-model snapshot API; ct → pct snapshot on the node host; " +
+      "model → a pluggable snapshotter model (see `snapshotter`)",
   ),
-  vmid: z.number().describe("VM id, or CT id when kind=ct"),
-  proxmoxNode: z.string().describe(
-    "node model (vm) or ssh host running pct (ct)",
+  vmid: z.number().nullable().describe(
+    "VM id, or CT id when kind=ct; null when kind=model",
+  ),
+  proxmoxNode: z.string().nullable().describe(
+    "node model (vm) or ssh host running pct (ct); null when kind=model",
+  ),
+  snapshotter: SnapshotterRefSchema.optional().describe(
+    "The implementation that took this snapshot; `rollback` and `pruneSnapshots` " +
+      "dispatch to it. Absent on records written before snapshotters were pluggable — " +
+      "those map from kind/vmid/proxmoxNode.",
   ),
   name: z.string(),
   reason: z.string(),
@@ -933,15 +1010,21 @@ export function isUnknownArgumentError(
     new RegExp(`\\b${name}\\b`).test(rejected);
 }
 
-/** Run the community-script source's `safeUpdate` for a CT whose snapshot @dmc/patch
- *  already owns: passes `{ snapshot: false }` so the source takes no snapshot of its own.
- *  An older source (@dmc/proxmox < 2026.10.01.1) rejects that argument; then retry ONCE
- *  with no arguments. Any other failure is returned as is, never retried. */
+/** Run a `source` updater's `safeUpdate`. When @dmc/patch already owns the snapshot
+ *  (the default) it passes `{ snapshot: false }` so the updater takes no snapshot of its
+ *  own. An older updater (e.g. @dmc/proxmox < 2026.10.01.1) rejects that argument; then
+ *  retry ONCE with no arguments. Any other failure is returned as is, never retried.
+ *  With `patchOwnsSnapshot: false` (an unguarded machine — no snapshotter) it calls
+ *  `safeUpdate` with no arguments, so the updater may guard itself. */
 export async function runSourceSafeUpdate(
   src: string,
   swamp: SwampApi,
   logger: Logger,
+  opts: { patchOwnsSnapshot?: boolean } = {},
 ): Promise<boolean> {
+  if (opts.patchOwnsSnapshot === false) {
+    return await runLogged(swamp, src, "safeUpdate", {}, logger);
+  }
   const first = await swamp.run(src, "safeUpdate", { snapshot: false });
   if (first.ok) return true;
   if (!isUnknownArgumentError(first, "snapshot")) {
@@ -1014,9 +1097,10 @@ export function utf8b64(s: string): string {
 export interface MachineShape {
   host: string;
   ct?: { proxmoxNode: string; ctid: number };
-  source?: { type: string; model: string };
+  source?: { type?: string; model: string };
   proxmox?: { model: string };
   vm?: { proxmoxNode: string; vmid: number };
+  snapshotter?: { model: string };
   reach?: "ssh" | "pct";
   health?: Array<z.infer<typeof HealthCheck>>;
 }
@@ -1026,9 +1110,12 @@ export function isCtMachine(m: MachineShape): boolean {
   return !!m.ct || (!m.vm && (m.reach === "pct" || !!m.proxmox?.model));
 }
 
-/** The community-script app-updater instance for a machine, or null. */
+/** The app-updater model instance for a machine, or null. Any `source.model` is
+ *  honoured regardless of `source.type` (the type is a documentation label only),
+ *  so consumers can plug in their own updater. The legacy `proxmox.model` ref is
+ *  still accepted as a fallback. */
 export function appSource(m: MachineShape): string | null {
-  if (m.source?.type === "community-script") return m.source.model;
+  if (m.source?.model) return m.source.model;
   if (m.proxmox?.model) return m.proxmox.model; // legacy
   return null;
 }
@@ -1088,27 +1175,232 @@ export async function resolveHealthChecks(
   return checks;
 }
 
-/** Run a (multi-line) shell script on a machine via its transport: `pct exec` on the
- *  node for a CT, the ssh model's `script` method otherwise. One model call. */
-async function runOnMachine(
-  m: MachineShape,
+// ---------------------------------------------------------------------------
+// Transports — how @dmc/patch reaches ONE machine.
+//
+// Two implementations sit behind the `Transport` interface; the machine's decorations
+// choose one (`transportFor`):
+//   • ssh — the host itself, through the ssh model's `script` (multi-line) and `exec`
+//           (one command) methods.
+//   • pct — a Proxmox CT, through `pct` on its node over the ssh model (a CT often has
+//           no ssh of its own). Scripts are shipped base64-encoded into `pct exec`.
+// safeOsUpdate, reboot, the health checks, pruneSnapshots' live gate and the
+// host-reachable check reach a machine only through a Transport; none of them branches
+// on ssh-vs-pct. `scan` keeps its own batched fan-out (one call for every ssh host, one
+// per node) to stay under swamp's runModel call budget.
+// ---------------------------------------------------------------------------
+
+/** Lists the installed packages, one `name<TAB>version` line each (rpm / dpkg / apk). */
+export const PKG_MANIFEST_CMD =
+  `if command -v rpm >/dev/null 2>&1; then rpm -qa --qf '%{NAME}\\t%{VERSION}-%{RELEASE}\\n'; ` +
+  `elif command -v dpkg-query >/dev/null 2>&1; then dpkg-query -W -f='\${Package}\\t\${Version}\\n'; ` +
+  `elif command -v apk >/dev/null 2>&1; then apk info -v | sed 's/-\\([^-]*-r[0-9][0-9]*\\)$/\\t\\1/'; fi`;
+
+/** The installed-package manifest from PKG_MANIFEST_CMD's output: name → version. */
+export function parseManifest(out: string): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const ln of out.split("\n")) {
+    const t = ln.trim();
+    if (!t) continue;
+    const tab = t.indexOf("\t");
+    if (tab > 0) m.set(t.slice(0, tab), t.slice(tab + 1));
+    else m.set(t, "");
+  }
+  return m;
+}
+
+/** The packages that differ between two manifests (added, removed or changed), by name. */
+export function diffPkgs(
+  b: Map<string, string>,
+  a: Map<string, string>,
+): Array<z.infer<typeof PkgChange>> {
+  const names = new Set<string>([...b.keys(), ...a.keys()]);
+  const out: Array<z.infer<typeof PkgChange>> = [];
+  for (const n of names) {
+    const from = b.get(n) ?? null;
+    const to = a.get(n) ?? null;
+    if (from !== to) out.push({ name: n, from, to });
+  }
+  out.sort((x, y) => x.name.localeCompare(y.name));
+  return out;
+}
+
+/** Reboot over ssh, scheduled with systemd-run so the exec call returns before sshd dies. */
+const SSH_REBOOT_CMD = `SUDO=""; [ "$(id -u)" != 0 ] && SUDO="sudo -n"; ` +
+  `$SUDO systemd-run --on-active=3 --timer-property=AccuracySec=100ms systemctl reboot`;
+
+/** How @dmc/patch reaches one machine. */
+export interface Transport {
+  via: "ssh" | "pct";
+  /** Where the commands run, for logs and errors. */
+  where: string;
+  /** Appended to some log lines: "" over ssh, " via pct" for a CT. */
+  note: string;
+  /** Why an update cannot start when the machine does not answer a scan. */
+  notReachable: string;
+  /** The CT's location (pct only): the built-in proxmox-ct snapshotter needs it. */
+  ct?: { node: string; ctid: number };
+  /** Run a multi-line script on the machine (one model call). */
+  script(
+    body: string,
+    timeoutSec: number,
+  ): Promise<{ rc: number; out: string }>;
+  /** Run one command on the machine. */
+  exec(
+    command: string,
+    timeoutSec: number,
+  ): Promise<{ rc: number; out: string }>;
+  /** The machine's patch inventory from the bundled collector; null when it does not answer. */
+  scan(): Promise<z.infer<typeof Inventory> | null>;
+  /** The installed-package manifest; null when it cannot be read (unknown is never
+   *  reported as an empty list, which would fake a diff). */
+  packages(): Promise<Map<string, string> | null>;
+  /** Pre-flight reachability: null when the machine answers, else why not. */
+  probe(): Promise<string | null>;
+  /** What `reboot` logs before it starts the reboot. */
+  rebootLabel: string;
+  /** Start a reboot; resolves with the command's exit code. */
+  reboot(): Promise<number>;
+  /** How long to wait after the reboot command before the first probe. */
+  rebootSettleMs: number;
+}
+
+/** What a transport needs to reach a machine. */
+export interface TransportDeps {
+  sshModel: string;
+  swamp: SwampApi;
+}
+
+/** The patch inventory from a collector run; null when there is no answer, no marker
+ *  line, or no valid JSON. */
+async function scanWith(
+  script: Transport["script"],
+): Promise<z.infer<typeof Inventory> | null> {
+  try {
+    const { out } = await script(COLLECTOR_SCRIPT, 240);
+    const line = markerLine(out, "patch-inventory");
+    return line ? JSON.parse(line) as z.infer<typeof Inventory> : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The installed-package manifest through `run`; null when it cannot be read — the
+ *  run fails or exits non-zero. An audit detail never aborts an update, and an unknown
+ *  list is never passed off as an empty one (that would fake the package diff). */
+async function packagesWith(
+  run: Transport["exec"],
+): Promise<Map<string, string> | null> {
+  try {
+    const r = await run(PKG_MANIFEST_CMD, 120);
+    return r.rc === 0 ? parseManifest(r.out) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** One `<sshModel> script` run on one host: its exit code and stdout. */
+async function scriptOnHost(
   sshModel: string,
-  script: string,
+  host: string,
+  body: string,
   timeoutSec: number,
   swamp: SwampApi,
 ): Promise<{ rc: number; out: string }> {
-  let host = m.host;
-  let body = script;
-  if (isCtMachine(m) && !m.vm) {
-    const { node, ctid } = await ctLocation(m, swamp);
-    host = node;
-    body = `pct exec ${ctid} -- bash -c "echo '${
-      utf8b64(script)
-    }' | base64 -d | bash"`;
-  }
   const runs = await runScript(sshModel, [host], body, timeoutSec, swamp);
   const r = runs.find((x) => x.host === host) ?? runs[0];
   return { rc: r?.exitCode ?? -1, out: r?.stdout ?? "" };
+}
+
+/** Reach a host over ssh. */
+export function sshTransport(host: string, deps: TransportDeps): Transport {
+  const { sshModel, swamp } = deps;
+  const script = (body: string, timeoutSec: number) =>
+    scriptOnHost(sshModel, host, body, timeoutSec, swamp);
+  const exec = (command: string, timeoutSec: number) =>
+    nodeExec(sshModel, host, command, timeoutSec, swamp);
+  return {
+    via: "ssh",
+    where: `host "${host}" over ${sshModel}`,
+    note: "",
+    notReachable: `host "${host}" is not ssh-reachable`,
+    script,
+    exec,
+    scan: () => scanWith(script),
+    packages: () => packagesWith(exec),
+    probe: async () => {
+      const r = await exec("true", 30);
+      return r.rc === 0
+        ? null
+        : `Host "${host}" did not answer over ${sshModel} (rc ${r.rc}). ` +
+          `Bring the host up or fix its ssh access.`;
+    },
+    rebootLabel: "scheduling systemctl reboot (+3s) over ssh",
+    reboot: async () => (await exec(SSH_REBOOT_CMD, 30)).rc,
+    rebootSettleMs: 15000,
+  };
+}
+
+/** Reach a Proxmox CT through `pct` on its node. A CT has no exec channel of its own,
+ *  so a single command is shipped the same way as a script. */
+export function pctTransport(
+  host: string,
+  ct: { node: string; ctid: number },
+  deps: TransportDeps,
+): Transport {
+  const { sshModel, swamp } = deps;
+  const { node, ctid } = ct;
+  const onNode = (command: string, timeoutSec: number) =>
+    nodeExec(sshModel, node, command, timeoutSec, swamp);
+  const script = (body: string, timeoutSec: number) =>
+    scriptOnHost(
+      sshModel,
+      node,
+      `pct exec ${ctid} -- bash -c "echo '${
+        utf8b64(body)
+      }' | base64 -d | bash"`,
+      timeoutSec,
+      swamp,
+    );
+  return {
+    via: "pct",
+    where: `CT ${ctid} on node "${node}"`,
+    note: " via pct",
+    notReachable: `CT "${host}" (ctid ${ctid}) not reachable via pct`,
+    ct,
+    script,
+    exec: script,
+    scan: () => scanWith(script),
+    packages: () => packagesWith(script),
+    probe: async () => {
+      const r = await onNode(`pct status ${ctid}`, 30);
+      return r.rc === 0 && /status:\s*running/.test(r.out)
+        ? null
+        : `CT "${host}" (ctid ${ctid}) is not running on node "${node}" ` +
+          `(pct status rc ${r.rc}). Start the CT or fix its ct decoration.`;
+    },
+    rebootLabel: `pct reboot ${ctid} on ${node}`,
+    reboot: async () => (await onNode(`pct reboot ${ctid}`, 180)).rc,
+    rebootSettleMs: 5000,
+  };
+}
+
+/** Which transport a machine uses, from its decorations alone (no lookup): pct for a CT
+ *  that is not also a VM, ssh otherwise. */
+export function transportVia(m: MachineShape): "ssh" | "pct" {
+  return isCtMachine(m) && !m.vm ? "pct" : "ssh";
+}
+
+/** The transport for a machine. A CT's location is resolved here (a legacy CT reads it
+ *  from its proxmox model). */
+export async function transportFor(
+  m: MachineShape,
+  deps: TransportDeps,
+): Promise<Transport> {
+  if (transportVia(m) === "pct") {
+    return pctTransport(m.host, await ctLocation(m, deps.swamp), deps);
+  }
+  return sshTransport(m.host, deps);
 }
 
 /** The marker a health batch prints after check `i`: `@@PATCH-HC <i> rc=<rc>`. */
@@ -1172,13 +1464,8 @@ export async function evalHealth(
       (t, c) => t + (c.type === "command" ? c.timeoutSec : 30),
       0,
     );
-    const r = await runOnMachine(
-      m,
-      sshModel,
-      healthBatchScript(snippets),
-      timeoutSec,
-      swamp,
-    );
+    const transport = await transportFor(m, { sshModel, swamp });
+    const r = await transport.script(healthBatchScript(snippets), timeoutSec);
     rcs = parseHealthBatch(r.out);
   }
   const results: HealthResult["results"] = [];
@@ -1198,6 +1485,9 @@ export async function evalHealth(
         });
         ok = res.status === c.expectStatus;
         detail = `status ${res.status}`;
+        // We only need the status; cancel the body so the connection does not
+        // leak (also satisfies the test leak sanitizer).
+        await res.body?.cancel();
       } catch (e) {
         detail = `fetch failed: ${(e as Error).message.slice(0, 60)}`;
       } finally {
@@ -1321,24 +1611,222 @@ function checkMachine(
 
 type Machine = z.infer<typeof Machine>;
 
-/** Names of the snapshots of a VM, from the node model's read-only `listVmSnapshots`. */
-export async function vmSnapshotNames(
-  nodeModel: string,
-  vmid: number,
+/** Snapshot names from a read-only list method whose first resource holds
+ *  `snapshots: [{ name }]` (Proxmox's `current` pseudo-snapshot is dropped). Throws when
+ *  the run fails; null when the model answered but the list is not readable. */
+async function listedSnapshotNames(
+  model: string,
+  method: string,
+  args: Record<string, unknown>,
   swamp: SwampApi,
 ): Promise<string[] | null> {
-  const res = await swamp.run(nodeModel, "listVmSnapshots", { vmid });
+  const res = await swamp.run(model, method, args);
   if (!res.ok) {
-    throw new Error(
-      tail(res.error, 300) || `${nodeModel} listVmSnapshots failed`,
-    );
+    throw new Error(tail(res.error, 300) || `${model} ${method} failed`);
   }
   const list = res.artifacts[0]?.snapshots;
-  // null: the node answered, but the list is not readable
+  // null: the model answered, but the list is not readable
   if (!Array.isArray(list)) return null;
   return list.map((s) => (s as { name?: string })?.name ?? "").filter((n) =>
     n && n !== "current"
   );
+}
+
+/** Names of the snapshots of a VM, from the node model's read-only `listVmSnapshots`. */
+export function vmSnapshotNames(
+  nodeModel: string,
+  vmid: number,
+  swamp: SwampApi,
+): Promise<string[] | null> {
+  return listedSnapshotNames(nodeModel, "listVmSnapshots", { vmid }, swamp);
+}
+
+// ---------------------------------------------------------------------------
+// Snapshotters — the pluggable snapshot lifecycle.
+//
+// Snapshot, rollback and cleanup act on one artifact, so ONE implementation owns all
+// three. Three implementations sit behind the `Snapshotter` interface:
+//   • proxmox-vm — the `vm` node model: snapshotVm / rollbackVm / deleteVmSnapshot /
+//                  listVmSnapshots (built in).
+//   • proxmox-ct — `pct snapshot|rollback|delsnapshot|listsnapshot` on the CT's node,
+//                  over the ssh model (built in).
+//   • model      — any model named by a machine's `snapshotter.model`, driven by name
+//                  through runModel with the snapshotter contract (the extension point).
+// safeOsUpdate picks the implementation from the machine's decorations
+// (`snapshotterRefFor`). The SnapshotRecord persists that choice, and `rollback` /
+// `pruneSnapshots` dispatch from the record (`snapshotterRefFromRecord`), so a snapshot
+// is always rolled back and deleted by the implementation that took it.
+// ---------------------------------------------------------------------------
+
+/** Which implementation owns a snapshot, and where. */
+export type SnapshotterRef = z.infer<typeof SnapshotterRefSchema>;
+
+/** One snapshot backend. @dmc/patch chooses every snapshot name. snapshot / rollback /
+ *  delete report the outcome as a boolean (a broken ssh transport may still throw);
+ *  the caller decides whether to abort the update or keep the record. */
+export interface Snapshotter {
+  ref: SnapshotterRef;
+  /** Where the snapshots live, for logs and check messages. */
+  where: string;
+  snapshot(name: string): Promise<boolean>;
+  rollback(name: string): Promise<boolean>;
+  delete(name: string): Promise<boolean>;
+  /** Snapshot names; null when the backend answered but the list is unreadable.
+   *  Throws when the backend does not answer. */
+  list(): Promise<string[] | null>;
+}
+
+/** What a snapshotter needs to reach its backend. */
+export interface SnapshotterDeps {
+  sshModel: string;
+  swamp: SwampApi;
+  /** The machine — passed to a model snapshotter, so one instance can serve many machines. */
+  host: string;
+  /** Receives warnings about failed model runs. Checks pass none (they only list). */
+  logger?: Logger;
+}
+
+const SILENT_LOGGER: Logger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+};
+
+/** The snapshotter a machine uses now, from its decorations. An explicit
+ *  `snapshotter.model` wins; else the built-in proxmox-vm (`vm`); else proxmox-ct when
+ *  the caller passes the CT's resolved location; else null — no snapshot guard. */
+export function snapshotterRefFor(
+  m: MachineShape,
+  ct?: { node: string; ctid: number },
+): SnapshotterRef | null {
+  if (m.snapshotter?.model) {
+    return { kind: "model", model: m.snapshotter.model };
+  }
+  if (m.vm) {
+    return { kind: "proxmox-vm", node: m.vm.proxmoxNode, vmid: m.vm.vmid };
+  }
+  if (ct) return { kind: "proxmox-ct", node: ct.node, ctid: ct.ctid };
+  return null;
+}
+
+/** The snapshotter that took a recorded snapshot. Records written before snapshotters
+ *  were pluggable carry no `snapshotter`; they map from kind/vmid/proxmoxNode. */
+export function snapshotterRefFromRecord(
+  a: z.infer<typeof SnapshotRecord>,
+): SnapshotterRef {
+  if (a.snapshotter) return a.snapshotter;
+  if (a.vmid === null || a.proxmoxNode === null) {
+    throw new Error(
+      `snapshot record ${a.name} of ${a.host} names no snapshotter and no Proxmox location`,
+    );
+  }
+  return a.kind === "ct"
+    ? { kind: "proxmox-ct", node: a.proxmoxNode, ctid: a.vmid }
+    : { kind: "proxmox-vm", node: a.proxmoxNode, vmid: a.vmid };
+}
+
+/** The location fields of a SnapshotRecord for a snapshotter: the ref itself, plus the
+ *  plain kind/vmid/proxmoxNode that reports and older readers of Proxmox records use. */
+export function snapshotRecordLocation(ref: SnapshotterRef): {
+  kind: "vm" | "ct" | "model";
+  vmid: number | null;
+  proxmoxNode: string | null;
+  snapshotter: SnapshotterRef;
+} {
+  switch (ref.kind) {
+    case "proxmox-vm":
+      return {
+        kind: "vm",
+        vmid: ref.vmid,
+        proxmoxNode: ref.node,
+        snapshotter: ref,
+      };
+    case "proxmox-ct":
+      return {
+        kind: "ct",
+        vmid: ref.ctid,
+        proxmoxNode: ref.node,
+        snapshotter: ref,
+      };
+    case "model":
+      return { kind: "model", vmid: null, proxmoxNode: null, snapshotter: ref };
+  }
+}
+
+/** The error that aborts an update when the pre-update snapshot fails. */
+export function snapshotFailedMessage(
+  ref: SnapshotterRef,
+  host: string,
+): string {
+  switch (ref.kind) {
+    case "proxmox-vm":
+      return `snapshot failed on ${ref.node} for vmid ${ref.vmid} — aborting update`;
+    case "proxmox-ct":
+      return `pct snapshot failed for ctid ${ref.ctid} on ${ref.node} — aborting update`;
+    case "model":
+      return `snapshotter model "${ref.model}" failed to snapshot ${host} — aborting update`;
+  }
+}
+
+/** The implementation behind a snapshotter ref. The built-in ones issue exactly the
+ *  Proxmox calls they always have; the model one drives the snapshotter contract. */
+export function snapshotterFor(
+  ref: SnapshotterRef,
+  deps: SnapshotterDeps,
+): Snapshotter {
+  const { sshModel, swamp, host } = deps;
+  const logger = deps.logger ?? SILENT_LOGGER;
+  switch (ref.kind) {
+    case "proxmox-vm": {
+      const { node, vmid } = ref;
+      const call = (method: string, name: string) =>
+        runLogged(swamp, node, method, { vmid, name }, logger);
+      return {
+        ref,
+        where: `VM ${vmid} via node model "${node}"`,
+        snapshot: (name) => call("snapshotVm", name),
+        rollback: (name) => call("rollbackVm", name),
+        delete: (name) => call("deleteVmSnapshot", name),
+        list: () => vmSnapshotNames(node, vmid, swamp),
+      };
+    }
+    case "proxmox-ct": {
+      const { node, ctid } = ref;
+      const pct = (op: string, timeoutSec: number) =>
+        nodeExec(sshModel, node, `pct ${op}`, timeoutSec, swamp);
+      const ok = async (op: string, timeoutSec: number) =>
+        (await pct(op, timeoutSec)).rc === 0;
+      return {
+        ref,
+        where: `CT ${ctid} on node "${node}"`,
+        snapshot: (name) => ok(`snapshot ${ctid} ${name}`, 300),
+        rollback: (name) => ok(`rollback ${ctid} ${name}`, 300),
+        delete: (name) => ok(`delsnapshot ${ctid} ${name}`, 180),
+        list: async () => {
+          const r = await pct(`listsnapshot ${ctid}`, 30);
+          if (r.rc !== 0) throw new Error(`pct listsnapshot rc ${r.rc}`);
+          return [...r.out.matchAll(/->\s*(\S+)/g)].map((m) => m[1]).filter(
+            (n) => n !== "current",
+          );
+        },
+      };
+    }
+    case "model": {
+      const { model } = ref;
+      const call = (method: string, name: string) =>
+        runLogged(swamp, model, method, { host, name }, logger);
+      return {
+        ref,
+        where: `snapshotter model "${model}" (host ${host})`,
+        snapshot: (name) => call("snapshot", name),
+        rollback: (name) => call("rollback", name),
+        delete: (name) => call("deleteSnapshot", name),
+        list: () =>
+          listedSnapshotNames(model, "listSnapshots", { host }, swamp),
+      };
+    }
+  }
 }
 
 /** `policy` — the `host` argument names a machine in the fleet. */
@@ -1390,41 +1878,16 @@ export async function checkHostReachable(ctx: CheckCtx): Promise<CheckResult> {
   const found = checkMachine(ctx);
   if (!found) return PASS;
   const { host, machine } = found;
-  const { sshModel } = ctx.globalArgs;
-  // safeUpdate always reaches the docker host over ssh; the others follow the OS path.
-  const viaPct = ctx.methodName !== "safeUpdate" && !machine.vm &&
-    isCtMachine(machine);
-  const swamp = checkSwamp(ctx);
+  const deps = { sshModel: ctx.globalArgs.sshModel, swamp: checkSwamp(ctx) };
   try {
-    if (viaPct) {
-      const { node, ctid } = await ctLocation(machine, swamp);
-      const r = await nodeExec(
-        sshModel,
-        node,
-        `pct status ${ctid}`,
-        30,
-        swamp,
-      );
-      if (r.rc !== 0 || !/status:\s*running/.test(r.out)) {
-        return fail(
-          `CT "${host}" (ctid ${ctid}) is not running on node "${node}" ` +
-            `(pct status rc ${r.rc}). Start the CT or fix its ct decoration. ${
-              skipHint("host-reachable", "live")
-            }`,
-        );
-      }
-      return PASS;
-    }
-    const r = await nodeExec(sshModel, host, "true", 30, swamp);
-    if (r.rc !== 0) {
-      return fail(
-        `Host "${host}" did not answer over ${sshModel} (rc ${r.rc}). ` +
-          `Bring the host up or fix its ssh access. ${
-            skipHint("host-reachable", "live")
-          }`,
-      );
-    }
-    return PASS;
+    // safeUpdate always reaches the docker host over ssh; the others follow the OS path.
+    const transport = ctx.methodName === "safeUpdate"
+      ? sshTransport(host, deps)
+      : await transportFor(machine, deps);
+    const why = await transport.probe();
+    return why === null
+      ? PASS
+      : fail(`${why} ${skipHint("host-reachable", "live")}`);
   } catch (e) {
     return fail(
       `Host "${host}" is not reachable: ${
@@ -1473,7 +1936,8 @@ export async function checkBaselineHealthy(
   }
 }
 
-/** `live` — the VM/CT location resolves, its node answers, and (rollback) a snapshot exists. */
+/** `live` — the machine's snapshotter (a pluggable model, or the built-in VM node model /
+ *  CT pct) answers a list, and (rollback) a snapshot exists. */
 export async function checkSnapshotTargetResolves(
   ctx: CheckCtx,
 ): Promise<CheckResult> {
@@ -1482,42 +1946,30 @@ export async function checkSnapshotTargetResolves(
   const { host, machine } = found;
   const hint = skipHint("snapshot-target-resolves", "live");
   const isCt = !machine.vm && isCtMachine(machine);
-  if (!machine.vm && !isCt) return PASS; // bare metal: nothing to snapshot
+  // No snapshot guard (bare metal without a snapshotter): nothing to resolve.
+  if (!machine.snapshotter && !machine.vm && !isCt) return PASS;
   const wanted = checkArg(ctx, "snapshot");
   const needSnapshot = ctx.methodName === "rollback";
   const swamp = checkSwamp(ctx);
   let names: string[] | null = null;
-  let where: string;
+  let where = "the snapshot target";
   try {
-    if (machine.vm) {
-      const { proxmoxNode, vmid } = machine.vm;
-      where = `VM ${vmid} via node model "${proxmoxNode}"`;
-      names = await vmSnapshotNames(proxmoxNode, vmid, swamp);
-    } else {
-      const { node, ctid } = await ctLocation(machine, swamp);
-      where = `CT ${ctid} on node "${node}"`;
-      const r = await nodeExec(
-        ctx.globalArgs.sshModel,
-        node,
-        `pct listsnapshot ${ctid}`,
-        30,
-        swamp,
-      );
-      if (r.rc !== 0) {
-        return fail(
-          `Machine "${host}": ${where} did not answer (pct listsnapshot rc ${r.rc}). ` +
-            `Fix the ct decoration or the node. ${hint}`,
-        );
-      }
-      names = [...r.out.matchAll(/->\s*(\S+)/g)].map((m) => m[1]).filter((n) =>
-        n !== "current"
-      );
-    }
+    // The CT location is only needed for the built-in pct snapshotter.
+    const ct = !machine.snapshotter && isCt
+      ? await ctLocation(machine, swamp)
+      : undefined;
+    const snapper = snapshotterFor(snapshotterRefFor(machine, ct)!, {
+      sshModel: ctx.globalArgs.sshModel,
+      swamp,
+      host,
+    });
+    where = snapper.where;
+    names = await snapper.list();
   } catch (e) {
     return fail(
-      `Machine "${host}": the snapshot target did not resolve: ${
+      `Machine "${host}": ${where} did not resolve: ${
         (e as Error).message.slice(0, 300)
-      }. Fix the vm/ct decoration or the node. ${hint}`,
+      }. Fix the vm/ct/snapshotter decoration or the node. ${hint}`,
     );
   }
   if (needSnapshot && names !== null) {
@@ -1727,7 +2179,7 @@ export function parseCtSections(
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.10.09.1",
+  version: "2026.10.16.1",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
@@ -1739,6 +2191,17 @@ export const model = {
       toVersion: "2026.10.09.1",
       description:
         "Version bump, no globalArguments schema change (adds the clearRetired method; reads own data by model id)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.16.1",
+      description:
+        "Additive globalArguments change, no migration needed: `source.type` is now an " +
+        "optional label (any model that implements the updater contract can be a " +
+        "`source`, on any machine kind), and machines take an optional pluggable " +
+        "`snapshotter`. Snapshot records gain a `snapshotter` field; older records map " +
+        "from kind/vmid/proxmoxNode. Internally every per-machine operation reaches its " +
+        "machine through one ssh / pct Transport.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1784,7 +2247,7 @@ export const model = {
     },
     snapshot: {
       description:
-        "Lifecycle of a pre-update VM snapshot: kept through the reboot, health-verified, pruned only after a retention window by pruneSnapshots.",
+        "Lifecycle of a pre-update snapshot (from any snapshotter, recorded in `snapshotter`): kept through the reboot, health-verified, pruned only after a retention window by pruneSnapshots, through the snapshotter that took it.",
       schema: SnapshotRecord,
       lifetime: "infinite" as const,
       garbageCollection: 1000,
@@ -2358,7 +2821,10 @@ export const model = {
                 signal: ctrl.signal,
                 redirect: "manual",
               });
-              return r.status === dcfg.healthExpectStatus ? true : null;
+              const healthy = r.status === dcfg.healthExpectStatus;
+              // Cancel the body so the connection does not leak.
+              await r.body?.cancel();
+              return healthy ? true : null;
             } catch {
               return null;
             } finally {
@@ -2559,7 +3025,16 @@ export const model = {
     },
     safeOsUpdate: {
       description:
-        "Snapshot-guarded OS update for one machine. Proxmox VM (vm decoration): snapshot via the node model → upgrade over ssh → re-scan; roll back the snapshot when the host does not return healthy. Proxmox CT (proxmox decoration): delegate to the community-script safeUpdate. Bare metal: plain safe upgrade, no snapshot. Reboot is never automatic.",
+        "Snapshot-guarded OS update for one machine: snapshot → upgrade → re-scan → " +
+        "health verdict → roll back the snapshot when the machine does not return healthy. " +
+        "The snapshot guard is pluggable: a `snapshotter` decoration names any model that " +
+        "implements the snapshotter contract (it also guards bare metal); otherwise a " +
+        "Proxmox VM (vm decoration) is snapshotted via its node model and a Proxmox CT " +
+        "(ct decoration) via pct, and bare metal is upgraded unguarded. VMs and bare metal " +
+        "upgrade over ssh; CTs via pct exec. An app updater (`source`) runs on top for any " +
+        "machine kind, under the same snapshot: it is called with snapshot:false when " +
+        "@dmc/patch took the snapshot, and with no arguments on an unguarded machine. " +
+        "Reboot is never automatic.",
       arguments: z.object({
         host: z.string().min(1).describe("Machine (host) to update"),
         mode: z.enum(["safe", "full"]).default("safe").describe(
@@ -2567,10 +3042,12 @@ export const model = {
         ),
         retentionHours: z.number().int().default(DEFAULT_RETENTION_HOURS)
           .describe(
-            "How long the pre-update VM snapshot is retained as a rollback point before pruneSnapshots may delete it (default 7 days). The snapshot is never auto-deleted.",
+            "How long the pre-update snapshot is retained as a rollback point before pruneSnapshots may delete it (default 7 days). The snapshot is never auto-deleted.",
           ),
         rollbackOnFailure: z.boolean().default(true).describe(
-          "Roll back when the machine is unhealthy after the upgrade",
+          "Roll back to the pre-update snapshot when the machine is unhealthy after the " +
+            "update, whatever the upgrade's exit code. Applies to every machine kind that " +
+            "has a snapshot guard. false = keep the unhealthy machine as-is (outcome failed).",
         ),
         healthGraceSec: z.number().int().min(0).default(120).describe(
           "Grace window for the post-update health check. While the machine is unhealthy, re-check every 10 s until healthy or this many seconds have passed (a docker-ce upgrade restarts every container). 0 = check once.",
@@ -2639,385 +3116,138 @@ export const model = {
           `  $SUDO apk upgrade`,
           `else echo "no known package manager" >&2; exit 3; fi`,
         ].join("\n");
-        const pkgCmd =
-          `if command -v rpm >/dev/null 2>&1; then rpm -qa --qf '%{NAME}\\t%{VERSION}-%{RELEASE}\\n'; ` +
-          `elif command -v dpkg-query >/dev/null 2>&1; then dpkg-query -W -f='\${Package}\\t\${Version}\\n'; ` +
-          `elif command -v apk >/dev/null 2>&1; then apk info -v | sed 's/-\\([^-]*-r[0-9][0-9]*\\)$/\\t\\1/'; fi`;
-        const parseManifest = (out: string): Map<string, string> => {
-          const m = new Map<string, string>();
-          for (const ln of out.split("\n")) {
-            const t = ln.trim();
-            if (!t) continue;
-            const tab = t.indexOf("\t");
-            if (tab > 0) m.set(t.slice(0, tab), t.slice(tab + 1));
-            else m.set(t, "");
-          }
-          return m;
-        };
-        const diffPkgs = (b: Map<string, string>, a: Map<string, string>) => {
-          const names = new Set<string>([...b.keys(), ...a.keys()]);
-          const out: Array<z.infer<typeof PkgChange>> = [];
-          for (const n of names) {
-            const from = b.get(n) ?? null;
-            const to = a.get(n) ?? null;
-            if (from !== to) out.push({ name: n, from, to });
-          }
-          out.sort((x, y) => x.name.localeCompare(y.name));
-          return out;
-        };
-        const collector = COLLECTOR_SCRIPT;
 
-        // ---- CT: snapshot-guarded OS update inside the container via pct (captured),
-        // plus the optional app updater (community-script) on top — one snapshot guards both. ----
-        if (isCtMachine(machine) && !machine.vm) {
-          const { node, ctid } = await ctLocation(machine, swamp);
-          const collectorB64 = utf8b64(collector);
-          // Ship a shell snippet into the CT via pct, piped as a script (like scanCt) to
-          // avoid the nested-quote breakage of `pct exec -- sh -c "..."` through exec.
-          const ctExec = async (
-            snippet: string,
-            t: number,
-          ): Promise<{ rc: number; out: string }> => {
-            const runs = await runScript(
-              sshModel,
-              [node],
-              `pct exec ${ctid} -- bash -c "echo '${
-                utf8b64(snippet)
-              }' | base64 -d | bash"`,
-              t,
-              swamp,
-            );
-            const r = runs.find((x) => x.host === node) ?? runs[0];
-            return { rc: r?.exitCode ?? -1, out: r?.stdout ?? "" };
-          };
-          const scanCt = async (): Promise<
-            z.infer<typeof Inventory> | null
-          > => {
-            try {
-              const runs = await runScript(
-                sshModel,
-                [node],
-                `pct exec ${ctid} -- bash -c "echo '${collectorB64}' | base64 -d | bash"`,
-                240,
-                swamp,
-              );
-              const r = runs.find((x) => x.host === node) ?? runs[0];
-              const line = r ? markerLine(r.stdout, "patch-inventory") : null;
-              return line
-                ? JSON.parse(line) as z.infer<typeof Inventory>
-                : null;
-            } catch {
-              return null;
-            }
-          };
-          const pct = (opArgs: string, t = 300) =>
-            nodeExec(sshModel, node, `pct ${opArgs}`, t, swamp);
+        // Reach the machine (pct on its node for a CT, ssh otherwise) and pick its
+        // snapshot guard: an explicit `snapshotter`, else the built-in proxmox-vm (`vm`)
+        // or proxmox-ct (a CT), else none — bare metal is upgraded unguarded. From here
+        // one flow serves every machine kind.
+        const transport = await transportFor(machine, { sshModel, swamp });
+        const snapRef = snapshotterRefFor(machine, transport.ct);
+        const snapper = snapRef
+          ? snapshotterFor(snapRef, {
+            sshModel,
+            swamp,
+            host: args.host,
+            logger: context.logger,
+          })
+          : null;
+        const kind: z.infer<typeof OsUpdateResult>["kind"] =
+          transport.via === "pct" ? "ct" : machine.vm ? "vm" : "bare-metal";
 
-          const before = await scanCt();
-          if (!before) {
-            throw new Error(
-              `CT "${args.host}" (ctid ${ctid}) not reachable via pct — cannot update`,
-            );
-          }
-          log(
-            `before: ${
-              before.updatesCount ?? "?"
-            } updates (${before.packageManager}) via pct`,
-          );
-          const beforePkgs = parseManifest((await ctExec(pkgCmd, 120)).out);
-
-          // Snapshot the CT up front (guards the OS update AND the app update on top).
-          const snapCreatedAt = new Date().toISOString();
-          const snap = `preupdate-${snapCreatedAt.replace(/[:.]/g, "-")}`;
-          log(`snapshot ${snap} (ctid ${ctid}) via pct on ${node}`);
-          const s = await pct(`snapshot ${ctid} ${snap}`);
-          if (s.rc !== 0) {
-            throw new Error(
-              `pct snapshot failed for ctid ${ctid} (rc ${s.rc}) — aborting update`,
-            );
-          }
-
-          log(`upgrading CT (${args.mode}) via pct`);
-          const up = await ctExec(upScript, 1800);
-          log(`upgrade rc ${up.rc}`);
-
-          // App updater (community-script) on top — only when a source is configured.
-          const src = appSource(machine);
-          let appNote = "";
-          if (src) {
-            // This method owns the snapshot (taken above) and the rollback, so the
-            // source must not take a second, untracked snapshot.
-            const ok = await runSourceSafeUpdate(src, swamp, context.logger);
-            appNote = `; app ${src}: ${ok ? "ok" : "failed"}`;
-            log(`app source ${src} safeUpdate: ${ok ? "ok" : "failed"}`);
-          }
-
-          const after = await scanCt();
-          const reachable = after !== null;
-          const healthy = await afterHealthy(reachable);
-          const pkgs = reachable
-            ? diffPkgs(
-              beforePkgs,
-              parseManifest((await ctExec(pkgCmd, 120)).out),
-            )
-            : null;
-          if (pkgs) log(`packages changed: ${pkgs.length}`);
-
-          let ctOutcome: z.infer<typeof OsUpdateResult>["outcome"];
-          let rolledBack = false;
-          if (!healthy) {
-            log(`unhealthy after update — rolling back to ${snap}`);
-            rolledBack = (await pct(`rollback ${ctid} ${snap}`)).rc === 0;
-            ctOutcome = "rolled-back";
-            log(
-              rolledBack
-                ? `rolled back to ${snap}`
-                : `ROLLBACK FAILED — snapshot ${snap} kept`,
-            );
-          } else if (up.rc !== 0) {
-            ctOutcome = "failed"; // upgrade failed but CT is up — no rollback, snapshot retained
-            log(
-              "upgrade command failed — CT healthy, no rollback; snapshot retained",
-            );
-          } else {
-            ctOutcome =
-              (before.updatesCount ?? 0) !== (after!.updatesCount ?? 0)
-                ? "updated"
-                : "no-change";
-          }
-
-          const runTs = new Date().toISOString();
-          const retainUntil = new Date(
-            new Date(snapCreatedAt).getTime() +
-              args.retentionHours * 3600 * 1000,
-          ).toISOString();
-          const dataHandles = [
-            await context.writeResource("osUpdate", `os-update-${args.host}`, {
-              host: args.host,
-              kind: "ct",
-              mode: args.mode,
-              outcome: ctOutcome,
-              snapshot: snap,
-              snapshotKept: !rolledBack,
-              beforeUpdates: before.updatesCount ?? null,
-              afterUpdates: after?.updatesCount ?? null,
-              healthyAfter: healthy,
-              rolledBack,
-              needsReboot: after?.needsReboot ?? false,
-              logs: logs.join("\n") + appNote,
-              timestamp: runTs,
-            }),
-            await context.writeResource(
-              "run",
-              runName("osUpdate", args.host, runTs),
-              {
-                runId: `osUpdate-${args.host}-${runTs.replace(/[:.]/g, "-")}`,
-                action: "osUpdate",
-                host: args.host,
-                outcome: ctOutcome,
-                beforeUpdates: before.updatesCount ?? null,
-                afterUpdates: after?.updatesCount ?? null,
-                packages: pkgs,
-                packagesChanged: pkgs ? pkgs.length : null,
-                images: null,
-                imagesChanged: null,
-                snapshot: snap,
-                rolledBack,
-                needsReboot: after?.needsReboot ?? null,
-                timestamp: runTs,
-              },
-            ),
-          ];
-          // Track the CT snapshot for retention/prune (unless a rollback already consumed it).
-          if (!rolledBack) {
-            dataHandles.push(
-              await context.writeResource(
-                "snapshot",
-                `snap-${args.host}-${snapCreatedAt.replace(/[:.]/g, "-")}`,
-                {
-                  host: args.host,
-                  kind: "ct",
-                  vmid: ctid,
-                  proxmoxNode: node,
-                  name: snap,
-                  reason: "safeOsUpdate",
-                  createdAt: snapCreatedAt,
-                  retainUntil,
-                  healthConfirmed: healthy,
-                  rebootRequired: after?.needsReboot ?? false,
-                  rebootConfirmed: false,
-                  status: "active",
-                  prunedAt: null,
-                },
-              ),
-            );
-            log(`snapshot ${snap} retained until ${retainUntil}`);
-          }
-          if (after) {
-            dataHandles.push(
-              await context.writeResource("inventory", args.host, {
-                ...after,
-                reachMethod: "pct",
-                // After a rollback the restored state is unchecked: leave it to the next scan.
-                health: rolledBack ? null : inventoryHealth(lastHealth),
-                error: null,
-              }),
-            );
-          }
-          context.logger.info(
-            "OS update of {host} finished: outcome={outcome} rolledBack={rolledBack}",
-            { host: args.host, outcome: ctOutcome, rolledBack },
-          );
-          return { dataHandles };
-        }
-
-        // ---- VM / bare metal: OS upgrade over ssh, snapshot-guarded for VMs ----
-        const isVm = !!machine.vm;
-        const scanHost = async (): Promise<
-          z.infer<typeof Inventory> | null
-        > => {
-          let runs: HostRun[] = [];
-          try {
-            runs = await runScript(
-              sshModel,
-              [args.host],
-              collector,
-              240,
-              swamp,
-            );
-          } catch {
-            return null;
-          }
-          const r = runs.find((x) => x.host === args.host) ?? runs[0];
-          if (!r) return null;
-          const line = markerLine(r.stdout, "patch-inventory");
-          if (!line) return null;
-          try {
-            return JSON.parse(line) as z.infer<typeof Inventory>;
-          } catch {
-            return null;
-          }
-        };
-
-        const before = await scanHost();
+        const before = await transport.scan();
         if (!before) {
-          throw new Error(
-            `host "${args.host}" is not ssh-reachable — cannot update`,
-          );
+          throw new Error(`${transport.notReachable} — cannot update`);
         }
         log(
           `before: ${
             before.updatesCount ?? "?"
-          } updates (${before.packageManager})`,
+          } updates (${before.packageManager})${transport.note}`,
         );
 
+        // Snapshot up front: it guards the OS update AND the app update on top.
         let snap: string | null = null;
         let snapCreatedAt: string | null = null;
-        if (isVm) {
+        if (snapper) {
           snapCreatedAt = new Date().toISOString();
           snap = `preupdate-${snapCreatedAt.replace(/[:.]/g, "-")}`;
-          log(
-            `snapshot ${snap} (vmid ${machine.vm!.vmid}) via ${
-              machine.vm!.proxmoxNode
-            }`,
-          );
-          const s = await runLogged(
-            swamp,
-            machine.vm!.proxmoxNode,
-            "snapshotVm",
-            { vmid: machine.vm!.vmid, name: snap },
-            context.logger,
-          );
-          if (!s) {
-            throw new Error(
-              `snapshot failed on ${machine.vm!.proxmoxNode} for vmid ${
-                machine.vm!.vmid
-              } — aborting update`,
-            );
+          log(`snapshot ${snap} (${snapper.where})`);
+          if (!(await snapper.snapshot(snap))) {
+            throw new Error(snapshotFailedMessage(snapper.ref, args.host));
           }
         }
 
-        // Installed-package manifest over ssh, for the before/after diff (shared pkgCmd/parse).
-        const manifest = async (): Promise<Map<string, string>> => {
-          try {
-            return parseManifest(
-              (await nodeExec(sshModel, args.host, pkgCmd, 120, swamp)).out,
-            );
-          } catch {
-            return new Map();
-          }
-        };
-        const beforePkgs = await manifest();
+        const beforePkgs = await transport.packages();
 
-        log(`upgrading (${args.mode})`);
-        const up = await nodeExec(sshModel, args.host, upScript, 1800, swamp);
+        log(`upgrading (${args.mode})${transport.note}`);
+        const up = await transport.exec(upScript, 1800);
         log(`upgrade rc ${up.rc}`);
 
-        let outcome: z.infer<typeof OsUpdateResult>["outcome"];
-        let rolledBack = false;
-        // Snapshots are never auto-deleted here — they are retained as a rollback
-        // point and only removed later by pruneSnapshots after the retention window.
-        const snapshotKept = isVm && !!snap;
-        const after = await scanHost();
+        // App updater on top — only when a `source` is configured. The snapshot above
+        // (if any) guards both, so the updater is told not to take its own; an
+        // unguarded machine lets the updater decide.
+        const src = appSource(machine);
+        let appNote = "";
+        if (src) {
+          const ok = await runSourceSafeUpdate(src, swamp, context.logger, {
+            patchOwnsSnapshot: !!snapper,
+          });
+          appNote = `; app ${src}: ${ok ? "ok" : "failed"}`;
+          log(`app source ${src} safeUpdate: ${ok ? "ok" : "failed"}`);
+        }
+
+        const after = await transport.scan();
         const healthy = await afterHealthy(after !== null);
 
-        if (up.rc !== 0) {
-          // The upgrade command failed but the host is still up — do NOT roll back.
-          outcome = "failed";
-          log(
-            "upgrade command failed — host left as-is, no rollback; snapshot retained",
-          );
-        } else if (healthy) {
-          outcome = (before.updatesCount ?? 0) !== (after?.updatesCount ?? 0)
-            ? "updated"
-            : "no-change";
-          log(`healthy after (${after?.updatesCount ?? "?"} updates left)`);
-        } else if (isVm && snap && args.rollbackOnFailure) {
+        // What the update changed — read before any rollback, so a rolled-back run still
+        // records it, and a machine is never read while it is being restored. When
+        // either list is unreadable, record no diff rather than a misleading one.
+        let pkgs: Array<z.infer<typeof PkgChange>> | null = null;
+        if (after) {
+          const afterPkgs = await transport.packages();
+          if (beforePkgs && afterPkgs) {
+            pkgs = diffPkgs(beforePkgs, afterPkgs);
+            log(`packages changed: ${pkgs.length}`);
+          } else {
+            log("package list unreadable — no package diff recorded");
+          }
+        }
+
+        // Outcome — health first, the same for every machine kind:
+        //   unhealthy + snapshot + rollbackOnFailure → roll back       → rolled-back
+        //   unhealthy, otherwise                     → keep as-is      → failed
+        //   healthy, but the upgrade command failed  → no rollback     → failed
+        //   healthy                                  → updated / no-change
+        // An unhealthy machine is rolled back whatever the upgrade's exit code.
+        let outcome: z.infer<typeof OsUpdateResult>["outcome"];
+        let rolledBack = false;
+        if (!healthy && snapper && snap && args.rollbackOnFailure) {
           log(`unhealthy after upgrade — rolling back to ${snap}`);
-          rolledBack = await runLogged(
-            swamp,
-            machine.vm!.proxmoxNode,
-            "rollbackVm",
-            { vmid: machine.vm!.vmid, name: snap },
-            context.logger,
-          );
+          rolledBack = await snapper.rollback(snap);
           outcome = "rolled-back";
           log(
             rolledBack
               ? `rolled back to ${snap}`
               : `ROLLBACK FAILED — snapshot ${snap} kept for manual recovery`,
           );
-        } else {
+        } else if (!healthy) {
           outcome = "failed";
           log(
-            isVm
+            snapper
               ? "unhealthy — rollback disabled; snapshot retained"
               : "unhealthy after upgrade (bare metal, no snapshot)",
           );
-        }
-
-        // What changed: diff the installed-package manifest before vs after.
-        let pkgs: Array<z.infer<typeof PkgChange>> | null = null;
-        if (after) {
-          pkgs = diffPkgs(beforePkgs, await manifest());
-          log(`packages changed: ${pkgs.length}`);
+        } else if (up.rc !== 0) {
+          outcome = "failed";
+          log(
+            `upgrade command failed — machine healthy, no rollback${
+              snapper ? "; snapshot retained" : ""
+            }`,
+          );
+        } else {
+          // `after` can be null while health checks pass (the rescan failed, the app
+          // answers): count it as no updates left.
+          outcome = (before.updatesCount ?? 0) !== (after?.updatesCount ?? 0)
+            ? "updated"
+            : "no-change";
+          log(`healthy after (${after?.updatesCount ?? "?"} updates left)`);
         }
 
         const runTs = new Date().toISOString();
         const dataHandles = [
           await context.writeResource("osUpdate", `os-update-${args.host}`, {
             host: args.host,
-            kind: isVm ? "vm" : "bare-metal",
+            kind,
             mode: args.mode,
             outcome,
             snapshot: snap,
-            snapshotKept,
+            // A rollback reverts to the snapshot; it does not delete it.
+            snapshotKept: !!snapper && !!snap,
             beforeUpdates: before.updatesCount ?? null,
             afterUpdates: after?.updatesCount ?? null,
             healthyAfter: healthy,
             rolledBack,
             needsReboot: after?.needsReboot ?? false,
-            logs: logs.join("\n"),
+            logs: logs.join("\n") + appNote,
             timestamp: runTs,
           }),
           // Append-only audit record for this run (includes the package diff).
@@ -3042,9 +3272,9 @@ export const model = {
             },
           ),
         ];
-        // Track the snapshot lifecycle: kept as a rollback point, health-verified
-        // by the post-upgrade re-scan, pruned later by pruneSnapshots.
-        if (isVm && snap && snapCreatedAt) {
+        // Track the snapshot for retention / prune — also after a rollback: rolling back
+        // does not delete the snapshot, and an untracked snapshot is never pruned.
+        if (snapper && snap && snapCreatedAt) {
           const retainUntil = new Date(
             new Date(snapCreatedAt).getTime() +
               args.retentionHours * 3600 * 1000,
@@ -3055,9 +3285,7 @@ export const model = {
               `snap-${args.host}-${snapCreatedAt.replace(/[:.]/g, "-")}`,
               {
                 host: args.host,
-                kind: "vm",
-                vmid: machine.vm!.vmid,
-                proxmoxNode: machine.vm!.proxmoxNode,
+                ...snapshotRecordLocation(snapper.ref),
                 name: snap,
                 reason: "safeOsUpdate",
                 createdAt: snapCreatedAt,
@@ -3072,13 +3300,13 @@ export const model = {
           );
           log(`snapshot ${snap} retained until ${retainUntil}`);
         }
-        // Refresh the inventory resource from the post-update scan so needsReboot
-        // (and update counts) are current for the reboot guard and the report.
+        // Refresh the inventory from the post-update scan so needsReboot (and the update
+        // counts) are current for the reboot guard and the report.
         if (after) {
           dataHandles.push(
             await context.writeResource("inventory", args.host, {
               ...after,
-              reachMethod: "ssh",
+              reachMethod: transport.via,
               // After a rollback the restored state is unchecked: leave it to the next scan.
               health: rolledBack ? null : inventoryHealth(lastHealth),
               error: null,
@@ -3134,8 +3362,8 @@ export const model = {
         const ts = new Date().toISOString();
         const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-        const usePct = !machine.vm && isCtMachine(machine);
-        const via: "ssh" | "pct" = usePct ? "pct" : "ssh";
+        // From the decorations alone: a skipped reboot records it without a CT lookup.
+        const via = transportVia(machine);
 
         // Append-only audit record for this reboot run.
         const writeRun = (outcome: string, needsRebootAfter: boolean | null) =>
@@ -3155,46 +3383,6 @@ export const model = {
             needsReboot: needsRebootAfter,
             timestamp: ts,
           });
-
-        // node + ctid for the pct path (from the `ct` decoration, or legacy proxmox ref).
-        const ctInfo = () => ctLocation(machine, swamp);
-
-        // collector, UTF-8-safe base64 for the pct re-scan path (mirrors scan)
-        const collector = COLLECTOR_SCRIPT;
-        const collectorB64 = utf8b64(collector);
-        const scanNow = async (): Promise<z.infer<typeof Inventory> | null> => {
-          try {
-            if (via === "pct") {
-              const { node, ctid } = await ctInfo();
-              const wrapped =
-                `pct exec ${ctid} -- bash -c "echo '${collectorB64}' | base64 -d | bash"`;
-              const runs = await runScript(
-                sshModel,
-                [node],
-                wrapped,
-                240,
-                swamp,
-              );
-              const r = runs.find((x) => x.host === node) ?? runs[0];
-              const line = r ? markerLine(r.stdout, "patch-inventory") : null;
-              return line
-                ? JSON.parse(line) as z.infer<typeof Inventory>
-                : null;
-            }
-            const runs = await runScript(
-              sshModel,
-              [args.host],
-              collector,
-              240,
-              swamp,
-            );
-            const r = runs.find((x) => x.host === args.host) ?? runs[0];
-            const line = r ? markerLine(r.stdout, "patch-inventory") : null;
-            return line ? JSON.parse(line) as z.infer<typeof Inventory> : null;
-          } catch {
-            return null;
-          }
-        };
 
         // Guard: read the last scan's needsReboot (this instance's own inventory) unless forced.
         let neededReboot: boolean | null = null;
@@ -3233,27 +3421,11 @@ export const model = {
           );
         }
 
-        // Fire the reboot.
-        let cmdRc: number;
-        if (via === "pct") {
-          const { node, ctid } = await ctInfo();
-          log(`pct reboot ${ctid} on ${node}`);
-          const r = await nodeExec(
-            sshModel,
-            node,
-            `pct reboot ${ctid}`,
-            180,
-            swamp,
-          );
-          cmdRc = r.rc;
-        } else {
-          // Schedule via systemd-run so the exec call returns cleanly before sshd dies.
-          const cmd = `SUDO=""; [ "$(id -u)" != 0 ] && SUDO="sudo -n"; ` +
-            `$SUDO systemd-run --on-active=3 --timer-property=AccuracySec=100ms systemctl reboot`;
-          log("scheduling systemctl reboot (+3s) over ssh");
-          const r = await nodeExec(sshModel, args.host, cmd, 30, swamp);
-          cmdRc = r.rc;
-        }
+        // Fire the reboot: `pct reboot` on the node for a CT, systemd-run over ssh otherwise.
+        // The transport (and a CT's location) is resolved only now, past the guard.
+        const transport = await transportFor(machine, { sshModel, swamp });
+        log(transport.rebootLabel);
+        const cmdRc = await transport.reboot();
         log(`reboot command rc ${cmdRc}`);
         if (cmdRc !== 0) {
           const handle = await context.writeResource(
@@ -3283,10 +3455,10 @@ export const model = {
         let needsRebootAfter: boolean | null = null;
         let confirmInv: z.infer<typeof Inventory> | null = null;
         if (args.wait) {
-          await sleep(via === "ssh" ? 15000 : 5000); // let it actually go down first
+          await sleep(transport.rebootSettleMs); // let it actually go down first
           const deadline = Date.now() + args.waitTimeoutSec * 1000;
           for (;;) {
-            const inv = await scanNow();
+            const inv = await transport.scan();
             if (inv) {
               confirmed = true;
               needsRebootAfter = !!inv.needsReboot;
@@ -3401,7 +3573,7 @@ export const model = {
     },
     rollback: {
       description:
-        "Deliberately revert a machine to a retained pre-update snapshot (VM snapshot rollback / pct rollback). The explicit recovery for an update or reboot that left the host unhealthy — a reboot itself cannot be rolled back. Reverts to the newest active snapshot for the host unless `snapshot` is given.",
+        "Deliberately revert a machine to a retained pre-update snapshot, through the snapshotter that took it (recorded on the snapshot: built-in VM node model / CT pct, or a pluggable `snapshotter` model). The explicit recovery for an update or reboot that left the host unhealthy — a reboot itself cannot be rolled back. Reverts to the newest active snapshot for the host unless `snapshot` is given.",
       arguments: z.object({
         host: z.string().min(1).describe("Machine (host) to roll back"),
         snapshot: z.string().optional().describe(
@@ -3450,28 +3622,17 @@ export const model = {
           );
         }
         const a = target.a;
-        log(
-          `rolling back ${a.kind} ${a.vmid} to snapshot ${a.name} (via ${a.proxmoxNode})`,
-        );
+        // Roll back through the snapshotter that TOOK this snapshot (from the record),
+        // not whatever the machine is decorated with now.
+        const snapper = snapshotterFor(snapshotterRefFromRecord(a), {
+          sshModel,
+          swamp,
+          host: args.host,
+          logger: context.logger,
+        });
+        log(`rolling back to snapshot ${a.name} (${snapper.where})`);
 
-        const ok = a.kind === "ct"
-          ? (await nodeExec(
-            sshModel,
-            a.proxmoxNode,
-            `pct rollback ${a.vmid} ${a.name}`,
-            300,
-            swamp,
-          )).rc === 0
-          : await runLogged(
-            swamp,
-            a.proxmoxNode,
-            "rollbackVm",
-            {
-              vmid: a.vmid,
-              name: a.name,
-            },
-            context.logger,
-          );
+        const ok = await snapper.rollback(a.name);
         log(ok ? `rolled back to ${a.name}` : `ROLLBACK FAILED for ${a.name}`);
 
         // Best-effort health verdict after the revert.
@@ -3521,7 +3682,7 @@ export const model = {
     },
     pruneSnapshots: {
       description:
-        "Delete retained pre-update VM snapshots that are past their retention window, health-confirmed, reboot-confirmed (when the update needed a reboot), AND pass a fresh healthcheck now. Nothing else deletes snapshots. Use dryRun to preview.",
+        "Delete retained pre-update snapshots that are past their retention window, health-confirmed, reboot-confirmed (when the update needed a reboot), AND pass a fresh healthcheck now. Each one is deleted through the snapshotter that took it (recorded on the snapshot: built-in VM node model / CT pct, or a pluggable `snapshotter` model's deleteSnapshot). Nothing else deletes snapshots. Use dryRun to preview.",
       arguments: z.object({
         host: z.string().optional().describe(
           "Limit to one host (default: all tracked snapshots)",
@@ -3549,17 +3710,12 @@ export const model = {
         );
         const now = Date.now();
         const scannedAt = new Date().toISOString();
-        const collector = COLLECTOR_SCRIPT;
-        // Final live gate: host answers a scan AND no reboot is pending. The scan
-        // goes the machine's own way: pct on its node for a CT (a CT often has no
-        // ssh), ssh otherwise.
+        // Final live gate: the machine answers a scan over its own transport (pct on its
+        // node for a CT, which often has no ssh) AND no reboot is pending.
         const healthyNow = async (m: MachineShape): Promise<boolean> => {
           try {
-            const r = await runOnMachine(m, sshModel, collector, 240, swamp);
-            const line = markerLine(r.out, "patch-inventory");
-            if (!line) return false;
-            return (JSON.parse(line) as z.infer<typeof Inventory>)
-              .needsReboot === false;
+            const transport = await transportFor(m, { sshModel, swamp });
+            return (await transport.scan())?.needsReboot === false;
           } catch {
             return false;
           }
@@ -3624,32 +3780,34 @@ export const model = {
             });
             continue;
           }
+          // Delete through the snapshotter that TOOK this snapshot (from the record). A
+          // record that names none is kept with the reason; the others still prune.
+          let ref: SnapshotterRef;
+          try {
+            ref = snapshotterRefFromRecord(a);
+          } catch (e) {
+            kept.push({
+              host: a.host,
+              name: a.name,
+              reason: (e as Error).message,
+            });
+            continue;
+          }
+          const label = ref.kind === "model" ? `model:${ref.model}` : null;
           if (args.dryRun) {
             pruned.push({
               host: a.host,
               name: a.name,
-              detail: `${a.kind}:${a.vmid}`,
+              detail: label ?? `${a.kind}:${a.vmid}`,
             });
             continue;
           }
-          const ok = a.kind === "ct"
-            ? (await nodeExec(
-              sshModel,
-              a.proxmoxNode,
-              `pct delsnapshot ${a.vmid} ${a.name}`,
-              180,
-              swamp,
-            )).rc === 0
-            : await runLogged(
-              swamp,
-              a.proxmoxNode,
-              "deleteVmSnapshot",
-              {
-                vmid: a.vmid,
-                name: a.name,
-              },
-              context.logger,
-            );
+          const ok = await snapshotterFor(ref, {
+            sshModel,
+            swamp,
+            host: a.host,
+            logger: context.logger,
+          }).delete(a.name);
           if (!ok) {
             kept.push({
               host: a.host,
@@ -3665,7 +3823,11 @@ export const model = {
               prunedAt: scannedAt,
             }),
           );
-          pruned.push({ host: a.host, name: a.name, detail: `vmid:${a.vmid}` });
+          pruned.push({
+            host: a.host,
+            name: a.name,
+            detail: label ?? `vmid:${a.vmid}`,
+          });
         }
 
         handles.push(
