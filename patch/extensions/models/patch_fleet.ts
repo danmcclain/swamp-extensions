@@ -1252,8 +1252,9 @@ export interface Transport {
   ): Promise<{ rc: number; out: string }>;
   /** The machine's patch inventory from the bundled collector; null when it does not answer. */
   scan(): Promise<z.infer<typeof Inventory> | null>;
-  /** The installed-package manifest; empty when it cannot be read. */
-  packages(): Promise<Map<string, string>>;
+  /** The installed-package manifest; null when it cannot be read (unknown is never
+   *  reported as an empty list, which would fake a diff). */
+  packages(): Promise<Map<string, string> | null>;
   /** Pre-flight reachability: null when the machine answers, else why not. */
   probe(): Promise<string | null>;
   /** What `reboot` logs before it starts the reboot. */
@@ -1284,15 +1285,17 @@ async function scanWith(
   }
 }
 
-/** The installed-package manifest through `run`; empty when it cannot be read (an
- *  audit detail never aborts an update). */
+/** The installed-package manifest through `run`; null when it cannot be read — the
+ *  run fails or exits non-zero. An audit detail never aborts an update, and an unknown
+ *  list is never passed off as an empty one (that would fake the package diff). */
 async function packagesWith(
   run: Transport["exec"],
-): Promise<Map<string, string>> {
+): Promise<Map<string, string> | null> {
   try {
-    return parseManifest((await run(PKG_MANIFEST_CMD, 120)).out);
+    const r = await run(PKG_MANIFEST_CMD, 120);
+    return r.rc === 0 ? parseManifest(r.out) : null;
   } catch {
-    return new Map();
+    return null;
   }
 }
 
@@ -3177,11 +3180,17 @@ export const model = {
         const healthy = await afterHealthy(after !== null);
 
         // What the update changed — read before any rollback, so a rolled-back run still
-        // records it, and a machine is never read while it is being restored.
+        // records it, and a machine is never read while it is being restored. When
+        // either list is unreadable, record no diff rather than a misleading one.
         let pkgs: Array<z.infer<typeof PkgChange>> | null = null;
         if (after) {
-          pkgs = diffPkgs(beforePkgs, await transport.packages());
-          log(`packages changed: ${pkgs.length}`);
+          const afterPkgs = await transport.packages();
+          if (beforePkgs && afterPkgs) {
+            pkgs = diffPkgs(beforePkgs, afterPkgs);
+            log(`packages changed: ${pkgs.length}`);
+          } else {
+            log("package list unreadable — no package diff recorded");
+          }
         }
 
         // Outcome — health first, the same for every machine kind:
@@ -3772,8 +3781,19 @@ export const model = {
             });
             continue;
           }
-          // Delete through the snapshotter that TOOK this snapshot (from the record).
-          const ref = snapshotterRefFromRecord(a);
+          // Delete through the snapshotter that TOOK this snapshot (from the record). A
+          // record that names none is kept with the reason; the others still prune.
+          let ref: SnapshotterRef;
+          try {
+            ref = snapshotterRefFromRecord(a);
+          } catch (e) {
+            kept.push({
+              host: a.host,
+              name: a.name,
+              reason: (e as Error).message,
+            });
+            continue;
+          }
           const label = ref.kind === "model" ? `model:${ref.model}` : null;
           if (args.dryRun) {
             pruned.push({

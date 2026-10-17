@@ -4958,16 +4958,81 @@ Deno.test("transport.scan: parses the collector's marker line; no marker or no a
   }
 });
 
-Deno.test("transport.packages: an unreadable package list is empty on both transports — it never aborts an update", async () => {
-  const down = () => stubSwamp([{ ok: false, error: "link down" }]).api;
-  const transports = [
-    fleet.sshTransport("web1", { sshModel: "ssh", swamp: down() }),
+Deno.test("transport.packages: an unreadable package list is null (unknown) on both transports — never an empty list", async () => {
+  const at = (answer: { ok: boolean; error?: string }) => [
+    fleet.sshTransport("web1", {
+      sshModel: "ssh",
+      swamp: stubSwamp([answer]).api,
+    }),
     fleet.pctTransport("ct1", { node: "pve", ctid: 200 }, {
       sshModel: "ssh",
-      swamp: down(),
+      swamp: stubSwamp([answer]).api,
     }),
   ];
-  for (const t of transports) assertEquals((await t.packages()).size, 0);
+  // The run fails: no exception escapes, the list is unknown.
+  for (const t of at({ ok: false, error: "link down" })) {
+    assertEquals(await t.packages(), null);
+  }
+  // The command exits non-zero: also unknown, not a list parsed from its error text.
+  const ssh = fleet.sshTransport("web1", {
+    sshModel: "ssh",
+    swamp: stubSwamp([execAnswer("dpkg-query: error", 2)]).api,
+  });
+  assertEquals(await ssh.packages(), null);
+});
+
+Deno.test("safeOsUpdate: an unreadable package list records NO diff, not a fake one", async () => {
+  // Before-read fails, after-read works: a naive diff would list every package as added.
+  await withFake(
+    { ...osUpdateEnv(), FAKE_SWAMP_PKGS_1: execOut("", 1) },
+    async () => {
+      const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const run = t.one("run");
+      assertEquals(run.packages, null);
+      assertEquals(run.packagesChanged, null);
+      assertStringIncludes(
+        String(t.one("osUpdate").logs),
+        "package list unreadable",
+      );
+    },
+  );
+});
+
+Deno.test("pruneSnapshots: a record that names no snapshotter is kept with the reason; the others still prune", async () => {
+  await withFake({ FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW }, async () => {
+    const t = mkCtx(FLEET, {
+      data: {
+        snapshot: [
+          snapDatum("s-bad", {
+            name: "bad",
+            kind: "model",
+            vmid: null,
+            proxmoxNode: null,
+          }),
+          snapDatum("s-ok", { name: "ok" }),
+        ],
+      },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({}),
+      t.ctx,
+    );
+    const prune = t.one("prune");
+    assertEquals(
+      (prune.pruned as Array<{ name: string }>).map((p) => p.name),
+      ["ok"],
+    );
+    const kept = prune.kept as Array<{ name: string; reason: string }>;
+    assertEquals(kept.map((k) => k.name), ["bad"]);
+    assertStringIncludes(kept[0].reason, "names no snapshotter");
+  });
 });
 
 Deno.test("safeOsUpdate: the after-update package list is read BEFORE a rollback, on a VM too", async () => {

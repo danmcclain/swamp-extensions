@@ -517,7 +517,8 @@ Flow, per machine type:
 2. **Upgrade** — apt/dnf/apk, over ssh (VM/bare) or `pct exec` (CT), capturing an
    installed-package **before/after diff** (`{name, from, to}`). The "after" list is
    read before any rollback, so a rolled-back run still records what the update
-   changed. An unreadable package list counts as empty; it never aborts the update.
+   changed. When either list cannot be read, the run records no diff (`packages:
+   null`) rather than a misleading one; it never aborts the update.
 3. **App update** (any machine with a `source`) — delegate to the `source`
    updater on top of the OS update. **One snapshot guards both**: when the
    fleet took a snapshot, it calls the source's `safeUpdate` with
