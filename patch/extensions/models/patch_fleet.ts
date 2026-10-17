@@ -2179,7 +2179,7 @@ export function parseCtSections(
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.10.16.2",
+  version: "2026.10.16.1",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
@@ -2196,13 +2196,12 @@ export const model = {
     {
       toVersion: "2026.10.16.1",
       description:
-        "Additive globalArguments change, no migration needed: `source.type` is now an optional label (any model that implements the updater contract can be a `source`, on any machine kind), and machines take an optional pluggable `snapshotter`. Snapshot records gain a `snapshotter` field; older records map from kind/vmid/proxmoxNode.",
-      upgradeAttributes: (old: Record<string, unknown>) => old,
-    },
-    {
-      toVersion: "2026.10.16.2",
-      description:
-        "Version bump, no globalArguments schema change (internal refactor: every per-machine operation reaches its machine through one ssh / pct Transport; safeOsUpdate runs one flow for every machine kind)",
+        "Additive globalArguments change, no migration needed: `source.type` is now an " +
+        "optional label (any model that implements the updater contract can be a " +
+        "`source`, on any machine kind), and machines take an optional pluggable " +
+        "`snapshotter`. Snapshot records gain a `snapshotter` field; older records map " +
+        "from kind/vmid/proxmoxNode. Internally every per-machine operation reaches its " +
+        "machine through one ssh / pct Transport.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
