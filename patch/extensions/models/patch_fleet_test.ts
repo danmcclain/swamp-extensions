@@ -4829,3 +4829,175 @@ Deno.test("snapshot-target-resolves: a snapshotter is checked with its listSnaps
     assertStringIncludes(r.errors!.join(" "), 'snapshotter model "zfs"');
   });
 });
+
+// --- transports -------------------------------------------------------------------
+// safeOsUpdate, reboot, the health checks, prune's live gate and the host-reachable
+// check reach a machine only through a Transport. The method tests above pin the calls
+// each transport makes end to end; these pin the transports themselves.
+
+/** A stub `exec` answer: stdout plus the rc sentinel line, as the ssh model returns it. */
+const execAnswer = (stdout: string, rc = 0) => ({
+  ok: true,
+  artifacts: [{
+    host: "x",
+    stdout: `${stdout}\n${fleet.RC_SENTINEL}=${rc}\n`,
+    exitCode: 0,
+  }],
+});
+
+Deno.test("transportVia / transportFor: a CT that is not a VM goes through pct on its node; all else over ssh", async () => {
+  const ct = { proxmoxNode: "pve", ctid: 200 };
+  assertEquals(fleet.transportVia({ host: "a" }), "ssh");
+  assertEquals(
+    fleet.transportVia({ host: "a", vm: { proxmoxNode: "pve", vmid: 1 } }),
+    "ssh",
+  );
+  assertEquals(fleet.transportVia({ host: "a", ct }), "pct");
+  const deps = { sshModel: "ssh", swamp: stubSwamp([{ ok: true }]).api };
+  const t = await fleet.transportFor({ host: "a", ct }, deps);
+  assertEquals(t.via, "pct");
+  assertEquals(t.ct, { node: "pve", ctid: 200 });
+  assertEquals((await fleet.transportFor({ host: "a" }, deps)).via, "ssh");
+});
+
+Deno.test("pctTransport: scripts AND single commands are shipped base64 into pct exec on the node", async () => {
+  const s = stubSwamp([{
+    ok: true,
+    artifacts: [{ host: "pve", stdout: "out", exitCode: 0 }],
+  }]);
+  const t = fleet.pctTransport("ct1", { node: "pve", ctid: 200 }, {
+    sshModel: "ssh",
+    swamp: s.api,
+  });
+  assertEquals(await t.script("echo hi", 60), { rc: 0, out: "out" });
+  assertEquals(await t.exec("uptime", 60), { rc: 0, out: "out" });
+  const shipped = (cmd: string) =>
+    `pct exec 200 -- bash -c "echo '${fleet.utf8b64(cmd)}' | base64 -d | bash"`;
+  assertEquals(
+    s.calls.map((c) => [c.model, c.method, c.args?.hosts, c.args?.script]),
+    [
+      ["ssh", "script", ["pve"], shipped("echo hi")],
+      ["ssh", "script", ["pve"], shipped("uptime")],
+    ],
+  );
+});
+
+Deno.test("pctTransport: probe needs pct status 'running'; reboot runs pct reboot on the node", async () => {
+  const at = (answer: ReturnType<typeof execAnswer>) => {
+    const s = stubSwamp([answer]);
+    const t = fleet.pctTransport("ct1", { node: "pve", ctid: 200 }, {
+      sshModel: "ssh",
+      swamp: s.api,
+    });
+    return { s, t };
+  };
+  const running = at(execAnswer("status: running"));
+  assertEquals(await running.t.probe(), null);
+  assertEquals(running.s.calls[0].args?.hosts, ["pve"]);
+  assertStringIncludes(String(running.s.calls[0].args?.command), "pct status 200");
+  assertStringIncludes(
+    String(await at(execAnswer("status: stopped")).t.probe()),
+    'CT "ct1" (ctid 200) is not running on node "pve"',
+  );
+  const rb = at(execAnswer(""));
+  assertEquals(await rb.t.reboot(), 0);
+  assertStringIncludes(String(rb.s.calls[0].args?.command), "pct reboot 200");
+  assertEquals(rb.t.rebootLabel, "pct reboot 200 on pve");
+});
+
+Deno.test("sshTransport: script uses the ssh model's script on the host; exec, probe and reboot use exec", async () => {
+  const s = stubSwamp([
+    { ok: true, artifacts: [{ host: "web1", stdout: "out", exitCode: 0 }] },
+    execAnswer(""),
+    execAnswer(""),
+  ]);
+  const t = fleet.sshTransport("web1", { sshModel: "ssh", swamp: s.api });
+  assertEquals(await t.script("echo hi", 60), { rc: 0, out: "out" });
+  assertEquals(await t.probe(), null);
+  assertEquals(await t.reboot(), 0);
+  assertEquals(s.calls.map((c) => [c.method, c.args?.hosts]), [
+    ["script", ["web1"]],
+    ["exec", ["web1"]],
+    ["exec", ["web1"]],
+  ]);
+  assertEquals(s.calls[0].args?.script, "echo hi");
+  assertStringIncludes(String(s.calls[2].args?.command), "systemd-run");
+});
+
+Deno.test("sshTransport: a host that does not answer is reported with its ssh model", async () => {
+  const t = fleet.sshTransport("web1", {
+    sshModel: "ssh",
+    swamp: stubSwamp([execAnswer("", 255)]).api,
+  });
+  assertStringIncludes(
+    String(await t.probe()),
+    'Host "web1" did not answer over ssh (rc 255)',
+  );
+});
+
+Deno.test("transport.scan: parses the collector's marker line; no marker or no answer is null", async () => {
+  const ok = stubSwamp([{
+    ok: true,
+    artifacts: [{ host: "web1", stdout: collectorStdout(), exitCode: 0 }],
+  }]);
+  const inv = await fleet.sshTransport("web1", { sshModel: "ssh", swamp: ok.api })
+    .scan();
+  assertEquals(inv?.updatesCount, 3);
+  assertEquals(ok.calls[0].args?.script, fleet.COLLECTOR_SCRIPT);
+  for (
+    const answer of [
+      { ok: true, artifacts: [{ host: "web1", stdout: "no marker", exitCode: 0 }] },
+      { ok: false, error: "link down" },
+    ]
+  ) {
+    const t = fleet.sshTransport("web1", {
+      sshModel: "ssh",
+      swamp: stubSwamp([answer]).api,
+    });
+    assertEquals(await t.scan(), null);
+  }
+});
+
+Deno.test("transport.packages: an unreadable package list is empty on both transports — it never aborts an update", async () => {
+  const down = () => stubSwamp([{ ok: false, error: "link down" }]).api;
+  const transports = [
+    fleet.sshTransport("web1", { sshModel: "ssh", swamp: down() }),
+    fleet.pctTransport("ct1", { node: "pve", ctid: 200 }, {
+      sshModel: "ssh",
+      swamp: down(),
+    }),
+  ];
+  for (const t of transports) assertEquals((await t.packages()).size, 0);
+});
+
+Deno.test("safeOsUpdate: the after-update package list is read BEFORE a rollback, on a VM too", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withCallLog(osUpdateEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          vm: { proxmoxNode: "pve", vmid: 100 },
+          health: [{ type: "http", url: server.url }],
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const all = await calls();
+      const lastPkgRead = all.map((c, i) => c.includes("dpkg-query") ? i : -1)
+        .filter((i) => i >= 0).pop()!;
+      const rollback = all.findIndex((c) => c.includes(" rollbackVm "));
+      assert(rollback > lastPkgRead, "package diff read before the rollback");
+      // So the run record still shows what the update changed.
+      assert((t.one("run").packages as unknown[]).length > 0);
+    });
+  } finally {
+    await server.stop();
+  }
+});

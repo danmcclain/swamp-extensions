@@ -515,7 +515,9 @@ Flow, per machine type:
    when set; else a VM via the node model, a CT via `pct snapshot`; bare metal
    none. A failed snapshot aborts the update.
 2. **Upgrade** — apt/dnf/apk, over ssh (VM/bare) or `pct exec` (CT), capturing an
-   installed-package **before/after diff** (`{name, from, to}`).
+   installed-package **before/after diff** (`{name, from, to}`). The "after" list is
+   read before any rollback, so a rolled-back run still records what the update
+   changed. An unreadable package list counts as empty; it never aborts the update.
 3. **App update** (any machine with a `source`) — delegate to the `source`
    updater on top of the OS update. **One snapshot guards both**: when the
    fleet took a snapshot, it calls the source's `safeUpdate` with
@@ -793,6 +795,13 @@ swamp model method run fleet clearRetired --input dryRun=false
   record. Changing a machine's `snapshotter` never orphans its older snapshots.
 - **Both extension points are reached by name, never by type**, so a consumer
   adds an updater or snapshotter in their own repo without upstreaming it.
+- **Every per-machine operation goes through a transport.** `safeOsUpdate`,
+  `reboot`, the health checks, `pruneSnapshots`' live gate and the
+  `host-reachable` check reach a machine only through a `Transport`: **ssh** (the
+  ssh model's `script` / `exec` on the host) or **pct** (`pct exec` / `pct
+  status` / `pct reboot` on a CT's node). None of them branches on ssh-vs-pct, so
+  every machine kind runs the same flow. `scan` keeps its own batched fan-out to
+  stay under the runModel call budget.
 - **Health checks share a definition** with `@dmc/proxmox/community-script`
   (a shared contract, since swamp extensions bundle independently).
 
