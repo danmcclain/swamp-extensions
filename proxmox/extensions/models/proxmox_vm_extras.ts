@@ -73,6 +73,57 @@ async function resolveLxcId(
   return ct;
 }
 
+/**
+ * Delete a VM that createFromImage has just created and never started, with
+ * its disks. Never throws: the caller is already failing and reports this
+ * outcome in its own error.
+ */
+async function destroyNewVm(
+  apiUrl: string,
+  node: string,
+  vmid: number,
+  ticket: string,
+  csrfToken: string,
+  skipTlsVerify: boolean | undefined,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const resp = await fetchWithCurl(
+      `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}?purge=1&destroy-unreferenced-disks=1`,
+      {
+        method: "DELETE",
+        headers: {
+          "Cookie": `PVEAuthCookie=${ticket}`,
+          "CSRFPreventionToken": csrfToken,
+        },
+        skipTlsVerify,
+      },
+    );
+    if (!resp.ok) {
+      return { ok: false, error: `${resp.status} ${await resp.text()}` };
+    }
+    const upid = (await resp.json()).data;
+    if (typeof upid === "string" && upid.startsWith("UPID:")) {
+      const result = await waitForTask(
+        apiUrl,
+        node,
+        upid,
+        ticket,
+        csrfToken,
+        skipTlsVerify,
+      );
+      if (!result.success) {
+        return { ok: false, error: `delete task: ${result.exitstatus}` };
+      }
+    }
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 // ---- Pre-flight checks ------------------------------------------------------
 //
 // swamp runs these before the mutating methods they list in `appliesTo`. They
@@ -84,6 +135,8 @@ async function resolveLxcId(
 // `context.unresolvedMethodArgs`. When an arg is absent or is still an
 // unresolved ${{ }} expression, the check passes and leaves the decision to
 // the method's own validation.
+
+const GIB = 1024 ** 3;
 
 /** The part of swamp's check context these checks read. */
 interface VmCheckContext {
@@ -324,6 +377,43 @@ const preflightChecks = {
       return { pass: true };
     },
   },
+  "disk-size-fits-image": {
+    description:
+      "Verify diskSize is not smaller than the image's virtual size — Proxmox cannot shrink a disk, and would only refuse after the VM exists. Passes when diskSize is unset. Only evaluated when createFromImage is the selected method.",
+    labels: ["live"],
+    appliesTo: ["createFromImage"],
+    execute: async (ctx: VmCheckContext): Promise<CheckResult> => {
+      if (!selected(ctx, "createFromImage")) return { pass: true };
+      const diskSize = ctx.unresolvedMethodArgs?.diskSize;
+      const importFrom = stringArg(ctx, "importFrom");
+      if (typeof diskSize !== "number" || !importFrom) return { pass: true };
+      const storage = importFrom.split(":")[0];
+      const node = ctx.globalArgs.node;
+      const res = await checkApiGet(
+        ctx,
+        `/nodes/${node}/storage/${encodeURIComponent(storage)}/content/${
+          encodeURIComponent(importFrom)
+        }`,
+        `image "${importFrom}"`,
+      );
+      if (!res.ok) return { pass: false, errors: res.errors };
+      const imageBytes = (res.data as { size?: number } | null)?.size;
+      if (typeof imageBytes !== "number") return { pass: true };
+      if (imageBytes > diskSize * GIB) {
+        return {
+          pass: false,
+          errors: [
+            `diskSize ${diskSize} GiB is smaller than the image "${importFrom}" (${
+              Math.ceil(imageBytes / GIB)
+            } GiB). Use at least ${
+              Math.ceil(imageBytes / GIB)
+            }, leave diskSize unset, or skip with --skip-check disk-size-fits-image.`,
+          ],
+        };
+      }
+      return { pass: true };
+    },
+  },
   "snapshot-name-valid": {
     description:
       'Verify the snapshot name follows the Proxmox rule (a letter first, then letters, digits, "_" or "-", 2 to 40 characters) and is not "current"',
@@ -479,6 +569,27 @@ export const extension = {
         ipConfig: z.string().default("ip=dhcp").describe(
           "Cloud-init IP config (ip=dhcp or ip=x.x.x.x/24,gw=x.x.x.1)",
         ),
+        cpu: z.string().default("Broadwell-noTSX").describe(
+          "QEMU CPU model. Broadwell-noTSX runs on hosts without TSX and can live-migrate between them; use Broadwell only when every host it may run on has TSX.",
+        ),
+        sockets: z.number().int().positive().default(1).describe(
+          "CPU sockets",
+        ),
+        ostype: z.string().default("l26").describe(
+          "Proxmox guest OS type (l26 = Linux 2.6+ kernel)",
+        ),
+        agent: z.boolean().default(true).describe(
+          "Enable the QEMU guest agent (start waits for its IP)",
+        ),
+        serialConsole: z.boolean().default(true).describe(
+          "Add a serial console (serial0: socket) — cloud images log boot output there",
+        ),
+        diskOptions: z.string().default("iothread=1,discard=on").describe(
+          "Extra options for the imported virtio0 disk",
+        ),
+        diskSize: z.number().int().positive().optional().describe(
+          "Grow the imported disk to this size in GiB before first boot (default: keep the image's size). Must not be smaller than the image.",
+        ),
       }),
       execute: async (args, context) => {
         const { apiUrl, node, skipTlsVerify } = context.globalArgs;
@@ -492,6 +603,13 @@ export const extension = {
           ciUser,
           sshKeys,
           ipConfig,
+          cpu,
+          sockets,
+          ostype,
+          agent,
+          serialConsole,
+          diskOptions,
+          diskSize,
         } = args;
         context.logger.info(
           "Creating VM {vmName} on {node} from image {importFrom}",
@@ -536,16 +654,16 @@ export const extension = {
           name: vmName,
           memory: String(memory),
           cores: String(cores),
-          sockets: "1",
-          cpu: "Broadwell",
-          ostype: "l26",
-          agent: "1",
-          virtio0:
-            `${diskStorage}:0,import-from=${importFrom},iothread=1,discard=on`,
+          sockets: String(sockets),
+          cpu,
+          ostype,
+          agent: agent ? "1" : "0",
+          virtio0: [`${diskStorage}:0,import-from=${importFrom}`, diskOptions]
+            .filter(Boolean).join(","),
           net0: `virtio,bridge=${networkBridge}`,
-          serial0: "socket",
           boot: "order=virtio0",
         });
+        if (serialConsole) createParams.set("serial0", "socket");
 
         const createResp = await fetchWithCurl(
           `${apiUrl}/api2/json/nodes/${node}/qemu`,
@@ -581,38 +699,105 @@ export const extension = {
         }
         log(`VM ${vmid} created (${createResult.pollCount} polls)`);
 
-        log(`Attaching cloud-init drive and configuring`);
-        const ciParams = new URLSearchParams({
-          ide2: `${diskStorage}:cloudinit`,
-          ipconfig0: ipConfig,
-        });
-        if (ciUser) ciParams.set("ciuser", ciUser);
-        // Proxmox requires sshkeys to be URL-encoded inside the form field (double-encode).
-        if (sshKeys) ciParams.set("sshkeys", encodeURIComponent(sshKeys));
+        // From here the VM exists. If finishing it fails, remove it again so
+        // a re-run is not blocked by its own half-built VM (vmid-free).
+        try {
+          if (diskSize != null) {
+            // import-from always copies the image at its own size; grow it now,
+            // before the first boot, so the guest's growpart sees the full disk.
+            log(`Growing virtio0 to ${diskSize}G`);
+            const resizeResp = await fetchWithCurl(
+              `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}/resize`,
+              {
+                method: "PUT",
+                headers: {
+                  ...authHeaders,
+                  "Content-Type": "application/x-www-form-urlencoded",
+                },
+                body: new URLSearchParams({
+                  disk: "virtio0",
+                  size: `${diskSize}G`,
+                }).toString(),
+                skipTlsVerify,
+              },
+            );
+            if (!resizeResp.ok) {
+              throw new Error(
+                `Failed to grow virtio0 to ${diskSize}G: ${resizeResp.status} ${await resizeResp
+                  .text()}`,
+              );
+            }
+            // Newer Proxmox runs the resize as a task (returns a UPID); older
+            // versions finish it inline (returns null).
+            const resizeUpid = (await resizeResp.json()).data;
+            if (
+              typeof resizeUpid === "string" && resizeUpid.startsWith("UPID:")
+            ) {
+              const resizeResult = await waitForTask(
+                apiUrl,
+                node,
+                resizeUpid,
+                ticket,
+                csrfToken,
+                skipTlsVerify,
+              );
+              if (!resizeResult.success) {
+                throw new Error(
+                  `Growing virtio0 to ${diskSize}G failed: ${resizeResult.exitstatus}`,
+                );
+              }
+            }
+            log(`virtio0 is now ${diskSize}G`);
+          }
 
-        const ciResp = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}/config`,
-          {
-            method: "PUT",
-            headers: {
-              ...authHeaders,
-              "Content-Type": "application/x-www-form-urlencoded",
+          log(`Attaching cloud-init drive and configuring`);
+          const ciParams = new URLSearchParams({
+            ide2: `${diskStorage}:cloudinit`,
+            ipconfig0: ipConfig,
+          });
+          if (ciUser) ciParams.set("ciuser", ciUser);
+          // Proxmox requires sshkeys to be URL-encoded inside the form field (double-encode).
+          if (sshKeys) ciParams.set("sshkeys", encodeURIComponent(sshKeys));
+
+          const ciResp = await fetchWithCurl(
+            `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}/config`,
+            {
+              method: "PUT",
+              headers: {
+                ...authHeaders,
+                "Content-Type": "application/x-www-form-urlencoded",
+              },
+              body: ciParams.toString(),
+              skipTlsVerify,
             },
-            body: ciParams.toString(),
+          );
+          if (!ciResp.ok) {
+            throw new Error(
+              `Failed to configure cloud-init: ${ciResp.status} ${await ciResp
+                .text()}`,
+            );
+          }
+          log(
+            `Cloud-init configured (user=${
+              ciUser ?? "default"
+            }, ipConfig=${ipConfig})`,
+          );
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          const removed = await destroyNewVm(
+            apiUrl,
+            node,
+            vmid,
+            ticket,
+            csrfToken,
             skipTlsVerify,
-          },
-        );
-        if (!ciResp.ok) {
+          );
           throw new Error(
-            `Failed to configure cloud-init: ${ciResp.status} ${await ciResp
-              .text()}`,
+            removed.ok
+              ? `${reason} — VM ${vmid} was removed again; it is safe to re-run createFromImage.`
+              : `${reason} — VM ${vmid} was left half-built and could not be removed (${removed.error}); delete it before re-running.`,
           );
         }
-        log(
-          `Cloud-init configured (user=${
-            ciUser ?? "default"
-          }, ipConfig=${ipConfig})`,
-        );
 
         const handle = await context.writeResource("vm", vmName, {
           vmid,

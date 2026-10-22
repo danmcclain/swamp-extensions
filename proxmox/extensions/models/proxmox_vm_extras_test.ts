@@ -129,6 +129,233 @@ Deno.test("migrate throws when the VM is not found", async () => {
   );
 });
 
+// ---- createFromImage --------------------------------------------------------
+
+const createFromImage = extension.methods[0].createFromImage;
+const baseCreateArgs = {
+  vmName: "new-vm",
+  vmid: 300,
+  importFrom: "nfs:import/rocky10.qcow2",
+  diskStorage: "nfs",
+};
+
+/** The `-d` form body of one recorded curl call, parsed. */
+function formBody(call: { args: string[] }): URLSearchParams {
+  return new URLSearchParams(call.args[call.args.indexOf("-d") + 1]);
+}
+
+async function runCreate(
+  args: Record<string, unknown>,
+  responses: Array<{ stdout: string; code: number }>,
+) {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs,
+  });
+  const parsed = createFromImage.arguments.parse({
+    ...baseCreateArgs,
+    ...args,
+  });
+  const { calls } = await withMockedCommand(
+    responses,
+    () => createFromImage.execute(parsed, context),
+  );
+  return { calls, written: getWrittenResources()[0]?.data };
+}
+
+const createOk = [
+  httpOutput(200, { data: "UPID:pve:00000001:qmcreate:" }), // create POST
+  httpOutput(200, { data: { status: "stopped", exitstatus: "OK" } }), // waitForTask
+];
+const cloudInitOk = httpOutput(200, { data: null }); // cloud-init PUT
+
+Deno.test("createFromImage sends the defaults when no hardware inputs are given", async () => {
+  const { calls, written } = await runCreate({}, [...createOk, cloudInitOk]);
+
+  const create = formBody(calls[0]);
+  assertEquals(create.get("cpu"), "Broadwell-noTSX");
+  assertEquals(create.get("sockets"), "1");
+  assertEquals(create.get("ostype"), "l26");
+  assertEquals(create.get("agent"), "1");
+  assertEquals(create.get("serial0"), "socket");
+  assertEquals(
+    create.get("virtio0"),
+    "nfs:0,import-from=nfs:import/rocky10.qcow2,iothread=1,discard=on",
+  );
+  // No diskSize: create, wait, cloud-init — and no resize call.
+  assertEquals(calls.length, 3);
+  assertEquals(
+    calls.some((c: { args: string[] }) => c.args.join(" ").includes("/resize")),
+    false,
+  );
+  assertEquals(written.success, true);
+});
+
+Deno.test("createFromImage passes explicit hardware inputs through", async () => {
+  const { calls } = await runCreate(
+    {
+      cpu: "Broadwell",
+      sockets: 2,
+      ostype: "other",
+      agent: false,
+      serialConsole: false,
+      diskOptions: "cache=writeback",
+    },
+    [...createOk, cloudInitOk],
+  );
+
+  const create = formBody(calls[0]);
+  assertEquals(create.get("cpu"), "Broadwell");
+  assertEquals(create.get("sockets"), "2");
+  assertEquals(create.get("ostype"), "other");
+  assertEquals(create.get("agent"), "0");
+  assertEquals(create.has("serial0"), false);
+  assertEquals(
+    create.get("virtio0"),
+    "nfs:0,import-from=nfs:import/rocky10.qcow2,cache=writeback",
+  );
+});
+
+Deno.test("createFromImage with an empty diskOptions adds no trailing comma", async () => {
+  const { calls } = await runCreate({ diskOptions: "" }, [
+    ...createOk,
+    cloudInitOk,
+  ]);
+  assertEquals(
+    formBody(calls[0]).get("virtio0"),
+    "nfs:0,import-from=nfs:import/rocky10.qcow2",
+  );
+});
+
+Deno.test("createFromImage grows virtio0 to diskSize before cloud-init (resize task)", async () => {
+  const { calls, written } = await runCreate({ diskSize: 32 }, [
+    ...createOk,
+    httpOutput(200, { data: "UPID:pve:00000002:resize:" }), // resize PUT
+    httpOutput(200, { data: { status: "stopped", exitstatus: "OK" } }), // waitForTask
+    cloudInitOk,
+  ]);
+
+  const resize = calls[2];
+  assertStringIncludes(resize.args.join(" "), "/nodes/pve/qemu/300/resize");
+  assertEquals(formBody(resize).get("disk"), "virtio0");
+  assertEquals(formBody(resize).get("size"), "32G");
+  assertStringIncludes(calls[4].args.join(" "), "/qemu/300/config");
+  assertStringIncludes(String(written.logs), "virtio0 is now 32G");
+});
+
+Deno.test("createFromImage accepts an inline resize (older Proxmox returns null)", async () => {
+  const { calls } = await runCreate({ diskSize: 32 }, [
+    ...createOk,
+    httpOutput(200, { data: null }), // resize PUT, no task
+    cloudInitOk,
+  ]);
+  assertEquals(calls.length, 4);
+  assertStringIncludes(calls[3].args.join(" "), "/qemu/300/config");
+});
+
+/** Run createFromImage expecting it to throw; return the error and the calls. */
+async function runCreateFailing(
+  args: Record<string, unknown>,
+  responses: Array<{ stdout: string; code: number }>,
+) {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs,
+  });
+  const parsed = createFromImage.arguments.parse({
+    ...baseCreateArgs,
+    ...args,
+  });
+  const { result, calls } = await withMockedCommand(
+    responses,
+    async () => {
+      try {
+        await createFromImage.execute(parsed, context);
+      } catch (err) {
+        return err as Error;
+      }
+      throw new Error("createFromImage did not throw");
+    },
+  );
+  return { error: result, calls, written: getWrittenResources() };
+}
+
+const http500 = (body: string) => ({
+  stdout: `HTTP/1.1 500 Internal Server Error\r\n\r\n${body}`,
+  code: 0,
+});
+const deleteOk = [
+  httpOutput(200, { data: "UPID:pve:00000003:qmdestroy:" }), // DELETE
+  httpOutput(200, { data: { status: "stopped", exitstatus: "OK" } }), // waitForTask
+];
+
+Deno.test("createFromImage removes the new VM when the resize is rejected", async () => {
+  const { error, calls, written } = await runCreateFailing({ diskSize: 4 }, [
+    ...createOk,
+    http500("shrinking disks is not supported"),
+    ...deleteOk,
+  ]);
+
+  assertStringIncludes(error.message, "Failed to grow virtio0 to 4G");
+  assertStringIncludes(error.message, "VM 300 was removed again");
+  const del = calls[3].args.join(" ");
+  assertStringIncludes(del, "-X DELETE");
+  assertStringIncludes(
+    del,
+    "/nodes/pve/qemu/300?purge=1&destroy-unreferenced-disks=1",
+  );
+  assertEquals(written.length, 0);
+});
+
+Deno.test("createFromImage removes the new VM when the resize task fails", async () => {
+  const { error } = await runCreateFailing({ diskSize: 32 }, [
+    ...createOk,
+    httpOutput(200, { data: "UPID:pve:00000002:resize:" }),
+    httpOutput(200, { data: { status: "stopped", exitstatus: "ERROR" } }),
+    ...deleteOk,
+  ]);
+  assertStringIncludes(error.message, "Growing virtio0 to 32G failed");
+  assertStringIncludes(error.message, "safe to re-run");
+});
+
+Deno.test("createFromImage removes the new VM when cloud-init fails", async () => {
+  const { error, calls } = await runCreateFailing({}, [
+    ...createOk,
+    http500("bad sshkeys"),
+    ...deleteOk,
+  ]);
+  assertStringIncludes(error.message, "Failed to configure cloud-init");
+  assertStringIncludes(error.message, "VM 300 was removed again");
+  assertStringIncludes(calls[3].args.join(" "), "-X DELETE");
+});
+
+Deno.test("createFromImage says so when the half-built VM cannot be removed", async () => {
+  const { error } = await runCreateFailing({}, [
+    ...createOk,
+    http500("bad sshkeys"),
+    http500("VM is locked"), // DELETE refused
+  ]);
+  assertStringIncludes(error.message, "Failed to configure cloud-init");
+  assertStringIncludes(error.message, "could not be removed");
+  assertStringIncludes(error.message, "VM is locked");
+  assertStringIncludes(error.message, "delete it before re-running");
+});
+
+Deno.test("createFromImage does not remove anything when the create itself fails", async () => {
+  const { error, calls } = await runCreateFailing({}, [
+    httpOutput(200, { data: "UPID:pve:00000001:qmcreate:" }),
+    httpOutput(200, { data: { status: "stopped", exitstatus: "ERROR" } }),
+  ]);
+  assertStringIncludes(error.message, "VM creation failed");
+  assertEquals(calls.length, 2);
+});
+
+Deno.test("createFromImage rejects a non-positive diskSize", () => {
+  assertEquals(
+    createFromImage.arguments.safeParse({ ...baseCreateArgs, diskSize: 0 })
+      .success,
+    false,
+  );
+});
+
 // ---- pre-flight checks ------------------------------------------------------
 
 const preflight = extension.checks[0];
@@ -330,6 +557,91 @@ Deno.test("cluster-has-migration-target passes without a call under a plain `swa
   const { result, calls } = await withMockedCommand(
     [httpOutput(200, { data: [{ type: "node", name: "pve", online: 1 }] })],
     () => clusterCheck.execute({ ...context, methodName: "" }),
+  );
+  assertEquals(result, { pass: true });
+  assertEquals(calls.length, 0);
+});
+
+const imageArgs = {
+  vmName: "v",
+  importFrom: "mrrobot:import/rocky10.qcow2",
+  diskStorage: "mrrobot",
+};
+const tenGiBImage = httpOutput(200, {
+  data: { format: "qcow2", size: 10 * 1024 ** 3, used: 520355840 },
+});
+
+Deno.test("disk-size-fits-image passes when diskSize is at least the image's virtual size", async () => {
+  const { result, calls } = await runCheck(
+    "disk-size-fits-image",
+    "createFromImage",
+    { ...imageArgs, diskSize: 32 },
+    [tenGiBImage],
+  );
+  assertEquals(result, { pass: true });
+  assertStringIncludes(
+    calls[0].args.join(" "),
+    "/nodes/pve/storage/mrrobot/content/mrrobot%3Aimport%2Frocky10.qcow2",
+  );
+
+  const exact = await runCheck(
+    "disk-size-fits-image",
+    "createFromImage",
+    { ...imageArgs, diskSize: 10 },
+    [tenGiBImage],
+  );
+  assertEquals(exact.result, { pass: true });
+});
+
+Deno.test("disk-size-fits-image fails when diskSize is smaller than the image", async () => {
+  const { result } = await runCheck(
+    "disk-size-fits-image",
+    "createFromImage",
+    { ...imageArgs, diskSize: 4 },
+    [tenGiBImage],
+  );
+  assertEquals(result.pass, false);
+  assertStringIncludes(result.errors?.[0] ?? "", "smaller than the image");
+  assertStringIncludes(result.errors?.[0] ?? "", "at least 10");
+});
+
+Deno.test("disk-size-fits-image passes without a call when diskSize is unset or importFrom unresolved", async () => {
+  const unset = await runCheck(
+    "disk-size-fits-image",
+    "createFromImage",
+    imageArgs,
+  );
+  assertEquals(unset.result, { pass: true });
+  assertEquals(unset.calls.length, 0);
+
+  const unresolved = await runCheck(
+    "disk-size-fits-image",
+    "createFromImage",
+    {
+      ...imageArgs,
+      importFrom: '${{ data.latest("s", "img").attributes.storageRef }}',
+      diskSize: 32,
+    },
+  );
+  assertEquals(unresolved.result, { pass: true });
+  assertEquals(unresolved.calls.length, 0);
+});
+
+Deno.test("disk-size-fits-image fails when the image cannot be read", async () => {
+  const { result } = await runCheck(
+    "disk-size-fits-image",
+    "createFromImage",
+    { ...imageArgs, diskSize: 32 },
+    [httpOutput(500, {})],
+  );
+  assertEquals(result.pass, false);
+});
+
+Deno.test("disk-size-fits-image passes without a call under a plain `swamp model validate` (empty methodName)", async () => {
+  const { result, calls } = await runCheck(
+    "disk-size-fits-image",
+    "",
+    { ...imageArgs, diskSize: 4 },
   );
   assertEquals(result, { pass: true });
   assertEquals(calls.length, 0);
