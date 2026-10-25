@@ -23,6 +23,12 @@
 #                                           FAKE_SWAMP_SNAPLIST, exit FAKE_SWAMP_SNAPLIST_RC (0)
 #   model method run M snapshot ...         (a pluggable snapshotter model) exit
 #                                           FAKE_SWAMP_SNAPSHOT_RC (0)
+#   model method run M scanOs ...           (a pluggable osUpdater model) prints
+#                                           FAKE_SWAMP_OSSCAN_1, then _2; exit FAKE_SWAMP_OSSCAN_RC (0)
+#   model method run M upgradeOs ...        (a pluggable osUpdater model) exit
+#                                           FAKE_SWAMP_OSUPGRADE_RC (0), "upgrade failed" on stderr when not 0
+#   model method run M listPackages ...     (a pluggable osUpdater model) prints
+#                                           FAKE_SWAMP_OSPKGS_1, then _2; exit FAKE_SWAMP_OSPKGS_RC (0)
 #   model method run M safeUpdate ... (the app source's updater; the test reads the call log)
 #       with "snapshot:json=false" and FAKE_SWAMP_APP_REJECT_SNAPSHOT set: prints swamp's
 #           "Unknown method input(s): snapshot" error on stderr, exit 1
@@ -139,6 +145,20 @@ if [ "$1" = "model" ] && [ "$2" = "method" ] && [ "$3" = "run" ]; then
       ;;
     snapshot)
       exit "${FAKE_SWAMP_SNAPSHOT_RC:-0}"
+      ;;
+    scanOs)
+      seq_out OSSCAN
+      exit "${FAKE_SWAMP_OSSCAN_RC:-0}"
+      ;;
+    upgradeOs)
+      if [ "${FAKE_SWAMP_OSUPGRADE_RC:-0}" -ne 0 ]; then
+        printf '%s\n' "upgrade failed" >&2
+      fi
+      exit "${FAKE_SWAMP_OSUPGRADE_RC:-0}"
+      ;;
+    listPackages)
+      seq_out OSPKGS
+      exit "${FAKE_SWAMP_OSPKGS_RC:-0}"
       ;;
     *)
       exit "${FAKE_SWAMP_METHOD_RC:-0}"

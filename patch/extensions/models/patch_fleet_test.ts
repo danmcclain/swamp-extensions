@@ -5066,3 +5066,379 @@ Deno.test("safeOsUpdate: the after-update package list is read BEFORE a rollback
     await server.stop();
   }
 });
+
+// ---------------------------------------------------------------------------
+// pacman (built-in) and the pluggable OS updater
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the bundled collector with a PATH of only `stubs` (name → sh body) plus the
+ * basic tools it needs, so no real package manager on the test machine is found.
+ */
+async function runCollector(
+  stubs: Record<string, string>,
+): Promise<Record<string, unknown>> {
+  const dir = await Deno.makeTempDir();
+  try {
+    const tools = [
+      "sed", "tr", "grep", "wc", "ls", "uname", "hostname", "date", "id",
+      "head", "sort", "cat", "tail",
+    ];
+    for (const t of tools) {
+      const out = await new Deno.Command("sh", {
+        args: ["-c", `command -v ${t}`],
+        stdout: "piped",
+      }).output();
+      const path = new TextDecoder().decode(out.stdout).trim();
+      if (path) await Deno.symlink(path, `${dir}/${t}`);
+    }
+    for (const [name, body] of Object.entries(stubs)) {
+      await Deno.writeTextFile(`${dir}/${name}`, `#!/bin/sh\n${body}\n`);
+      await Deno.chmod(`${dir}/${name}`, 0o755);
+    }
+    await Deno.writeTextFile(`${dir}/collector.sh`, fleet.COLLECTOR_SCRIPT);
+    const bash = new TextDecoder().decode(
+      (await new Deno.Command("sh", {
+        args: ["-c", "command -v bash"],
+        stdout: "piped",
+      }).output()).stdout,
+    ).trim();
+    const out = await new Deno.Command(bash, {
+      args: [`${dir}/collector.sh`],
+      env: { PATH: dir },
+      clearEnv: true,
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const line = fleet.markerLine(
+      new TextDecoder().decode(out.stdout),
+      "patch-inventory",
+    );
+    assert(line, `no inventory line: ${new TextDecoder().decode(out.stderr)}`);
+    return JSON.parse(line);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+
+const PACMAN_STUB = [
+  'case "$1" in',
+  "  -Qq) printf 'base\\nlinux\\nopenssl\\ncurl\\nbash\\n' ;;",
+  "  -Qu) printf 'openssl 3.0.1-1 -> 3.0.2-1\\ncurl 8.0-1 -> 8.1-1 [ignored]\\n' ;;",
+  "esac",
+].join("\n");
+
+Deno.test("collector (pacman): counts checkupdates' list and pacman -Qq; no security channel without arch-audit", async () => {
+  const inv = await runCollector({
+    pacman: PACMAN_STUB,
+    checkupdates:
+      "printf 'openssl 3.0.1-1 -> 3.0.2-1\\nlinux 6.9-1 -> 6.10-1\\n'",
+  });
+  assertEquals(inv.packageManager, "pacman");
+  assertEquals(inv.updatesCount, 2);
+  assertEquals(inv.totalPackages, 5);
+  assertEquals(inv.securityUpdatesCount, null);
+  assertEquals(inv.distUpgradeRequired, null);
+});
+
+Deno.test("collector (pacman): checkupdates exit 2 means no updates", async () => {
+  const inv = await runCollector({ pacman: PACMAN_STUB, checkupdates: "exit 2" });
+  assertEquals(inv.updatesCount, 0);
+});
+
+Deno.test("collector (pacman): without checkupdates it reads pacman -Qu, skipping [ignored]; arch-audit gives the security count", async () => {
+  const inv = await runCollector({
+    pacman: PACMAN_STUB,
+    "arch-audit": "printf 'openssl\\n'",
+  });
+  assertEquals(inv.updatesCount, 1);
+  assertEquals(inv.securityUpdatesCount, 1);
+});
+
+Deno.test("collector: pacman is detected only after apt, dnf and apk", () => {
+  const s = fleet.COLLECTOR_SCRIPT;
+  assert(s.indexOf("collect_apk\n") < s.indexOf("collect_pacman\n", s.indexOf("main()")));
+  assertStringIncludes(s, "no supported package manager found (apt/dnf/apk/pacman)");
+  // Never sync the live db without upgrading (partial-upgrade hazard).
+  const code = s.split("\n").filter((l) => !l.trim().startsWith("#"));
+  assert(!code.some((l) => l.includes("pacman -Sy")));
+});
+
+Deno.test("osUpgradeScript: apt honours mode; pacman runs a full -Syu non-interactively, last", () => {
+  const safe = fleet.osUpgradeScript("safe");
+  assertStringIncludes(safe, "apt-get -y upgrade");
+  assertStringIncludes(fleet.osUpgradeScript("full"), "apt-get -y full-upgrade");
+  assertStringIncludes(safe, "$SUDO pacman -Syu --noconfirm");
+  assert(safe.indexOf("apk upgrade") < safe.indexOf("pacman -Syu"));
+});
+
+Deno.test("PKG_MANIFEST_CMD lists pacman packages as name<TAB>version, after the others", () => {
+  const cmd = fleet.PKG_MANIFEST_CMD;
+  assertStringIncludes(cmd, "pacman -Q | tr ' ' '\\t'");
+  assert(cmd.indexOf("dpkg-query") < cmd.indexOf("pacman -Q"));
+});
+
+Deno.test("schema: osUpdater takes a model name; an empty one is rejected", () => {
+  const m = parseMachine({ host: "arch1", osUpdater: { model: "pacman-os" } });
+  assertEquals(m.osUpdater, { model: "pacman-os" });
+  assertThrows(() => parseMachine({ host: "arch1", osUpdater: { model: "" } }));
+});
+
+Deno.test("modelOsScan: a minimal scanOs resource becomes a full inventory record", async () => {
+  const s = stubSwamp([{
+    ok: true,
+    artifacts: [{ updatesCount: 4, needsReboot: true, packageManager: "pacman" }],
+  }]);
+  const { inv, error } = await fleet.modelOsScan("pacman-os", "arch1", s.api);
+  assertEquals(error, "");
+  assertEquals(s.calls, [{ model: "pacman-os", method: "scanOs", args: { host: "arch1" } }]);
+  assertEquals(inv!.hostname, "arch1");
+  assertEquals(inv!.updatesCount, 4);
+  assertEquals(inv!.needsReboot, true);
+  assertEquals(inv!.packageManager, "pacman");
+  assertEquals(inv!.securityUpdatesCount, null);
+  assertEquals(inv!.osType, "Unknown");
+  assertEquals(inv!.reachMethod, null);
+  assertEquals(inv!.osUpdater, "pacman-os");
+  assertEquals(inv!.error, null);
+});
+
+Deno.test("modelOsScan: a failed run or an invalid resource is an error, not an inventory", async () => {
+  const failed = await fleet.modelOsScan(
+    "os",
+    "h",
+    stubSwamp([{ ok: false, error: "no route" }]).api,
+  );
+  assertEquals(failed.inv, null);
+  assertStringIncludes(failed.error, "no route");
+  const invalid = await fleet.modelOsScan(
+    "os",
+    "h",
+    stubSwamp([{ ok: true, artifacts: [{ updatesCount: 1 }] }]).api,
+  );
+  assertEquals(invalid.inv, null);
+  assertStringIncludes(invalid.error, "needsReboot");
+  const none = await fleet.modelOsScan("os", "h", stubSwamp([{ ok: true }]).api);
+  assertEquals(none.inv, null);
+});
+
+function stubTransport(): import("./patch_fleet.ts").Transport {
+  const inv = { ...INVENTORY, reachMethod: null, health: null, error: null };
+  return {
+    via: "ssh",
+    where: "stub",
+    note: "",
+    notReachable: "stub down",
+    script: () => Promise.resolve({ rc: 0, out: "" }),
+    exec: (command) => Promise.resolve({ rc: 0, out: command }),
+    scan: () => Promise.resolve(inv as never),
+    packages: () => Promise.resolve(new Map([["a", "1"]])),
+    probe: () => Promise.resolve(null),
+    rebootLabel: "",
+    reboot: () => Promise.resolve(0),
+    rebootSettleMs: 0,
+  };
+}
+
+Deno.test("osUpdaterFor: without an osUpdater the built-in one runs over the transport", async () => {
+  const s = stubSwamp([{ ok: true }]);
+  const os = fleet.osUpdaterFor({ host: "web1" }, stubTransport(), { swamp: s.api });
+  assertEquals(os.model, null);
+  assertEquals((await os.scan())!.packageManager, "apt");
+  assertEquals((await os.upgrade("full")).out, fleet.osUpgradeScript("full"));
+  assertEquals(await os.packages(), new Map([["a", "1"]]));
+  assertEquals(s.calls, []);
+});
+
+Deno.test("osUpdaterFor(model): drives the OS updater contract by name with { host }", async () => {
+  const s = stubSwamp([
+    { ok: true },
+    {
+      ok: true,
+      artifacts: [{ packages: [{ name: "openssl", version: "3.0.2-1" }, { name: "base" }] }],
+    },
+  ]);
+  const os = fleet.osUpdaterFor(
+    { host: "arch1", osUpdater: { model: "pacman-os" } },
+    stubTransport(),
+    { swamp: s.api },
+  );
+  assertEquals(os.model, "pacman-os");
+  assertEquals((await os.upgrade("safe")).rc, 0);
+  assertEquals(
+    await os.packages(),
+    new Map([["openssl", "3.0.2-1"], ["base", ""]]),
+  );
+  assertEquals(s.calls, [
+    { model: "pacman-os", method: "upgradeOs", args: { host: "arch1", mode: "safe" } },
+    { model: "pacman-os", method: "listPackages", args: { host: "arch1" } },
+  ]);
+});
+
+Deno.test("osUpdaterFor(model): a failed upgrade is rc 1 and warned; an unreadable package list is null", async () => {
+  const l = collectLogger();
+  const os = fleet.osUpdaterFor(
+    { host: "arch1", osUpdater: { model: "pacman-os" } },
+    stubTransport(),
+    { swamp: stubSwamp([{ ok: false, error: "mirror down" }]).api, logger: l.logger },
+  );
+  assertEquals((await os.upgrade("safe")).rc, 1);
+  assertStringIncludes(JSON.stringify(l.lines), "mirror down");
+  assertEquals(await os.packages(), null);
+  const bad = fleet.osUpdaterFor(
+    { host: "arch1", osUpdater: { model: "pacman-os" } },
+    stubTransport(),
+    { swamp: stubSwamp([{ ok: true, artifacts: [{ packages: [{ version: "1" }] }] }]).api },
+  );
+  assertEquals(await bad.packages(), null);
+});
+
+/** What the fake prints for a model method that writes one resource. */
+function resourceOut(attributes: Record<string, unknown>): string {
+  return JSON.stringify({ dataArtifacts: [{ attributes }] });
+}
+
+Deno.test("scan: an osUpdater machine is scanned by its model's scanOs, not by the collector", async () => {
+  await withCallLog({
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout()),
+    FAKE_SWAMP_OSSCAN_1: resourceOut({
+      packageManager: "pacman",
+      updatesCount: 7,
+      needsReboot: false,
+    }),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "web1" }, { host: "arch1", osUpdater: { model: "pacman-os" } }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const all = await calls();
+    const script = all.filter((c) => c.startsWith("ssh script "));
+    assertEquals(script.length, 1);
+    assertStringIncludes(script[0], 'hosts:json=["web1"]');
+    assertEquals(all.filter((c) => c.startsWith("pacman-os scanOs ")).length, 1);
+    const invs = t.written("inventory");
+    const arch = invs.find((r) => r.name === "arch1")!.data;
+    assertEquals(arch.updatesCount, 7);
+    assertEquals(arch.packageManager, "pacman");
+    assertEquals(arch.osUpdater, "pacman-os");
+    assertEquals(arch.reachMethod, null);
+    const web = invs.find((r) => r.name === "web1")!.data;
+    assertEquals(web.osUpdater, null);
+    assertEquals(web.reachMethod, "ssh");
+  });
+});
+
+Deno.test("scan: a failed scanOs gives that machine an error record naming the osUpdater", async () => {
+  await withFake({ FAKE_SWAMP_OSSCAN_RC: "1" }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "arch1", osUpdater: { model: "pacman-os" } }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertStringIncludes(inv.error as string, "osUpdater pacman-os");
+    assertEquals(inv.osUpdater, "pacman-os");
+  });
+});
+
+function osModelEnv(extra: Env = {}): Env {
+  return {
+    FAKE_SWAMP_OSSCAN_1: resourceOut({ packageManager: "pacman", updatesCount: 2, needsReboot: false }),
+    FAKE_SWAMP_OSSCAN_2: resourceOut({ packageManager: "pacman", updatesCount: 0, needsReboot: true }),
+    FAKE_SWAMP_OSPKGS_1: resourceOut({ packages: [{ name: "openssl", version: "3.0.1-1" }] }),
+    FAKE_SWAMP_OSPKGS_2: resourceOut({ packages: [{ name: "openssl", version: "3.0.2-1" }] }),
+    ...extra,
+  };
+}
+
+Deno.test("safeOsUpdate: an osUpdater model scans, upgrades and lists packages; no built-in upgrade runs", async () => {
+  await withCallLog(osModelEnv(), async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "arch1", osUpdater: { model: "pacman-os" } }],
+    });
+    await model.methods.safeOsUpdate.execute(
+      model.methods.safeOsUpdate.arguments.parse({ host: "arch1", mode: "full" }),
+      t.ctx,
+    );
+    const all = await calls();
+    assertEquals(
+      all.map((c) => c.split(" ").slice(0, 2).join(" ")),
+      [
+        "pacman-os scanOs",
+        "pacman-os listPackages",
+        "pacman-os upgradeOs",
+        "pacman-os scanOs",
+        "pacman-os listPackages",
+      ],
+    );
+    assertStringIncludes(all[2], "mode=full");
+    assertStringIncludes(all[2], "host=arch1");
+    const os = t.one("osUpdate");
+    assertEquals(os.outcome, "updated");
+    assertEquals(os.beforeUpdates, 2);
+    assertEquals(os.afterUpdates, 0);
+    assertEquals(os.needsReboot, true);
+    assertStringIncludes(os.logs as string, 'via osUpdater "pacman-os"');
+    assertEquals(t.one("run").packages, [
+      { name: "openssl", from: "3.0.1-1", to: "3.0.2-1" },
+    ]);
+    const inv = t.one("inventory");
+    assertEquals(inv.osUpdater, "pacman-os");
+    assertEquals(inv.reachMethod, null);
+  });
+});
+
+Deno.test("safeOsUpdate: a failed upgradeOs on a healthy machine is failed; a failed scanOs aborts", async () => {
+  await withFake(osModelEnv({ FAKE_SWAMP_OSUPGRADE_RC: "1" }), async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "arch1", osUpdater: { model: "pacman-os" } }],
+    });
+    await model.methods.safeOsUpdate.execute(
+      model.methods.safeOsUpdate.arguments.parse({ host: "arch1" }),
+      t.ctx,
+    );
+    assertEquals(t.one("osUpdate").outcome, "failed");
+  });
+  await withFake({ FAKE_SWAMP_OSSCAN_RC: "1" }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "arch1", osUpdater: { model: "pacman-os" } }],
+    });
+    await assertRejects(
+      () =>
+        model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({ host: "arch1" }),
+          t.ctx,
+        ),
+      Error,
+      'osUpdater "pacman-os" could not scan arch1',
+    );
+  });
+});
+
+Deno.test("reboot: the confirming scan goes through the osUpdater model", async () => {
+  await withCallLog({
+    FAKE_SWAMP_EXEC: execOut(""),
+    FAKE_SWAMP_OSSCAN_1: resourceOut({ updatesCount: 0, needsReboot: false }),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "arch1", osUpdater: { model: "pacman-os" } }],
+    });
+    await withFastPolling(() =>
+      model.methods.reboot.execute(
+        model.methods.reboot.arguments.parse({ host: "arch1", force: true }),
+        t.ctx,
+      )
+    );
+    const all = await calls();
+    assert(all.some((c) => c.startsWith("ssh exec ")), "reboot over ssh");
+    assert(all.some((c) => c.startsWith("pacman-os scanOs ")), "confirm via scanOs");
+    assert(!all.some((c) => c.startsWith("ssh script ")), "no collector run");
+    assertEquals(t.one("reboot").confirmed, true);
+    assertEquals(t.one("inventory").osUpdater, "pacman-os");
+  });
+});
