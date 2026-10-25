@@ -831,7 +831,8 @@ pending updates, security updates, held-back / dist-upgrade (apt), total package
 
 On Arch (pacman) it never runs `pacman -Sy` (syncing the live database without
 upgrading invites partial upgrades). It counts updates with `checkupdates` from
-`pacman-contrib`, which syncs a private copy of the database; without it, it
+`pacman-contrib` (which also needs `fakeroot`, not in a minimal install), which
+syncs a private copy of the database; without them, it
 falls back to `pacman -Qu` against the existing sync database (stale until the
 next upgrade) and logs that. `[ignored]` packages are not counted. Security
 updates come from `arch-audit -u` when it is installed (else none). A reboot is
