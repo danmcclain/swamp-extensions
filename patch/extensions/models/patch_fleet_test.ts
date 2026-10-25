@@ -5159,6 +5159,8 @@ Deno.test("collector: pacman is detected only after apt, dnf and apk", () => {
   const s = fleet.COLLECTOR_SCRIPT;
   assert(s.indexOf("collect_apk\n") < s.indexOf("collect_pacman\n", s.indexOf("main()")));
   assertStringIncludes(s, "no supported package manager found (apt/dnf/apk/pacman)");
+  // Arch's os-release has no VERSION_ID, only BUILD_ID=rolling.
+  assertStringIncludes(s, 'os_version="${VERSION_ID:-${BUILD_ID:-Unknown}}"');
   // Never sync the live db without upgrading (partial-upgrade hazard).
   const code = s.split("\n").filter((l) => !l.trim().startsWith("#"));
   assert(!code.some((l) => l.includes("pacman -Sy")));
