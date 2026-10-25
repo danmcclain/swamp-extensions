@@ -15,7 +15,7 @@ loads independently.
 | `@dmc/unifi-networks`  | model + reports | Query UniFi Network sites (VLANs, firewall zones/policies, clients, WiFi) via the official integration API, mapped together, with firewall-summary and zone-matrix reports. See [unifi-networks/README.md](unifi-networks/README.md). |
 | `@dmc/proxmox`         | models        | Proxmox VE VM/LXC lifecycle operations, cloud-image storage, and snapshot-guarded updates for community-scripts LXCs, extending the `@keeb/proxmox` family. See [proxmox/README.md](proxmox/README.md). |
 | `@dmc/fastmail`        | model + reports | Fastmail email-organization pipeline over JMAP — scan senders (flagging bulk/newsletter mail), generate Sieve scripts sorting senders into folders, and plan/apply moves, with audit, coverage, and plan reports. See [fastmail/README.md](fastmail/README.md). |
-| `@dmc/patch`           | model + reports | Agentless fleet patch management over `@swamp/ssh` — scan Proxmox VMs/CTs, bare metal and VPSs for pending updates, apply them snapshot-guarded and health-checked with automatic rollback, and keep an auditable history. App updaters and snapshotters are pluggable: bring your own model without upstreaming it. See [patch/README.md](patch/README.md). |
+| `@dmc/patch`           | model + reports | Agentless fleet patch management over `@swamp/ssh` — scan Proxmox VMs/CTs, bare metal and VPSs for pending updates, apply them snapshot-guarded and health-checked with automatic rollback, and keep an auditable history. App updaters, snapshotters and OS updaters are pluggable: bring your own model without upstreaming it. Built-in OS support: apt, dnf, apk and pacman. See [patch/README.md](patch/README.md). |
 
 ## Layout
 

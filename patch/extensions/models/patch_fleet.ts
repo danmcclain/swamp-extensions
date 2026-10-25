@@ -142,6 +142,42 @@ export const COLLECTOR_SCRIPT: string = [
   "  fi",
   "}",
   "",
+  "# Arch: never `pacman -Sy` here — syncing the db without upgrading invites partial",
+  "# upgrades. checkupdates (pacman-contrib; it also needs fakeroot) syncs a private copy",
+  "# of the db instead",
+  "# (exit 2 = nothing to update); without it, fall back to the existing sync db.",
+  "collect_pacman() {",
+  '  pkg_mgr="pacman"',
+  "  local list rc running",
+  "  if command -v checkupdates >/dev/null 2>&1; then",
+  '    list="$(checkupdates 2>/dev/null)"; rc=$?',
+  '    [ "$rc" -eq 2 ] && { list=""; rc=0; }',
+  "  else",
+  "    rc=1",
+  "  fi",
+  '  if [ "$rc" -ne 0 ]; then',
+  '    log "checkupdates unavailable or failed (it needs pacman-contrib and fakeroot); using the existing sync db"',
+  '    list="$(pacman -Qu 2>/dev/null || true)"',
+  "  fi",
+  "  updates=\"$(printf '%s\\n' \"$list\" | grep -v '\\[ignored\\]' | grep -c . || true)\"",
+  "  # arch-audit (optional) lists installed packages with a fixed advisory.",
+  "  if command -v arch-audit >/dev/null 2>&1; then",
+  '    security="$(arch-audit -u -q 2>/dev/null | grep -c . || true)"',
+  '    [ -z "$security" ] && security=0',
+  "  fi",
+  "  total=\"$(pacman -Qq 2>/dev/null | wc -l | tr -d ' ')\"",
+  '  [ -z "$updates" ] && updates=0',
+  '  [ -z "$total" ] && total=0',
+  "  # A kernel upgrade removes the running kernel's module tree. /boot/vmlinuz-linux",
+  "  # carries no version, so kernel_compare does not apply. A container runs the host's",
+  "  # kernel, so its own module tree (if any) says nothing: no verdict there.",
+  '  running="$(uname -r)"',
+  '  if ! systemd-detect-virt -cq 2>/dev/null && [ -n "$(ls -A /usr/lib/modules 2>/dev/null)" ] &&',
+  '     [ ! -d "/usr/lib/modules/$running" ]; then',
+  '    needs_reboot="true"; set_reason "running kernel $running is no longer installed"',
+  "  fi",
+  "}",
+  "",
   "# Container image drift: for each running container, compare the local image digest",
   "# (RepoDigests, i.e. the digest it was pulled at) against the registry digest for its",
   "# tag (buildx imagetools inspect). updateAvailable=true when they differ, null when it",
@@ -177,7 +213,8 @@ export const COLLECTOR_SCRIPT: string = [
   "  if [ -r /etc/os-release ]; then",
   "    # shellcheck disable=SC1091",
   "    . /etc/os-release",
-  '    os_type="${NAME:-Unknown}"; os_version="${VERSION_ID:-Unknown}"',
+  "    # A rolling release (Arch) has no VERSION_ID, only BUILD_ID=rolling.",
+  '    os_type="${NAME:-Unknown}"; os_version="${VERSION_ID:-${BUILD_ID:-Unknown}}"',
   '    os_id="${ID:-}"; os_like="${ID_LIKE:-}"',
   "  fi",
   "  local hostname_val scanned_at",
@@ -190,8 +227,10 @@ export const COLLECTOR_SCRIPT: string = [
   "    collect_dnf",
   "  elif command -v apk >/dev/null 2>&1; then",
   "    collect_apk",
+  "  elif command -v pacman >/dev/null 2>&1; then",
+  "    collect_pacman",
   "  else",
-  '    log "no supported package manager found (apt/dnf/apk)"',
+  '    log "no supported package manager found (apt/dnf/apk/pacman)"',
   "  fi",
   "",
   "  collect_docker",
@@ -339,6 +378,32 @@ const Machine = z.object({
       "also lets a bare-metal machine be snapshot-guarded. The record of each snapshot " +
       "remembers the snapshotter, so rollback and cleanup reach the one that took it.",
   ),
+  // ── Pluggable OS updater ────────────────────────────────────────────────
+  // The OS package layer: scan for pending updates, upgrade, list installed packages.
+  // Built in: the bundled collector + apt/dnf/apk/pacman over the machine's transport.
+  // `osUpdater.model` plugs in any other, reached by name via runModel. OS updater
+  // contract — the referenced model MUST expose:
+  //   • scanOs({ host })          — write one resource with the inventory fields:
+  //                                 `updatesCount` (number|null) and `needsReboot`
+  //                                 (bool) are required, the rest optional.
+  //   • upgradeOs({ host, mode }) — apply the OS updates (`mode` is safe|full).
+  //   • listPackages({ host })    — write one resource with
+  //                                 `packages: [{ name, version }]` (for the diff).
+  // Success = the method run succeeds. Snapshot, health, reboot and the app `source`
+  // stay with @dmc/patch, around the model's upgrade.
+  osUpdater: z.object({
+    model: z.string().min(1).describe(
+      "The OS updater model instance. ANY model that implements the OS updater " +
+        "contract works: scanOs({ host }) writing a resource with updatesCount + " +
+        "needsReboot (other inventory fields optional), upgradeOs({ host, mode }), and " +
+        "listPackages({ host }) writing a resource with `packages: [{ name, version }]`.",
+    ),
+  }).optional().describe(
+    "Optional pluggable OS package layer for scan, safeOsUpdate, reboot and " +
+      "pruneSnapshots. When set it replaces the bundled collector and the built-in " +
+      "apt/dnf/apk/pacman upgrade. Health checks and reboots still use the machine's " +
+      "ssh / pct transport.",
+  ),
 });
 
 const GlobalArgs = z.object({
@@ -375,7 +440,10 @@ const Inventory = z.object({
   dockerEngine: z.string().nullable(),
   dockerImages: z.array(DockerImage).nullable(),
   reachMethod: z.enum(["ssh", "pct"]).nullable().describe(
-    "How this host was scanned",
+    "How this host was scanned (null when an osUpdater model scanned it)",
+  ),
+  osUpdater: z.string().nullable().optional().describe(
+    "The osUpdater model that scanned this host; null/absent = the bundled collector",
   ),
   health: z.object({
     healthy: z.boolean(),
@@ -544,6 +612,26 @@ const SnapshotRecord = z.object({
   rebootConfirmed: z.boolean(),
   status: z.enum(["active", "pruned"]),
   prunedAt: z.string().nullable(),
+});
+
+// What an osUpdater model's `scanOs` must write. Only the two fields every caller reads
+// are required; the rest default, so a minimal OS updater stays minimal.
+const OsScanResult = z.object({
+  hostname: z.string().optional(),
+  osType: z.string().default("Unknown"),
+  osVersion: z.string().default("Unknown"),
+  packageManager: z.string().default("unknown"),
+  updatesCount: z.number().int().min(0).nullable(),
+  securityUpdatesCount: z.number().int().min(0).nullable().default(null),
+  heldBackCount: z.number().int().min(0).nullable().default(null),
+  removalsCount: z.number().int().min(0).nullable().default(null),
+  distUpgradeRequired: z.boolean().nullable().default(null),
+  totalPackages: z.number().int().min(0).nullable().default(null),
+  needsReboot: z.boolean(),
+  rebootReason: z.string().nullable().default(null),
+  dockerEngine: z.string().nullable().default(null),
+  dockerImages: z.array(DockerImage).nullable().default(null),
+  scannedAt: z.string().optional(),
 });
 
 const PruneResult = z.object({
@@ -1101,6 +1189,7 @@ export interface MachineShape {
   proxmox?: { model: string };
   vm?: { proxmoxNode: string; vmid: number };
   snapshotter?: { model: string };
+  osUpdater?: { model: string };
   reach?: "ssh" | "pct";
   health?: Array<z.infer<typeof HealthCheck>>;
 }
@@ -1190,11 +1279,36 @@ export async function resolveHealthChecks(
 // per node) to stay under swamp's runModel call budget.
 // ---------------------------------------------------------------------------
 
-/** Lists the installed packages, one `name<TAB>version` line each (rpm / dpkg / apk). */
+/** Lists the installed packages, one `name<TAB>version` line each (rpm / dpkg / apk /
+ *  pacman). pacman comes last: Debian ships an unrelated `pacman` game. */
 export const PKG_MANIFEST_CMD =
   `if command -v rpm >/dev/null 2>&1; then rpm -qa --qf '%{NAME}\\t%{VERSION}-%{RELEASE}\\n'; ` +
   `elif command -v dpkg-query >/dev/null 2>&1; then dpkg-query -W -f='\${Package}\\t\${Version}\\n'; ` +
-  `elif command -v apk >/dev/null 2>&1; then apk info -v | sed 's/-\\([^-]*-r[0-9][0-9]*\\)$/\\t\\1/'; fi`;
+  `elif command -v apk >/dev/null 2>&1; then apk info -v | sed 's/-\\([^-]*-r[0-9][0-9]*\\)$/\\t\\1/'; ` +
+  `elif command -v pacman >/dev/null 2>&1; then pacman -Q | tr ' ' '\\t'; fi`;
+
+/** The built-in OS upgrade, for the package manager the machine has. Works as root
+ *  (pct exec) or through `sudo -n` (ssh as non-root). apt honours `mode` (safe =
+ *  `upgrade`, never removes; full = `full-upgrade`); dnf, apk and pacman always do a
+ *  full upgrade (pacman supports no other kind). */
+export function osUpgradeScript(mode: "safe" | "full"): string {
+  const aptMode = mode === "full" ? "full-upgrade" : "upgrade";
+  // DEBIAN_FRONTEND is exported (not inlined after $SUDO) so it never lands in
+  // command position — `$SUDO VAR=val cmd` breaks when $SUDO is non-empty.
+  return [
+    `export DEBIAN_FRONTEND=noninteractive`,
+    `SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"`,
+    `if command -v apt-get >/dev/null 2>&1; then`,
+    `  $SUDO apt-get update -qq && $SUDO apt-get -y ${aptMode}`,
+    `elif command -v dnf >/dev/null 2>&1; then`,
+    `  $SUDO dnf -y upgrade`,
+    `elif command -v apk >/dev/null 2>&1; then`,
+    `  $SUDO apk upgrade`,
+    `elif command -v pacman >/dev/null 2>&1; then`,
+    `  $SUDO pacman -Syu --noconfirm`,
+    `else echo "no known package manager" >&2; exit 3; fi`,
+  ].join("\n");
+}
 
 /** The installed-package manifest from PKG_MANIFEST_CMD's output: name → version. */
 export function parseManifest(out: string): Map<string, string> {
@@ -1829,6 +1943,128 @@ export function snapshotterFor(
   }
 }
 
+// ---------------------------------------------------------------------------
+// OS updaters — the pluggable OS package layer.
+//
+// Two implementations sit behind the `OsUpdater` interface:
+//   • built-in — the bundled collector, `osUpgradeScript` (apt/dnf/apk/pacman) and
+//                PKG_MANIFEST_CMD, run over the machine's Transport.
+//   • model    — any model named by a machine's `osUpdater.model`, driven by name
+//                through runModel with the OS updater contract (the extension point).
+// safeOsUpdate, reboot's confirming scan and pruneSnapshots' live gate go through
+// `osUpdaterFor`. `scan` keeps its batched collector fan-out for built-in machines and
+// calls `scanOs` once per model machine.
+// ---------------------------------------------------------------------------
+
+/** One OS package backend for one machine. */
+export interface OsUpdater {
+  /** The osUpdater model, or null for the built-in one. */
+  model: string | null;
+  /** Appended to log lines: the transport note, or the model. */
+  note: string;
+  /** The machine's patch inventory; null when it does not answer. */
+  scan(): Promise<z.infer<typeof Inventory> | null>;
+  /** Apply the OS updates; rc 0 = success. */
+  upgrade(mode: "safe" | "full"): Promise<{ rc: number; out: string }>;
+  /** The installed-package manifest; null when it cannot be read. */
+  packages(): Promise<Map<string, string> | null>;
+}
+
+/** An osUpdater model's `scanOs` result as an inventory, or the reason it is not one. */
+export async function modelOsScan(
+  model: string,
+  host: string,
+  swamp: SwampApi,
+): Promise<{ inv: z.infer<typeof Inventory> | null; error: string }> {
+  const res = await swamp.run(model, "scanOs", { host });
+  if (!res.ok) {
+    return { inv: null, error: tail(res.error, 300) || "scanOs failed" };
+  }
+  const parsed = OsScanResult.safeParse(res.artifacts[0] ?? null);
+  if (!parsed.success) {
+    return {
+      inv: null,
+      error: `scanOs wrote no valid inventory: ${
+        parsed.error.issues.slice(0, 3).map((i) =>
+          `${i.path.join(".") || "(resource)"}: ${i.message}`
+        ).join("; ")
+      }`,
+    };
+  }
+  const s = parsed.data;
+  return {
+    inv: {
+      ...s,
+      hostname: s.hostname ?? host,
+      reachMethod: null,
+      osUpdater: model,
+      health: null,
+      error: null,
+      scannedAt: s.scannedAt ?? new Date().toISOString(),
+    },
+    error: "",
+  };
+}
+
+/** The OS updater a machine uses: its `osUpdater.model`, else the built-in one over
+ *  `transport`. */
+export function osUpdaterFor(
+  m: MachineShape,
+  transport: Transport,
+  deps: { swamp: SwampApi; logger?: Logger },
+): OsUpdater {
+  const model = m.osUpdater?.model;
+  if (!model) {
+    return {
+      model: null,
+      note: transport.note,
+      scan: () => transport.scan(),
+      upgrade: (mode) => transport.exec(osUpgradeScript(mode), 1800),
+      packages: () => transport.packages(),
+    };
+  }
+  const { swamp } = deps;
+  const logger = deps.logger ?? SILENT_LOGGER;
+  const host = m.host;
+  return {
+    model,
+    note: ` via osUpdater "${model}"`,
+    scan: async () => {
+      const { inv, error } = await modelOsScan(model, host, swamp);
+      if (!inv) {
+        logger.warn("{model} scanOs of {host} failed: {error}", {
+          model,
+          host,
+          error,
+        });
+      }
+      return inv;
+    },
+    upgrade: async (mode) => {
+      const ok = await runLogged(
+        swamp,
+        model,
+        "upgradeOs",
+        { host, mode },
+        logger,
+      );
+      return { rc: ok ? 0 : 1, out: "" };
+    },
+    // Like the built-in manifest: unreadable is null, never an empty list.
+    packages: async () => {
+      const res = await swamp.run(model, "listPackages", { host });
+      const list = res.ok ? res.artifacts[0]?.packages : undefined;
+      if (!Array.isArray(list)) return null;
+      const out = new Map<string, string>();
+      for (const p of list as Array<{ name?: unknown; version?: unknown }>) {
+        if (typeof p?.name !== "string" || !p.name) return null;
+        out.set(p.name, typeof p.version === "string" ? p.version : "");
+      }
+      return out;
+    },
+  };
+}
+
 /** `policy` — the `host` argument names a machine in the fleet. */
 export function checkHostInFleet(ctx: CheckCtx): CheckResult {
   const host = checkHost(ctx);
@@ -2179,7 +2415,7 @@ export function parseCtSections(
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.10.16.1",
+  version: "2026.10.25.1",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
@@ -2202,6 +2438,15 @@ export const model = {
         "`snapshotter`. Snapshot records gain a `snapshotter` field; older records map " +
         "from kind/vmid/proxmoxNode. Internally every per-machine operation reaches its " +
         "machine through one ssh / pct Transport.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.25.1",
+      description:
+        "Additive globalArguments change, no migration needed: machines take an optional " +
+        "pluggable `osUpdater` (any model that implements scanOs / upgradeOs / " +
+        "listPackages). The built-in OS layer adds pacman (Arch). Inventory records gain " +
+        "an optional `osUpdater` field.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2322,7 +2567,7 @@ export const model = {
   methods: {
     scan: {
       description:
-        "Fan out over the fleet: collect OS + docker image-drift per machine, and fire community-script checkUpdate for proxmox-referenced machines.",
+        "Fan out over the fleet: collect OS + docker image-drift per machine (the bundled collector, or `scanOs` of the machine's osUpdater model), and fire checkUpdate on every app `source`.",
       arguments: z.object({}),
       execute: async (
         _args: unknown,
@@ -2390,8 +2635,12 @@ export const model = {
         const addErr = (h: string, e: string) =>
           errs.set(h, errs.has(h) ? `${errs.get(h)}; ${e}` : e);
 
+        // A machine with an `osUpdater` model is scanned by that model (step 2b), never
+        // by the bundled collector.
+        const collected = scanned.filter((m) => !m.osUpdater);
+
         // 1) ONE ssh `script` call runs the collector on every ssh host.
-        const sshHosts = scanned.filter((m) => m.reach !== "pct").map((m) =>
+        const sshHosts = collected.filter((m) => m.reach !== "pct").map((m) =>
           m.host
         );
         if (sshHosts.length) {
@@ -2423,7 +2672,7 @@ export const model = {
         // 2) CTs with no inventory yet go to pct, grouped by node: ONE call per node
         // runs the collector in each of its CTs (see ctBatchScript).
         const byNode = new Map<string, Array<{ host: string; ctid: number }>>();
-        for (const m of scanned) {
+        for (const m of collected) {
           if (lines.has(m.host) || !isCtMachine(m)) continue;
           try {
             const { node, ctid } = await ctLocation(m, swamp);
@@ -2469,12 +2718,22 @@ export const model = {
             }
           }
         }
+        // 2b) ONE `scanOs` call per machine with an osUpdater model.
+        const modelInvs = new Map<string, z.infer<typeof Inventory>>();
+        const modelScanned = scanned.filter((m) => m.osUpdater);
+        for (const m of modelScanned) {
+          const model = m.osUpdater!.model;
+          const { inv, error } = await modelOsScan(model, m.host, swamp);
+          if (inv) modelInvs.set(m.host, inv);
+          else addErr(m.host, `osUpdater ${model}: ${tail(error, 120)}`);
+        }
         context.logger.info(
-          "Collected inventory: {ssh} ssh host(s) in one call, {cts} CT(s) on {nodes} node(s) via pct",
+          "Collected inventory: {ssh} ssh host(s) in one call, {cts} CT(s) on {nodes} node(s) via pct, {models} host(s) via osUpdater models",
           {
             ssh: sshHosts.length,
             cts: [...byNode.values()].reduce((n, c) => n + c.length, 0),
             nodes: byNode.size,
+            models: modelScanned.length,
           },
         );
 
@@ -2495,7 +2754,15 @@ export const model = {
           } catch { /* health stays null */ }
 
           const found = lines.get(h);
-          if (found) {
+          const modelInv = modelInvs.get(h);
+          if (modelInv) {
+            handles.push(
+              await context.writeResource("inventory", h, {
+                ...modelInv,
+                health,
+              }),
+            );
+          } else if (found) {
             handles.push(
               await context.writeResource(
                 "inventory",
@@ -2503,6 +2770,7 @@ export const model = {
                 {
                   ...(JSON.parse(found.line) as Record<string, unknown>),
                   reachMethod: found.via,
+                  osUpdater: null,
                   health,
                   error: null,
                 },
@@ -2512,6 +2780,7 @@ export const model = {
             handles.push(
               await context.writeResource("inventory", h, {
                 ...errorInv(h, errs.get(h) || "unreachable"),
+                osUpdater: m.osUpdater?.model ?? null,
                 health,
               }),
             );
@@ -3034,11 +3303,13 @@ export const model = {
         "upgrade over ssh; CTs via pct exec. An app updater (`source`) runs on top for any " +
         "machine kind, under the same snapshot: it is called with snapshot:false when " +
         "@dmc/patch took the snapshot, and with no arguments on an unguarded machine. " +
-        "Reboot is never automatic.",
+        "The OS package layer is pluggable too: an `osUpdater` decoration names any model " +
+        "that implements the OS updater contract (scanOs / upgradeOs / listPackages); " +
+        "otherwise the built-in apt/dnf/apk/pacman upgrade runs. Reboot is never automatic.",
       arguments: z.object({
         host: z.string().min(1).describe("Machine (host) to update"),
         mode: z.enum(["safe", "full"]).default("safe").describe(
-          "apt: safe = `upgrade` (never removes), full = `full-upgrade`. dnf/apk always upgrade.",
+          "apt: safe = `upgrade` (never removes), full = `full-upgrade`. dnf/apk/pacman always do a full upgrade. Passed to an osUpdater model's upgradeOs as is.",
         ),
         retentionHours: z.number().int().default(DEFAULT_RETENTION_HOURS)
           .describe(
@@ -3100,23 +3371,6 @@ export const model = {
           return h.healthy;
         };
 
-        // Shared OS-update pieces (both the CT-via-pct and VM/bare-via-ssh paths).
-        // upScript works as root (pct exec) or via sudo -n (ssh non-root).
-        const aptMode = args.mode === "full" ? "full-upgrade" : "upgrade";
-        // DEBIAN_FRONTEND is exported (not inlined after $SUDO) so it never lands in
-        // command position — `$SUDO VAR=val cmd` breaks when $SUDO is non-empty.
-        const upScript = [
-          `export DEBIAN_FRONTEND=noninteractive`,
-          `SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"`,
-          `if command -v apt-get >/dev/null 2>&1; then`,
-          `  $SUDO apt-get update -qq && $SUDO apt-get -y ${aptMode}`,
-          `elif command -v dnf >/dev/null 2>&1; then`,
-          `  $SUDO dnf -y upgrade`,
-          `elif command -v apk >/dev/null 2>&1; then`,
-          `  $SUDO apk upgrade`,
-          `else echo "no known package manager" >&2; exit 3; fi`,
-        ].join("\n");
-
         // Reach the machine (pct on its node for a CT, ssh otherwise) and pick its
         // snapshot guard: an explicit `snapshotter`, else the built-in proxmox-vm (`vm`)
         // or proxmox-ct (a CT), else none — bare metal is upgraded unguarded. From here
@@ -3133,15 +3387,24 @@ export const model = {
           : null;
         const kind: z.infer<typeof OsUpdateResult>["kind"] =
           transport.via === "pct" ? "ct" : machine.vm ? "vm" : "bare-metal";
+        // The OS package layer: an explicit `osUpdater` model, else the built-in one.
+        const os = osUpdaterFor(machine, transport, {
+          swamp,
+          logger: context.logger,
+        });
 
-        const before = await transport.scan();
+        const before = await os.scan();
         if (!before) {
-          throw new Error(`${transport.notReachable} — cannot update`);
+          throw new Error(
+            os.model
+              ? `osUpdater "${os.model}" could not scan ${args.host} — cannot update`
+              : `${transport.notReachable} — cannot update`,
+          );
         }
         log(
           `before: ${
             before.updatesCount ?? "?"
-          } updates (${before.packageManager})${transport.note}`,
+          } updates (${before.packageManager})${os.note}`,
         );
 
         // Snapshot up front: it guards the OS update AND the app update on top.
@@ -3156,10 +3419,10 @@ export const model = {
           }
         }
 
-        const beforePkgs = await transport.packages();
+        const beforePkgs = await os.packages();
 
-        log(`upgrading (${args.mode})${transport.note}`);
-        const up = await transport.exec(upScript, 1800);
+        log(`upgrading (${args.mode})${os.note}`);
+        const up = await os.upgrade(args.mode);
         log(`upgrade rc ${up.rc}`);
 
         // App updater on top — only when a `source` is configured. The snapshot above
@@ -3175,7 +3438,7 @@ export const model = {
           log(`app source ${src} safeUpdate: ${ok ? "ok" : "failed"}`);
         }
 
-        const after = await transport.scan();
+        const after = await os.scan();
         const healthy = await afterHealthy(after !== null);
 
         // What the update changed — read before any rollback, so a rolled-back run still
@@ -3183,7 +3446,7 @@ export const model = {
         // either list is unreadable, record no diff rather than a misleading one.
         let pkgs: Array<z.infer<typeof PkgChange>> | null = null;
         if (after) {
-          const afterPkgs = await transport.packages();
+          const afterPkgs = await os.packages();
           if (beforePkgs && afterPkgs) {
             pkgs = diffPkgs(beforePkgs, afterPkgs);
             log(`packages changed: ${pkgs.length}`);
@@ -3306,7 +3569,8 @@ export const model = {
           dataHandles.push(
             await context.writeResource("inventory", args.host, {
               ...after,
-              reachMethod: transport.via,
+              reachMethod: os.model ? null : transport.via,
+              osUpdater: os.model,
               // After a rollback the restored state is unchecked: leave it to the next scan.
               health: rolledBack ? null : inventoryHealth(lastHealth),
               error: null,
@@ -3450,7 +3714,8 @@ export const model = {
           return { dataHandles: [handle, await writeRun("failed", null)] };
         }
 
-        // Wait for the host to return and confirm.
+        // Wait for the host to return and confirm, through its OS updater's scan.
+        const os = osUpdaterFor(machine, transport, { swamp });
         let confirmed = false;
         let needsRebootAfter: boolean | null = null;
         let confirmInv: z.infer<typeof Inventory> | null = null;
@@ -3458,7 +3723,7 @@ export const model = {
           await sleep(transport.rebootSettleMs); // let it actually go down first
           const deadline = Date.now() + args.waitTimeoutSec * 1000;
           for (;;) {
-            const inv = await transport.scan();
+            const inv = await os.scan();
             if (inv) {
               confirmed = true;
               needsRebootAfter = !!inv.needsReboot;
@@ -3537,7 +3802,8 @@ export const model = {
           dh.push(
             await context.writeResource("inventory", args.host, {
               ...confirmInv,
-              reachMethod: via,
+              reachMethod: os.model ? null : via,
+              osUpdater: os.model,
               health: inventoryHealth(rebootHealth),
               error: null,
             }),
@@ -3710,12 +3976,14 @@ export const model = {
         );
         const now = Date.now();
         const scannedAt = new Date().toISOString();
-        // Final live gate: the machine answers a scan over its own transport (pct on its
-        // node for a CT, which often has no ssh) AND no reboot is pending.
+        // Final live gate: the machine answers a scan through its OS updater (over its own
+        // transport — pct on its node for a CT, which often has no ssh — unless an
+        // osUpdater model scans it) AND no reboot is pending.
         const healthyNow = async (m: MachineShape): Promise<boolean> => {
           try {
             const transport = await transportFor(m, { sshModel, swamp });
-            return (await transport.scan())?.needsReboot === false;
+            const os = osUpdaterFor(m, transport, { swamp });
+            return (await os.scan())?.needsReboot === false;
           } catch {
             return false;
           }

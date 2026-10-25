@@ -19,9 +19,10 @@ containers) through a single `@swamp/ssh` model.
 - [The fleet model — `@dmc/patch/fleet`](#the-fleet-model--dmcpatchfleet)
   - [Machine decorations](#machine-decorations)
   - [Health checks](#health-checks)
-- [Extending `@dmc/patch` — your own updater and snapshotter](#extending-dmcpatch--your-own-updater-and-snapshotter)
+- [Extending `@dmc/patch` — your own updater, snapshotter and OS updater](#extending-dmcpatch--your-own-updater-snapshotter-and-os-updater)
   - [Updater contract (`source`)](#updater-contract-source)
   - [Snapshotter contract (`snapshotter`)](#snapshotter-contract-snapshotter)
+  - [OS updater contract (`osUpdater`)](#os-updater-contract-osupdater)
   - [Example](#example)
 - [Methods](#methods)
   - [Retired machines and `clearRetired`](#retired-machines-and-clearretired)
@@ -44,8 +45,8 @@ model's methods act on it:
 
 | Layer | What it patches | Owned by |
 | ----- | --------------- | -------- |
-| **OS packages** | apt / dnf / apk inside the host or container | `@dmc/patch` (`ct` / `vm` / bare-metal path) |
-| **App version** | a versioned app on the machine (e.g. Forgejo in a CT, a binary on a VM) | a `source` updater (e.g. `@dmc/proxmox/community-script`, or [your own](#extending-dmcpatch--your-own-updater-and-snapshotter)) |
+| **OS packages** | apt / dnf / apk / pacman inside the host or container | `@dmc/patch` (`ct` / `vm` / bare-metal path), or an `osUpdater` model ([your own](#os-updater-contract-osupdater)) |
+| **App version** | a versioned app on the machine (e.g. Forgejo in a CT, a binary on a VM) | a `source` updater (e.g. `@dmc/proxmox/community-script`, or [your own](#extending-dmcpatch--your-own-updater-snapshotter-and-os-updater)) |
 | **Docker images** | running compose containers | `@dmc/patch` (`docker` path) |
 
 The three layers are complementary — an app updater bumps the app binary, but the
@@ -72,9 +73,9 @@ give a full, queryable history.
 
 CTs are snapshot-guarded via `pct` directly (no node-model method needed).
 
-None of these is required for a mechanism you bring yourself: an app updater or a
-snapshotter can be any model that implements the contract — see
-[Extending `@dmc/patch`](#extending-dmcpatch--your-own-updater-and-snapshotter).
+None of these is required for a mechanism you bring yourself: an app updater, a
+snapshotter or an OS updater can be any model that implements the contract — see
+[Extending `@dmc/patch`](#extending-dmcpatch--your-own-updater-snapshotter-and-os-updater).
 
 ---
 
@@ -84,9 +85,10 @@ The fleet does no ssh or Proxmox work itself. It calls the methods of other
 models: `<sshModel> exec` / `script`, the `vm.proxmoxNode` model
 (`snapshotVm`, `rollbackVm`, `listVmSnapshots`, `deleteVmSnapshot`), the
 `proxmoxNodes` models (`listGuests`, for `import`), the `source` updater
-(`checkUpdate`, `safeUpdate`), and the `snapshotter` model (`snapshot`,
-`rollback`, `deleteSnapshot`, `listSnapshots`). Updaters and snapshotters are
-reached by instance name; their type does not matter.
+(`checkUpdate`, `safeUpdate`), the `snapshotter` model (`snapshot`,
+`rollback`, `deleteSnapshot`, `listSnapshots`), and the `osUpdater` model
+(`scanOs`, `upgradeOs`, `listPackages`). Updaters, snapshotters and OS updaters
+are reached by instance name; their type does not matter.
 
 **Methods** use swamp's in-process API. They never start the swamp CLI:
 
@@ -140,6 +142,7 @@ batches its calls to stay well below that:
 ```text
 calls = 1                                  one ssh `script` call: the collector on every ssh host
       + nodes with CTs on the pct path     one call per Proxmox node: the collector in each of its CTs in turn
+      + machines with an osUpdater         one `scanOs` per machine (not in the collector calls)
       + machines with service/command checks   one health call per machine
       + app sources                        one `checkUpdate` per `source`
 ```
@@ -203,6 +206,10 @@ declares its nature:
   snapshotter:
     model: my-snapshots       # ANY model that implements the snapshotter contract
 
+  # --- optional pluggable OS package layer (overrides the bundled collector + apt/dnf/apk/pacman) ---
+  osUpdater:
+    model: my-os-updater      # ANY model that implements the OS updater contract
+
   # --- optional docker inspection / update ---
   docker:
     composePath: /home/me/my-app
@@ -229,6 +236,10 @@ Notes:
 - **`snapshotter`** replaces the built-in snapshot guard (VM node model / CT
   `pct`) with any model you write, and lets a bare-metal machine be
   snapshot-guarded ([snapshotter contract](#snapshotter-contract-snapshotter)).
+- **`osUpdater`** replaces the bundled collector and the built-in
+  apt/dnf/apk/pacman upgrade with any model you write
+  ([OS updater contract](#os-updater-contract-osupdater)). Health checks and
+  reboots still reach the machine over its ssh / `pct` transport.
 - The deprecated **`proxmox: { model }`** is a legacy field that supplied both a
   CT's location and its app updater from one reference; still honoured as a
   fallback, but prefer `ct` + `source`.
@@ -305,9 +316,9 @@ work without extra config, and you can override anytime.
 
 ---
 
-## Extending `@dmc/patch` — your own updater and snapshotter
+## Extending `@dmc/patch` — your own updater, snapshotter and OS updater
 
-`@dmc/patch` has two extension points. Each one is a **contract**: you name a
+`@dmc/patch` has three extension points. Each one is a **contract**: you name a
 model instance on a machine, and the fleet calls that model's methods **by name**
 (through `runModel`). The fleet never needs the model's type. So you can add your
 own update or snapshot mechanism in your own repo, without changing or
@@ -317,9 +328,11 @@ upstreaming anything to `@dmc/patch`.
 | ---------- | ---------------- | ------------------------------------- |
 | `source: { model }` | The app-update step, on top of the OS update | `checkUpdate`, `safeUpdate({ snapshot? })` |
 | `snapshotter: { model }` | The snapshot guard: snapshot → rollback → cleanup | `snapshot`, `rollback`, `deleteSnapshot`, `listSnapshots` |
+| `osUpdater: { model }` | The OS package layer: scan → upgrade → package list | `scanOs`, `upgradeOs`, `listPackages` |
 
 The built-in behavior is the same code path: the Proxmox VM and CT snapshots are
-two snapshotter implementations inside the fleet, and
+two snapshotter implementations inside the fleet, the bundled collector with
+apt/dnf/apk/pacman is the built-in OS updater, and
 `@dmc/proxmox/community-script` is one updater.
 
 ### Updater contract (`source`)
@@ -387,6 +400,98 @@ from the machine's current decorations. So when you change a machine's
 snapshotter, its older snapshots are still rolled back and deleted by the
 implementation that took them. Records written before this release have no
 `snapshotter` field; they map from `kind` / `vmid` / `proxmoxNode`.
+
+### OS updater contract (`osUpdater`)
+
+The OS package layer is scan, upgrade and package list. Use it for a package
+manager `@dmc/patch` does not ship (zypper, xbps, nix, a vendor appliance CLI), or
+to reach a machine some other way (an MDM, a cloud agent).
+
+| Method | Arguments | Called by | Your model must |
+| ------ | --------- | --------- | --------------- |
+| `scanOs` | `host` | `scan`; `safeOsUpdate` before and after the upgrade; `reboot` (the confirming scan); `pruneSnapshots` (the live gate) | Write one resource with the inventory fields. `updatesCount` (number or null) and `needsReboot` (boolean) are required. `packageManager`, `securityUpdatesCount`, `totalPackages`, `rebootReason`, `osType`, `osVersion`, `heldBackCount`, `removalsCount`, `distUpgradeRequired`, `dockerEngine`, `dockerImages` and `scannedAt` are optional. A failed run (or an invalid resource) means "no answer": `scan` writes an error record, and `safeOsUpdate` stops before it changes anything. |
+| `upgradeOs` | `host`, `mode` (`safe` / `full`) | `safeOsUpdate`, after the snapshot | Apply the OS updates. A failed run counts as a failed upgrade. `mode` is passed through; ignore it if your package manager has one kind of upgrade. |
+| `listPackages` | `host` | `safeOsUpdate`, before and after the upgrade | Write one resource with `packages: [{ name, version }]`. A failed run means no package diff is recorded; the update still goes ahead. |
+
+Rules:
+
+- **`@dmc/patch` keeps everything around the upgrade**: the snapshot guard, the
+  app `source`, the health verdict, the rollback and the reboot. Your model only
+  does the package work.
+- **Health checks and reboots still use the machine's transport** (ssh, or `pct`
+  for a CT), so the machine stays a host in the `sshModel` unless it has only
+  `http` checks and you never reboot it through the fleet.
+- **The bundled collector is skipped** for a machine with an `osUpdater`, so docker
+  image drift comes only from `dockerEngine` / `dockerImages` in your `scanOs`
+  resource.
+- The inventory record names the model (`osUpdater`), with `reachMethod: null`; the
+  reports show `via osUpdater <model>`.
+
+A minimal outline (add your own backend calls where the comments are):
+
+```ts
+import { z } from "npm:zod@4";
+
+const Host = z.object({ host: z.string() });
+
+export const model = {
+  type: "@you/zypper-os",
+  version: "2026.10.25.1",
+  globalArguments: z.object({ sshModel: z.string() }),
+  resources: {
+    scan: {
+      description: "OS package status of a host",
+      // The two required fields, plus any optional inventory fields you report.
+      schema: z.object({
+        packageManager: z.string(),
+        updatesCount: z.number().nullable(),
+        securityUpdatesCount: z.number().nullable().optional(),
+        needsReboot: z.boolean(),
+        rebootReason: z.string().nullable().optional(),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
+    },
+    packages: {
+      description: "Installed packages of a host",
+      schema: z.object({
+        packages: z.array(z.object({ name: z.string(), version: z.string() })),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
+    },
+  },
+  methods: {
+    scanOs: {
+      description: "Pending OS updates of `host`",
+      arguments: Host,
+      execute: async (a, ctx) => {
+        // e.g. `zypper -q lu | grep -c '^v '` and `zypper ps -s` over ctx.runModel
+        const h = await ctx.writeResource("scan", a.host, {
+          packageManager: "zypper",
+          updatesCount: 0,
+          needsReboot: false,
+        });
+        return { dataHandles: [h] };
+      },
+    },
+    upgradeOs: {
+      description: "Apply the OS updates on `host`",
+      arguments: Host.extend({ mode: z.enum(["safe", "full"]) }),
+      execute: async (a, ctx) => ({ dataHandles: [] }), // e.g. zypper -n up / dup
+    },
+    listPackages: {
+      description: "Installed packages of `host`",
+      arguments: Host,
+      execute: async (a, ctx) => {
+        const packages: Array<{ name: string; version: string }> = []; // e.g. rpm -qa
+        const h = await ctx.writeResource("packages", a.host, { packages });
+        return { dataHandles: [h] };
+      },
+    },
+  },
+};
+```
 
 ### Example
 
@@ -496,7 +601,7 @@ methods: {
 ### `safeOsUpdate` in detail
 
 Arguments: `host`, `mode` (`safe` = `apt upgrade` / `full` = `apt full-upgrade`;
-dnf/apk always upgrade), `retentionHours` (default 168 = 7 days),
+dnf/apk/pacman always do a full upgrade; an `osUpdater` model gets `mode` as is), `retentionHours` (default 168 = 7 days),
 `rollbackOnFailure` (default true; applies to every machine kind with a snapshot
 guard), `healthGraceSec` (default 120, see [Health checks](#health-checks)).
 
@@ -514,7 +619,9 @@ Flow, per machine type:
 1. **Snapshot** — through the machine's snapshotter: your `snapshotter` model
    when set; else a VM via the node model, a CT via `pct snapshot`; bare metal
    none. A failed snapshot aborts the update.
-2. **Upgrade** — apt/dnf/apk, over ssh (VM/bare) or `pct exec` (CT), capturing an
+2. **Upgrade** — through the machine's `osUpdater` model when set (`upgradeOs`,
+   with `scanOs` / `listPackages` around it); else apt/dnf/apk/pacman
+   (`pacman -Syu --noconfirm`), over ssh (VM/bare) or `pct exec` (CT), capturing an
    installed-package **before/after diff** (`{name, from, to}`). The "after" list is
    read before any rollback, so a rolled-back run still records what the update
    changed. When either list cannot be read, the run records no diff (`packages:
@@ -656,7 +763,7 @@ All are versioned model data (`swamp data list fleet`, `swamp data query`).
 
 | Spec | Written by | Contents |
 | ---- | ---------- | -------- |
-| `inventory` | scan / safeOsUpdate | Per-host OS status, docker engine + image drift, reachMethod, **health** verdict. Keyed by host (latest = current). |
+| `inventory` | scan / safeOsUpdate | Per-host OS status, docker engine + image drift, reachMethod (or the `osUpdater` model that scanned it), **health** verdict. Keyed by host (latest = current). |
 | `run` | every mutating method | Append-only audit row (`run-<action>-<host>-<ts>`): action, outcome, before/after counts, **package** and **image** diffs, snapshot, rolledBack, needsReboot. |
 | `snapshot` | safeOsUpdate | Lifecycle of a retained snapshot (`snapshotter` that took it, `kind` vm/ct/model, retainUntil, healthConfirmed, rebootConfirmed, status). |
 | `image` | safeUpdate | A retained previous docker image (rollback point) with a retention window. |
@@ -718,11 +825,22 @@ fleet) is a planned addition.
 
 ## The collector
 
-The collector is a self-contained, OS-detecting bash script (apt / dnf / apk)
-bundled inside the extension — consumers do not need to provide it. It prints **one** `{"_kind":"patch-inventory",…}` JSON line:
+The collector is a self-contained, OS-detecting bash script (apt / dnf / apk /
+pacman) bundled inside the extension — consumers do not need to provide it. A
+machine with an `osUpdater` model is scanned by that model instead. It prints **one** `{"_kind":"patch-inventory",…}` JSON line:
 pending updates, security updates, held-back / dist-upgrade (apt), total packages,
 `needsReboot` (running-vs-installed kernel + `needs-restarting -r` / apt
-`reboot-required`), and per-container docker image drift. It runs over ssh, or is
+`reboot-required`), and per-container docker image drift.
+
+On Arch (pacman) it never runs `pacman -Sy` (syncing the live database without
+upgrading invites partial upgrades). It counts updates with `checkupdates` from
+`pacman-contrib` (which also needs `fakeroot`, not in a minimal install), which
+syncs a private copy of the database; without them, it
+falls back to `pacman -Qu` against the existing sync database (stale until the
+next upgrade) and logs that. `[ignored]` packages are not counted. Security
+updates come from `arch-audit -u` when it is installed (else none). A reboot is
+needed when the running kernel's `/usr/lib/modules/<uname -r>` tree is gone
+(not judged inside a container, which runs the host's kernel). It runs over ssh, or is
 shipped base64-encoded through `pct exec` for CTs. It reads no stdin
 (`main </dev/null`) because the ssh model pipes it on stdin.
 
@@ -794,8 +912,9 @@ swamp model method run fleet clearRetired --input dryRun=false
   that took a snapshot can roll it back or delete it, so the `snapshot` record
   stores its snapshotter and `rollback` / `pruneSnapshots` dispatch from the
   record. Changing a machine's `snapshotter` never orphans its older snapshots.
-- **Both extension points are reached by name, never by type**, so a consumer
-  adds an updater or snapshotter in their own repo without upstreaming it.
+- **All three extension points are reached by name, never by type**, so a
+  consumer adds an updater, snapshotter or OS updater in their own repo without
+  upstreaming it.
 - **Every per-machine operation goes through a transport.** `safeOsUpdate`,
   `reboot`, the health checks, `pruneSnapshots`' live gate and the
   `host-reachable` check reach a machine only through a `Transport`: **ssh** (the

@@ -120,7 +120,29 @@ provisioning, snapshot, disk/node migration, and LXC container control.
 **VM provisioning:**
 
 - `createFromImage` — create a VM by importing a cloud image disk, attaching a
-  cloud-init drive, and configuring user/keys/IP in one step
+  cloud-init drive, and configuring user/keys/IP in one step. The disk is
+  `virtio0` and the NIC is `virtio`. Every hardware setting is an input with a
+  default — nothing is fixed in code:
+
+  | Input           | Default                 | Notes                                                                                                                                     |
+  | --------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+  | `memory`        | `2048`                  | MB                                                                                                                                        |
+  | `cores`         | `2`                     |                                                                                                                                           |
+  | `sockets`       | `1`                     |                                                                                                                                           |
+  | `cpu`           | `Broadwell-noTSX`       | QEMU CPU model. `-noTSX` runs on hosts without TSX and can live-migrate between them; use `Broadwell` only if every possible host has TSX |
+  | `ostype`        | `l26`                   | Proxmox guest OS type                                                                                                                     |
+  | `agent`         | `true`                  | QEMU guest agent (`start` waits for its IP)                                                                                               |
+  | `serialConsole` | `true`                  | adds `serial0: socket`; cloud images log boot output there                                                                                |
+  | `diskOptions`   | `iothread=1,discard=on` | extra options for `virtio0`                                                                                                               |
+  | `diskSize`      | the image's size        | GiB. `import-from` copies the image at its own size; when set, the disk grows to this size before the first boot. Cannot shrink.          |
+  | `networkBridge` | `vmbr0`                 |                                                                                                                                           |
+  | `ipConfig`      | `ip=dhcp`               |                                                                                                                                           |
+
+  If a step after the VM is created fails (the disk resize or cloud-init),
+  `createFromImage` deletes that new, never-started VM with its disks, so a
+  re-run is not blocked by `vmid-free`. The error says whether the removal
+  worked; if it did not, delete the VM before re-running.
+
 - `configureCloudInit` — update cloud-init settings on an existing VM
 
 **Snapshots:**
@@ -164,16 +186,18 @@ method's own validation decides.
 | `guest-exists`                 | `live`   | `configureCloudInit`, `snapshot`, `deleteSnapshot`, `moveDisk`, `migrate`, `lxcStop`, `lxcStart`, `lxcMoveVolume` | the VM or LXC exists on the node (`sourceNode` for `migrate`) |
 | `vmid-free`                    | `live`   | `createFromImage`                                                                                                 | an explicit `vmid` is unused in the cluster                   |
 | `target-storage-exists`        | `live`   | `createFromImage`, `moveDisk`, `lxcMoveVolume`                                                                    | the target storage exists and is active on the node           |
+| `disk-size-fits-image`         | `live`   | `createFromImage`                                                                                                 | `diskSize` is not smaller than the image's virtual size       |
 | `snapshot-name-valid`          | `policy` | `snapshot`                                                                                                        | the name follows the Proxmox rule and is not `current`        |
 | `snapshot-name-free`           | `live`   | `snapshot`                                                                                                        | the VM has no snapshot with this name                         |
 | `snapshot-exists`              | `live`   | `deleteSnapshot`                                                                                                  | the snapshot to delete exists                                 |
 | `cluster-has-migration-target` | `live`   | `migrate`                                                                                                         | the node is in a multi-node cluster                           |
 
 Skip checks with `--skip-check <name>`, `--skip-check-label <policy|live>` or
-`--skip-checks`. `vmid-free` and `cluster-has-migration-target` are evaluated
-only when their method is selected (a real run or `validate --method`); a plain
-`swamp model validate <name>` passes them, since an existing VM's own vmid is
-taken and a standalone node has no migration target.
+`--skip-checks`. `vmid-free`, `disk-size-fits-image` and
+`cluster-has-migration-target` are evaluated only when their method is selected
+(a real run or `validate --method`); a plain `swamp model validate <name>`
+passes them, since an existing VM's own vmid is taken and a standalone node has
+no migration target.
 
 ## Usage
 
@@ -195,6 +219,7 @@ steps:
       vmName: my-rocky-vm
       importFrom: ${{ data.latest("proxmox-storage", "Rocky-9-GenericCloud-Base.latest.x86_64.qcow2").attributes.storageRef }}
       diskStorage: local-lvm
+      diskSize: 32
       ciUser: rocky
       sshKeys: ${{ vault.my-keys.SSH_PUBLIC_KEY }}
 ```

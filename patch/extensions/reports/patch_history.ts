@@ -64,6 +64,8 @@ interface Inventory {
   dockerEngine?: string | null;
   dockerImages?: DockerImage[] | null;
   reachMethod?: "ssh" | "pct" | null;
+  /** The osUpdater model that scanned the host; null/absent = the bundled collector. */
+  osUpdater?: string | null;
   health?: {
     healthy: boolean;
     checks: Array<{ label: string; ok: boolean; detail: string }>;
@@ -357,7 +359,11 @@ export const report = {
         lines.push(
           `**${inv.osType} ${inv.osVersion}** · ${inv.packageManager} · ${
             location(host)
-          } · via ${inv.reachMethod ?? "ssh"} · scanned ${when(inv.scannedAt)}`,
+          } · via ${
+            inv.osUpdater
+              ? `osUpdater ${inv.osUpdater}`
+              : inv.reachMethod ?? "ssh"
+          } · scanned ${when(inv.scannedAt)}`,
           "",
         );
         const osBits = [

@@ -461,3 +461,19 @@ Deno.test("history report: when no current host has data the retired block still
   assertStringIncludes(res.markdown, "## Retired machines");
   assertEquals(res.json.status === "no-data", false);
 });
+
+Deno.test("history report: the status line names the osUpdater model that scanned the host", async () => {
+  const res = await run([
+    inventory("arch1", {
+      osType: "Arch Linux",
+      osVersion: "rolling",
+      packageManager: "pacman",
+      reachMethod: null,
+      osUpdater: "pacman-os",
+    }),
+  ]);
+  assertStringIncludes(
+    res.markdown,
+    "**Arch Linux rolling** · pacman · host / VPS · via osUpdater pacman-os · scanned",
+  );
+});

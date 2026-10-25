@@ -476,3 +476,17 @@ Deno.test("status report: when no current host has inventory the retired hosts a
   assertStringIncludes(res.markdown, "## Retired machines");
   assertEquals(res.json.status, "no-data");
 });
+
+Deno.test("status report: Via names the osUpdater model when one scanned the node", async () => {
+  const res = await run([
+    inventory("arch1", {
+      packageManager: "pacman",
+      reachMethod: null,
+      osUpdater: "pacman-os",
+    }),
+    inventory("web1"),
+  ]);
+  assertEquals(row(res.markdown, "arch1")[col("Via")], "osUpdater pacman-os");
+  assertEquals(row(res.markdown, "arch1")[col("Mgr")], "pacman");
+  assertEquals(row(res.markdown, "web1")[col("Via")], "ssh");
+});
