@@ -1,5 +1,10 @@
 import { z } from "npm:zod@4";
-import { fetchWithCurl, resolveAuth, waitForTask } from "./lib/proxmox.ts";
+import {
+  authHeaders,
+  fetchWithCurl,
+  resolveAuth,
+  waitForTask,
+} from "./lib/proxmox.ts";
 
 function authOpts() {
   return { modelType: "@keeb/proxmox/vm" };
@@ -9,18 +14,14 @@ async function resolveVmId(
   apiUrl,
   node,
   vmName,
-  ticket,
-  csrfToken,
+  auth,
   skipTlsVerify,
 ) {
   const response = await fetchWithCurl(
     `${apiUrl}/api2/json/nodes/${node}/qemu`,
     {
       method: "GET",
-      headers: {
-        "Cookie": `PVEAuthCookie=${ticket}`,
-        "CSRFPreventionToken": csrfToken,
-      },
+      headers: authHeaders(auth),
       skipTlsVerify,
     },
   );
@@ -43,18 +44,14 @@ async function resolveLxcId(
   apiUrl,
   node,
   ctName,
-  ticket,
-  csrfToken,
+  auth,
   skipTlsVerify,
 ) {
   const response = await fetchWithCurl(
     `${apiUrl}/api2/json/nodes/${node}/lxc`,
     {
       method: "GET",
-      headers: {
-        "Cookie": `PVEAuthCookie=${ticket}`,
-        "CSRFPreventionToken": csrfToken,
-      },
+      headers: authHeaders(auth),
       skipTlsVerify,
     },
   );
@@ -82,8 +79,7 @@ async function destroyNewVm(
   apiUrl: string,
   node: string,
   vmid: number,
-  ticket: string,
-  csrfToken: string,
+  auth: Awaited<ReturnType<typeof resolveAuth>>,
   skipTlsVerify: boolean | undefined,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
@@ -91,10 +87,7 @@ async function destroyNewVm(
       `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}?purge=1&destroy-unreferenced-disks=1`,
       {
         method: "DELETE",
-        headers: {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        },
+        headers: authHeaders(auth),
         skipTlsVerify,
       },
     );
@@ -107,8 +100,7 @@ async function destroyNewVm(
         apiUrl,
         node,
         upid,
-        ticket,
-        csrfToken,
+        auth,
         skipTlsVerify,
       );
       if (!result.success) {
@@ -193,10 +185,7 @@ async function checkApiGet(
     const auth = await resolveAuth(ctx.globalArgs, ctx, authOpts());
     const response = await fetchWithCurl(`${apiUrl}/api2/json${path}`, {
       method: "GET",
-      headers: {
-        "Cookie": `PVEAuthCookie=${auth.ticket}`,
-        "CSRFPreventionToken": auth.csrfToken,
-      },
+      headers: authHeaders(auth),
       skipTlsVerify,
     });
     if (!response.ok) {
@@ -501,10 +490,7 @@ export const extension = {
           `${apiUrl}/api2/json/cluster/status`,
           {
             method: "GET",
-            headers: {
-              "Cookie": `PVEAuthCookie=${auth.ticket}`,
-              "CSRFPreventionToken": auth.csrfToken,
-            },
+            headers: authHeaders(auth),
             skipTlsVerify,
           },
         );
@@ -619,11 +605,7 @@ export const extension = {
         const log = (msg) => logs.push(msg);
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         let vmid: number;
         if (args.vmid != null) {
@@ -635,7 +617,7 @@ export const extension = {
             `${apiUrl}/api2/json/cluster/nextid`,
             {
               method: "GET",
-              headers: authHeaders,
+              headers,
               skipTlsVerify,
             },
           );
@@ -670,7 +652,7 @@ export const extension = {
           {
             method: "POST",
             headers: {
-              ...authHeaders,
+              ...headers,
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: createParams.toString(),
@@ -690,8 +672,7 @@ export const extension = {
           apiUrl,
           node,
           createUpid,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         if (!createResult.success) {
@@ -711,7 +692,7 @@ export const extension = {
               {
                 method: "PUT",
                 headers: {
-                  ...authHeaders,
+                  ...headers,
                   "Content-Type": "application/x-www-form-urlencoded",
                 },
                 body: new URLSearchParams({
@@ -737,8 +718,7 @@ export const extension = {
                 apiUrl,
                 node,
                 resizeUpid,
-                ticket,
-                csrfToken,
+                auth,
                 skipTlsVerify,
               );
               if (!resizeResult.success) {
@@ -764,7 +744,7 @@ export const extension = {
             {
               method: "PUT",
               headers: {
-                ...authHeaders,
+                ...headers,
                 "Content-Type": "application/x-www-form-urlencoded",
               },
               body: ciParams.toString(),
@@ -788,8 +768,7 @@ export const extension = {
             apiUrl,
             node,
             vmid,
-            ticket,
-            csrfToken,
+            auth,
             skipTlsVerify,
           );
           throw new Error(
@@ -841,14 +820,12 @@ export const extension = {
         const log = (msg) => logs.push(msg);
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
 
         const vm = await resolveVmId(
           apiUrl,
           node,
           vmName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
@@ -866,9 +843,8 @@ export const extension = {
           {
             method: "PUT",
             headers: {
-              "Cookie": `PVEAuthCookie=${ticket}`,
+              ...authHeaders(auth),
               "Content-Type": "application/x-www-form-urlencoded",
-              "CSRFPreventionToken": csrfToken,
             },
             body: ciParams.toString(),
             skipTlsVerify,
@@ -918,18 +894,13 @@ export const extension = {
         const log = (msg) => logs.push(msg);
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         const vm = await resolveVmId(
           apiUrl,
           node,
           vmName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
@@ -943,7 +914,7 @@ export const extension = {
           {
             method: "POST",
             headers: {
-              ...authHeaders,
+              ...headers,
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: body.toString(),
@@ -962,8 +933,7 @@ export const extension = {
           apiUrl,
           node,
           upid,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         if (!taskResult.success) {
@@ -1003,18 +973,13 @@ export const extension = {
         const log = (msg) => logs.push(msg);
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         const vm = await resolveVmId(
           apiUrl,
           node,
           vmName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
@@ -1026,7 +991,7 @@ export const extension = {
           }`,
           {
             method: "DELETE",
-            headers: authHeaders,
+            headers,
             skipTlsVerify,
           },
         );
@@ -1042,8 +1007,7 @@ export const extension = {
           apiUrl,
           node,
           upid,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         if (!taskResult.success) {
@@ -1090,18 +1054,13 @@ export const extension = {
         const log = (msg) => logs.push(msg);
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         const vm = await resolveVmId(
           apiUrl,
           node,
           vmName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         log(`Found VM "${vmName}" → vmid ${vm.vmid} [${vm.status}]`);
@@ -1123,7 +1082,7 @@ export const extension = {
           {
             method: "POST",
             headers: {
-              ...authHeaders,
+              ...headers,
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: body.toString(),
@@ -1141,8 +1100,7 @@ export const extension = {
           apiUrl,
           node,
           upid,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         if (!taskResult.success) {
@@ -1181,14 +1139,12 @@ export const extension = {
         });
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
 
         const vm = await resolveVmId(
           apiUrl,
           node,
           vmName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
 
@@ -1196,10 +1152,7 @@ export const extension = {
           `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/snapshot`,
           {
             method: "GET",
-            headers: {
-              "Cookie": `PVEAuthCookie=${ticket}`,
-              "CSRFPreventionToken": csrfToken,
-            },
+            headers: authHeaders(auth),
             skipTlsVerify,
           },
         );
@@ -1245,18 +1198,13 @@ export const extension = {
         const log = (msg) => logs.push(msg);
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         const ct = await resolveLxcId(
           apiUrl,
           node,
           ctName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
@@ -1268,7 +1216,7 @@ export const extension = {
             `${apiUrl}/api2/json/nodes/${node}/lxc/${ct.vmid}/status/stop`,
             {
               method: "POST",
-              headers: authHeaders,
+              headers,
               skipTlsVerify,
             },
           );
@@ -1282,8 +1230,7 @@ export const extension = {
             apiUrl,
             node,
             upid,
-            ticket,
-            csrfToken,
+            auth,
             skipTlsVerify,
           );
           if (!taskResult.success) {
@@ -1323,18 +1270,13 @@ export const extension = {
         const log = (msg) => logs.push(msg);
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         const ct = await resolveLxcId(
           apiUrl,
           node,
           ctName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
@@ -1346,7 +1288,7 @@ export const extension = {
             `${apiUrl}/api2/json/nodes/${node}/lxc/${ct.vmid}/status/start`,
             {
               method: "POST",
-              headers: authHeaders,
+              headers,
               skipTlsVerify,
             },
           );
@@ -1361,8 +1303,7 @@ export const extension = {
             apiUrl,
             node,
             upid,
-            ticket,
-            csrfToken,
+            auth,
             skipTlsVerify,
           );
           if (!taskResult.success) {
@@ -1410,18 +1351,13 @@ export const extension = {
         const log = (msg) => logs.push(msg);
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         const ct = await resolveLxcId(
           apiUrl,
           node,
           ctName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
@@ -1443,7 +1379,7 @@ export const extension = {
           {
             method: "POST",
             headers: {
-              ...authHeaders,
+              ...headers,
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: body.toString(),
@@ -1462,8 +1398,7 @@ export const extension = {
           apiUrl,
           node,
           upid,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         if (!taskResult.success) {
@@ -1506,23 +1441,20 @@ export const extension = {
         });
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
 
         const entity = kind === "lxc"
           ? await resolveLxcId(
             apiUrl,
             node,
             vmName,
-            ticket,
-            csrfToken,
+            auth,
             skipTlsVerify,
           )
           : await resolveVmId(
             apiUrl,
             node,
             vmName,
-            ticket,
-            csrfToken,
+            auth,
             skipTlsVerify,
           );
 
@@ -1530,10 +1462,7 @@ export const extension = {
           `${apiUrl}/api2/json/nodes/${node}/${kind}/${entity.vmid}/config`,
           {
             method: "GET",
-            headers: {
-              "Cookie": `PVEAuthCookie=${ticket}`,
-              "CSRFPreventionToken": csrfToken,
-            },
+            headers: authHeaders(auth),
             skipTlsVerify,
           },
         );
@@ -1591,18 +1520,13 @@ export const extension = {
         );
 
         const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const { ticket, csrfToken } = auth;
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${ticket}`,
-          "CSRFPreventionToken": csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         const vm = await resolveVmId(
           apiUrl,
           node,
           vmName,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         log(`Found VM "${vmName}" → vmid ${vm.vmid} [${vm.status}] on ${node}`);
@@ -1626,7 +1550,7 @@ export const extension = {
           {
             method: "POST",
             headers: {
-              ...authHeaders,
+              ...headers,
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: body.toString(),
@@ -1647,8 +1571,7 @@ export const extension = {
           apiUrl,
           node,
           upid,
-          ticket,
-          csrfToken,
+          auth,
           skipTlsVerify,
         );
         if (!taskResult.success) {

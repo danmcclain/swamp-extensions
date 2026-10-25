@@ -15,7 +15,8 @@ required. The resulting `storageRef` can be passed directly to
 `createFromImage`.
 
 **Global arguments:** `apiUrl`, `node`, `storage`, `skipTlsVerify`, and auth
-(`ticket`/`csrfToken` or `username`/`password`/`realm`).
+(`tokenId`/`tokenSecret`, `ticket`/`csrfToken`, or `username`/`password`/`realm`
+— see [Authentication](#authentication)).
 
 **Checks:**
 
@@ -297,13 +298,44 @@ That maps 1:1 onto this model: the URL is always `<ctScriptBaseUrl>/ct/<app>.sh`
 script supports it, is just `installVars: {"var_os": "alpine"}` (the script then
 applies its Alpine defaults).
 
+## Authentication
+
+Every API call goes through one auth layer (`lib/proxmox.ts`). It uses the first
+of these that is set:
+
+1. **API token** — `tokenId` (`user@realm!tokenname`) and `tokenSecret`.
+   Requests carry `Authorization: PVEAPIToken=<tokenId>=<tokenSecret>` and no
+   CSRF token. There is no login call, no 2-hour ticket expiry, and no ticket is
+   stored as data.
+2. **Ticket** — `ticket` and `csrfToken` global args.
+3. **Cached ticket** — a ticket under 2 hours old in the model's `auth` data.
+4. **Password** — `username`, `password` and `realm`; logs in with
+   `POST /access/ticket`.
+
+Keep `tokenSecret` in a vault:
+
+```yaml
+globalArguments:
+  tokenId: swamp@pve!automation
+  tokenSecret: ${{ vault.get(infra, PROXMOX_TOKEN_SECRET) }}
+```
+
+Request headers (cookie, CSRF token, token secret) go to curl in a 0600 temp
+config file (`-K`), so they do not show on the command line.
+
+Token args are available today on `@dmc/proxmox/storage`. The `@keeb/proxmox/vm`
+extension methods use the same layer, but swamp type extensions cannot add
+global arguments, so they keep ticket auth until `@dmc/proxmox` has its own VM
+type.
+
 ## Requirements
 
 - [`@keeb/proxmox`](https://swamp.club/extensions/@keeb/proxmox) installed and
   configured
 - Proxmox VE 7+ (download-url API required for `@dmc/proxmox/storage`)
-- Auth via ticket/CSRF token (from `@keeb/proxmox/node` `auth` method) or
-  `username`/`password` global args
+- Auth via an API token, a ticket/CSRF token (from `@keeb/proxmox/node` `auth`
+  method), or `username`/`password` global args — see
+  [Authentication](#authentication)
 - For `@dmc/proxmox/community-script`:
   [`@swamp/ssh`](https://swamp.club/extensions/@swamp/ssh) installed with an
   instance reaching the PVE node, the `swamp` binary on PATH, and an LXC created
