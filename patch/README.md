@@ -441,11 +441,14 @@ export const model = {
   resources: {
     scan: {
       description: "OS package status of a host",
+      // The two required fields, plus any optional inventory fields you report.
       schema: z.object({
         packageManager: z.string(),
         updatesCount: z.number().nullable(),
+        securityUpdatesCount: z.number().nullable().optional(),
         needsReboot: z.boolean(),
-      }).passthrough(),
+        rebootReason: z.string().nullable().optional(),
+      }),
       lifetime: "infinite" as const,
       garbageCollection: 5,
     },
