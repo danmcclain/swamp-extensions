@@ -1,5 +1,11 @@
 import { z } from "npm:zod@4";
-import { fetchWithCurl, resolveAuth, waitForTask } from "./lib/proxmox.ts";
+import {
+  authHeaders,
+  fetchWithCurl,
+  hasUnresolvedAuth,
+  resolveAuth,
+  waitForTask,
+} from "./lib/proxmox.ts";
 
 const GlobalArgs = z.object({
   apiUrl: z.string().describe(
@@ -10,6 +16,11 @@ const GlobalArgs = z.object({
   skipTlsVerify: z.boolean().default(true).describe(
     "Skip TLS certificate verification",
   ),
+  tokenId: z.string().optional().describe(
+    "Proxmox API token id, user@realm!tokenname (preferred auth; used with tokenSecret)",
+  ),
+  tokenSecret: z.string().optional().describe("Proxmox API token secret")
+    .meta({ sensitive: true }),
   ticket: z.string().optional().describe("Auth ticket from proxmox-node").meta(
     { sensitive: true },
   ),
@@ -33,12 +44,18 @@ const ImageSchema = z.object({
 /** Proxmox storage model — downloads cloud images server-side via the Proxmox download-url API. */
 export const model = {
   type: "@dmc/proxmox/storage",
-  version: "2026.07.18.1",
+  version: "2026.10.25.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
       toVersion: "2026.07.18.1",
       description: "Version bump, no schema changes",
+      upgradeAttributes: (old) => old,
+    },
+    {
+      toVersion: "2026.10.25.1",
+      description:
+        "Add optional tokenId/tokenSecret global args (API-token auth)",
       upgradeAttributes: (old) => old,
     },
   ],
@@ -59,6 +76,7 @@ export const model = {
       appliesTo: ["downloadImage"],
       execute: async (context) => {
         const { apiUrl, node, storage, skipTlsVerify } = context.globalArgs;
+        if (hasUnresolvedAuth(context.globalArgs)) return { pass: true };
         const auth = await resolveAuth(context.globalArgs, context, {
           modelType: "@dmc/proxmox/storage",
         });
@@ -67,13 +85,18 @@ export const model = {
           `${apiUrl}/api2/json/nodes/${node}/storage/${storage}/status`,
           {
             method: "GET",
-            headers: {
-              "Cookie": `PVEAuthCookie=${auth.ticket}`,
-              "CSRFPreventionToken": auth.csrfToken,
-            },
+            headers: authHeaders(auth),
             skipTlsVerify,
           },
         );
+        if (response.status === 401 || response.status === 403) {
+          return {
+            pass: false,
+            errors: [
+              `Proxmox refused the credentials (${response.status}) reading storage "${storage}" on node "${node}". Check tokenId/tokenSecret (or the ticket) and the token's Datastore.Audit privilege.`,
+            ],
+          };
+        }
         if (!response.ok) {
           return {
             pass: false,
@@ -126,15 +149,12 @@ export const model = {
         const auth = await resolveAuth(context.globalArgs, context, {
           modelType: "@dmc/proxmox/storage",
         });
-        const authHeaders = {
-          "Cookie": `PVEAuthCookie=${auth.ticket}`,
-          "CSRFPreventionToken": auth.csrfToken,
-        };
+        const headers = authHeaders(auth);
 
         log(`Checking if "${filename}" already exists in storage "${storage}"`);
         const existingResp = await fetchWithCurl(
           `${apiUrl}/api2/json/nodes/${node}/storage/${storage}/content`,
-          { method: "GET", headers: authHeaders, skipTlsVerify },
+          { method: "GET", headers, skipTlsVerify },
         );
         if (!existingResp.ok) {
           throw new Error(
@@ -179,7 +199,7 @@ export const model = {
           {
             method: "POST",
             headers: {
-              ...authHeaders,
+              ...headers,
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: params.toString(),
@@ -204,8 +224,7 @@ export const model = {
           apiUrl,
           node,
           upid,
-          auth.ticket,
-          auth.csrfToken,
+          auth,
           skipTlsVerify,
         );
         // A concurrent download of the same file races this check-then-download —
@@ -227,7 +246,7 @@ export const model = {
         // Proxmox's property-string parser rejects (duplicate "file" key error).
         const contentResp = await fetchWithCurl(
           `${apiUrl}/api2/json/nodes/${node}/storage/${storage}/content`,
-          { method: "GET", headers: authHeaders, skipTlsVerify },
+          { method: "GET", headers, skipTlsVerify },
         );
         if (!contentResp.ok) {
           throw new Error(
