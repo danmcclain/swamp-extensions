@@ -239,6 +239,14 @@ export const model = {
   type: "@dmc/proxmox/node",
   version: "2026.10.26.1",
   globalArguments: ProxmoxConnectionArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.26.1",
+      description:
+        "First release. Definitions moved from @keeb/proxmox/node keep their attributes; set tokenId/tokenSecret for token auth",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     status: {
       description: "Node resource usage (memory, CPU, uptime)",

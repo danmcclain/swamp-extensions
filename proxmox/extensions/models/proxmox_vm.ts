@@ -201,6 +201,14 @@ export const model = {
   type: "@dmc/proxmox/vm",
   version: "2026.10.26.1",
   globalArguments: ProxmoxConnectionArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.26.1",
+      description:
+        "First release. Definitions moved from @keeb/proxmox/vm keep their attributes; set tokenId/tokenSecret for token auth",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     vm: {
       description: "VM operation result",
