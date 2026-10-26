@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@dmc/proxmox"
-version: "2026.10.25.1"
-description: "Proxmox VE extensions — VM/LXC lifecycle operations, cloud image storage, and safe snapshot-guarded updates for community-scripts LXCs"
+version: "2026.10.26.1"
+description: "Proxmox VE extensions with API-token auth — node status and guest discovery, VM snapshot guarding, VM/LXC lifecycle (provisioning from cloud images, snapshots, migration), cloud image storage, and safe snapshot-guarded updates for community-scripts LXCs"
 repository: "https://github.com/danmcclain/swamp-extensions"
 labels:
   - proxmox
