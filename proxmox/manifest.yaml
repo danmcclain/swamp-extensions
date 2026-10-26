@@ -10,6 +10,8 @@ dependencies:
   - "@keeb/proxmox"
   - "@swamp/ssh"
 models:
+  - proxmox_node.ts
+  - proxmox_vm.ts
   - proxmox_vm_extras.ts
   - proxmox_storage.ts
   - proxmox_community_script.ts
