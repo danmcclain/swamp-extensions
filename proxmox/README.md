@@ -1,11 +1,47 @@
 # @dmc/proxmox
 
-Proxmox VE extensions for swamp — VM/LXC lifecycle operations and cloud image
-storage management. Extends the `@keeb/proxmox` family with methods for
-provisioning VMs from cloud images, snapshotting, disk and node migration, and
-LXC container control.
+Proxmox VE extensions for swamp, with API-token auth: node status and guest
+discovery, VM snapshot guarding, full QEMU VM and LXC lifecycle (provisioning
+from cloud images, snapshots, disk and node migration, container control), cloud
+image storage, and safe updates for community-scripts LXCs.
+
+`@dmc/proxmox/node` and `@dmc/proxmox/vm` replace `@keeb/proxmox/node` and
+`@keeb/proxmox/vm`. The `@keeb/proxmox/vm` extension is still included for one
+release so existing definitions keep working while they move — see
+[Moving from @keeb/proxmox](#moving-from-keebproxmox).
 
 ## Models
+
+### `@dmc/proxmox/node`
+
+Node-level operations. The guest methods keep the names and shapes `@dmc/patch`
+expects, so a `proxmoxNodes` / `proxmoxNode` entry can point at a definition of
+this type.
+
+- `status` — node memory, CPU and uptime (`status` resource).
+- `listGuests` — every VM and CT on the cluster with type, vmid, name, status,
+  node and IPv4 (`guests` resource).
+- `snapshotVm` / `rollbackVm` / `deleteVmSnapshot` — run the snapshot task and
+  wait for it; `listVmSnapshots` lists them (`snapshot` resource,
+  `snapshot-<vmid>`). Snapshot names must start with a letter and use letters,
+  digits, `_` or `-`.
+
+**Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, and auth (see
+[Authentication](#authentication)).
+
+**Checks:** `valid-connection` (policy), `node-reachable` (live).
+
+### `@dmc/proxmox/vm`
+
+QEMU VM (and LXC) lifecycle: `lookup`, `start`, `stop`, `create`, `delete`,
+`setBootOrder`, `setConfig`, `sync` (adapted from `@keeb/proxmox`, MIT; no
+`spiceConnect`), plus every method and check listed under
+[the VM/LXC methods](#vmlxc-methods) below.
+
+**Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, and auth (see
+[Authentication](#authentication)).
+
+Each method description lists the Proxmox privileges it needs.
 
 ### `@dmc/proxmox/storage`
 
@@ -113,10 +149,12 @@ only when their method is selected — a real run, or
 `swamp model validate <name> --method <method>` — and pass under a plain
 `swamp model validate <name>`.
 
-### `@keeb/proxmox/vm` extension
+### VM/LXC methods
 
-Extends `@keeb/proxmox/vm`, the base QEMU VM model from `@keeb/proxmox`, with
-provisioning, snapshot, disk/node migration, and LXC container control.
+Provisioning, snapshot, disk/node migration, and LXC container control. These
+are methods of `@dmc/proxmox/vm`, and also an extension of `@keeb/proxmox/vm`
+for one release (ticket auth only there, because a type extension cannot add
+global arguments).
 
 **VM provisioning:**
 
@@ -323,19 +361,35 @@ globalArguments:
 Request headers (cookie, CSRF token, token secret) go to curl in a 0600 temp
 config file (`-K`), so they do not show on the command line.
 
-Token args are available today on `@dmc/proxmox/storage`. The `@keeb/proxmox/vm`
-extension methods use the same layer, but swamp type extensions cannot add
-global arguments, so they keep ticket auth until `@dmc/proxmox` has its own VM
-type.
+Token args are available on `@dmc/proxmox/node`, `@dmc/proxmox/vm` and
+`@dmc/proxmox/storage`. The `@keeb/proxmox/vm` extension methods use the same
+layer but keep ticket auth (a type extension cannot add global arguments).
+
+Live checks pass when the auth args are still unresolved `${{ }}` expressions
+(as under `swamp model validate`); a method run resolves them and runs the
+checks for real.
+
+## Moving from @keeb/proxmox
+
+A definition can change type in place: keep its `id` and `name`, so
+`data.latest("<name>", ...)` references keep resolving to the data it already
+wrote.
+
+1. Set `type: '@dmc/proxmox/vm'` (or `'@dmc/proxmox/node'`) and the current
+   `typeVersion`.
+2. Replace `ticket` / `csrfToken` (or `username` / `password`) with `tokenId` /
+   `tokenSecret` vault references.
+3. Drop workflow steps that only ran `@keeb/proxmox/node` `auth`.
+4. For `@dmc/patch`, keep the node definition's name; `listGuests` and the VM
+   snapshot methods are built into `@dmc/proxmox/node`.
 
 ## Requirements
 
-- [`@keeb/proxmox`](https://swamp.club/extensions/@keeb/proxmox) installed and
-  configured
 - Proxmox VE 7+ (download-url API required for `@dmc/proxmox/storage`)
-- Auth via an API token, a ticket/CSRF token (from `@keeb/proxmox/node` `auth`
-  method), or `username`/`password` global args — see
-  [Authentication](#authentication)
+- Auth via an API token (preferred), a ticket/CSRF token, or
+  `username`/`password` global args — see [Authentication](#authentication)
+- [`@keeb/proxmox`](https://swamp.club/extensions/@keeb/proxmox) only for
+  definitions still on `@keeb/proxmox/vm`
 - For `@dmc/proxmox/community-script`:
   [`@swamp/ssh`](https://swamp.club/extensions/@swamp/ssh) installed with an
   instance reaching the PVE node, the `swamp` binary on PATH, and an LXC created
