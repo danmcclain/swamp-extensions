@@ -2,6 +2,7 @@ import { z } from "npm:zod@4";
 import {
   authHeaders,
   fetchWithCurl,
+  hasUnresolvedAuth,
   resolveAuth,
   waitForTask,
 } from "./lib/proxmox.ts";
@@ -472,536 +473,790 @@ const preflightChecks = {
   },
 };
 
-/** VM and LXC lifecycle extensions for `@keeb/proxmox/vm` — provisioning, snapshots, disk/node migration, and container control. */
-export const extension = {
-  type: "@keeb/proxmox/vm",
-  checks: [{
-    "cluster-has-migration-target": {
-      description:
-        "Verify the node is part of a multi-node Proxmox cluster — migration has nowhere to go on a standalone node. Only evaluated when migrate is the selected method.",
-      labels: ["live"],
-      appliesTo: ["migrate"],
-      execute: async (context) => {
-        if (!selected(context, "migrate")) return { pass: true };
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
+/**
+ * Wrap every `live` check so it passes when the auth global args are still
+ * unresolved `${{ }}` expressions (as under `swamp model validate`); the method
+ * run resolves them and runs the check for real.
+ */
+function skipLiveWhenAuthUnresolved<
+  T extends Record<
+    string,
+    { labels?: string[]; execute: (ctx) => Promise<CheckResult> }
+  >,
+>(checks: T): T {
+  const out = {} as T;
+  for (const [name, check] of Object.entries(checks)) {
+    out[name as keyof T] = (check.labels?.includes("live")
+      ? {
+        ...check,
+        execute: (ctx) =>
+          hasUnresolvedAuth(ctx?.globalArgs)
+            ? Promise.resolve({ pass: true })
+            : check.execute(ctx),
+      }
+      : check) as T[keyof T];
+  }
+  return out;
+}
 
-        const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/cluster/status`,
+/**
+ * Pre-flight checks for the VM/LXC extras. Shared by the `@keeb/proxmox/vm`
+ * extension below and the `@dmc/proxmox/vm` model.
+ */
+export const vmExtraChecks = skipLiveWhenAuthUnresolved({
+  "cluster-has-migration-target": {
+    description:
+      "Verify the node is part of a multi-node Proxmox cluster — migration has nowhere to go on a standalone node. Only evaluated when migrate is the selected method.",
+    labels: ["live"],
+    appliesTo: ["migrate"],
+    execute: async (context) => {
+      if (!selected(context, "migrate")) return { pass: true };
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/cluster/status`,
+        {
+          method: "GET",
+          headers: authHeaders(auth),
+          skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        return {
+          pass: false,
+          errors: [
+            `Failed to read cluster status: ${response.status} ${await response
+              .text()}`,
+          ],
+        };
+      }
+
+      const items = (await response.json()).data;
+      const nodes = items.filter((n) => n.type === "node");
+      if (nodes.length < 2) {
+        return {
+          pass: false,
+          errors: [
+            `Node "${node}" is not part of a multi-node cluster — migration has no valid target`,
+          ],
+        };
+      }
+
+      const self = nodes.find((n) => n.name === node);
+      if (self && self.online !== 1) {
+        return {
+          pass: false,
+          errors: [`Node "${node}" is reported offline in cluster status`],
+        };
+      }
+
+      return { pass: true };
+    },
+  },
+  ...preflightChecks,
+});
+
+/**
+ * VM and LXC lifecycle methods — provisioning, snapshots, disk/node migration,
+ * and container control. Shared by the `@keeb/proxmox/vm` extension below and
+ * the `@dmc/proxmox/vm` model.
+ */
+export const vmExtraMethods = {
+  createFromImage: {
+    description:
+      "Create a VM by importing a cloud image disk — handles VM creation, disk import, and cloud-init drive in one step",
+    arguments: z.object({
+      vmName: z.string().describe("VM name"),
+      vmid: z.number().int().optional().describe(
+        "Explicit VM ID to assign (default: auto-assigned by Proxmox)",
+      ),
+      importFrom: z.string().describe(
+        "Storage reference of the image to import (e.g., local:import/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2)",
+      ),
+      diskStorage: z.string().describe(
+        "Storage pool for the imported VM disk and cloud-init drive",
+      ),
+      memory: z.number().default(2048).describe("Memory in MB"),
+      cores: z.number().default(2).describe("CPU cores"),
+      networkBridge: z.string().default("vmbr0").describe("Network bridge"),
+      ciUser: z.string().optional().describe(
+        "Cloud-init username (e.g., rocky)",
+      ),
+      sshKeys: z.string().optional().describe(
+        "URL-encoded SSH public key(s) for cloud-init",
+      ),
+      ipConfig: z.string().default("ip=dhcp").describe(
+        "Cloud-init IP config (ip=dhcp or ip=x.x.x.x/24,gw=x.x.x.1)",
+      ),
+      cpu: z.string().default("Broadwell-noTSX").describe(
+        "QEMU CPU model. Broadwell-noTSX runs on hosts without TSX and can live-migrate between them; use Broadwell only when every host it may run on has TSX.",
+      ),
+      sockets: z.number().int().positive().default(1).describe(
+        "CPU sockets",
+      ),
+      ostype: z.string().default("l26").describe(
+        "Proxmox guest OS type (l26 = Linux 2.6+ kernel)",
+      ),
+      agent: z.boolean().default(true).describe(
+        "Enable the QEMU guest agent (start waits for its IP)",
+      ),
+      serialConsole: z.boolean().default(true).describe(
+        "Add a serial console (serial0: socket) — cloud images log boot output there",
+      ),
+      diskOptions: z.string().default("iothread=1,discard=on").describe(
+        "Extra options for the imported virtio0 disk",
+      ),
+      diskSize: z.number().int().positive().optional().describe(
+        "Grow the imported disk to this size in GiB before first boot (default: keep the image's size). Must not be smaller than the image.",
+      ),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const {
+        vmName,
+        importFrom,
+        diskStorage,
+        memory,
+        cores,
+        networkBridge,
+        ciUser,
+        sshKeys,
+        ipConfig,
+        cpu,
+        sockets,
+        ostype,
+        agent,
+        serialConsole,
+        diskOptions,
+        diskSize,
+      } = args;
+      context.logger.info(
+        "Creating VM {vmName} on {node} from image {importFrom}",
+        { vmName, node, importFrom },
+      );
+      const logs = [];
+      const log = (msg) => logs.push(msg);
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const headers = authHeaders(auth);
+
+      let vmid: number;
+      if (args.vmid != null) {
+        vmid = args.vmid;
+        log(`Using explicit VM ID: ${vmid}`);
+      } else {
+        log(`Fetching next available VM ID`);
+        const nextIdResp = await fetchWithCurl(
+          `${apiUrl}/api2/json/cluster/nextid`,
           {
             method: "GET",
-            headers: authHeaders(auth),
+            headers,
             skipTlsVerify,
           },
         );
-        if (!response.ok) {
-          return {
-            pass: false,
-            errors: [
-              `Failed to read cluster status: ${response.status} ${await response
-                .text()}`,
-            ],
-          };
-        }
-
-        const items = (await response.json()).data;
-        const nodes = items.filter((n) => n.type === "node");
-        if (nodes.length < 2) {
-          return {
-            pass: false,
-            errors: [
-              `Node "${node}" is not part of a multi-node cluster — migration has no valid target`,
-            ],
-          };
-        }
-
-        const self = nodes.find((n) => n.name === node);
-        if (self && self.online !== 1) {
-          return {
-            pass: false,
-            errors: [`Node "${node}" is reported offline in cluster status`],
-          };
-        }
-
-        return { pass: true };
-      },
-    },
-    ...preflightChecks,
-  }],
-  methods: [{
-    createFromImage: {
-      description:
-        "Create a VM by importing a cloud image disk — handles VM creation, disk import, and cloud-init drive in one step",
-      arguments: z.object({
-        vmName: z.string().describe("VM name"),
-        vmid: z.number().int().optional().describe(
-          "Explicit VM ID to assign (default: auto-assigned by Proxmox)",
-        ),
-        importFrom: z.string().describe(
-          "Storage reference of the image to import (e.g., local:import/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2)",
-        ),
-        diskStorage: z.string().describe(
-          "Storage pool for the imported VM disk and cloud-init drive",
-        ),
-        memory: z.number().default(2048).describe("Memory in MB"),
-        cores: z.number().default(2).describe("CPU cores"),
-        networkBridge: z.string().default("vmbr0").describe("Network bridge"),
-        ciUser: z.string().optional().describe(
-          "Cloud-init username (e.g., rocky)",
-        ),
-        sshKeys: z.string().optional().describe(
-          "URL-encoded SSH public key(s) for cloud-init",
-        ),
-        ipConfig: z.string().default("ip=dhcp").describe(
-          "Cloud-init IP config (ip=dhcp or ip=x.x.x.x/24,gw=x.x.x.1)",
-        ),
-        cpu: z.string().default("Broadwell-noTSX").describe(
-          "QEMU CPU model. Broadwell-noTSX runs on hosts without TSX and can live-migrate between them; use Broadwell only when every host it may run on has TSX.",
-        ),
-        sockets: z.number().int().positive().default(1).describe(
-          "CPU sockets",
-        ),
-        ostype: z.string().default("l26").describe(
-          "Proxmox guest OS type (l26 = Linux 2.6+ kernel)",
-        ),
-        agent: z.boolean().default(true).describe(
-          "Enable the QEMU guest agent (start waits for its IP)",
-        ),
-        serialConsole: z.boolean().default(true).describe(
-          "Add a serial console (serial0: socket) — cloud images log boot output there",
-        ),
-        diskOptions: z.string().default("iothread=1,discard=on").describe(
-          "Extra options for the imported virtio0 disk",
-        ),
-        diskSize: z.number().int().positive().optional().describe(
-          "Grow the imported disk to this size in GiB before first boot (default: keep the image's size). Must not be smaller than the image.",
-        ),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const {
-          vmName,
-          importFrom,
-          diskStorage,
-          memory,
-          cores,
-          networkBridge,
-          ciUser,
-          sshKeys,
-          ipConfig,
-          cpu,
-          sockets,
-          ostype,
-          agent,
-          serialConsole,
-          diskOptions,
-          diskSize,
-        } = args;
-        context.logger.info(
-          "Creating VM {vmName} on {node} from image {importFrom}",
-          { vmName, node, importFrom },
-        );
-        const logs = [];
-        const log = (msg) => logs.push(msg);
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const headers = authHeaders(auth);
-
-        let vmid: number;
-        if (args.vmid != null) {
-          vmid = args.vmid;
-          log(`Using explicit VM ID: ${vmid}`);
-        } else {
-          log(`Fetching next available VM ID`);
-          const nextIdResp = await fetchWithCurl(
-            `${apiUrl}/api2/json/cluster/nextid`,
-            {
-              method: "GET",
-              headers,
-              skipTlsVerify,
-            },
-          );
-          if (!nextIdResp.ok) {
-            throw new Error(
-              `Failed to get next VM ID: ${await nextIdResp.text()}`,
-            );
-          }
-          vmid = parseInt((await nextIdResp.json()).data, 10);
-          log(`VM ID: ${vmid}`);
-        }
-
-        log(`Creating VM "${vmName}" (${vmid}) with import-from=${importFrom}`);
-        const createParams = new URLSearchParams({
-          vmid: String(vmid),
-          name: vmName,
-          memory: String(memory),
-          cores: String(cores),
-          sockets: String(sockets),
-          cpu,
-          ostype,
-          agent: agent ? "1" : "0",
-          virtio0: [`${diskStorage}:0,import-from=${importFrom}`, diskOptions]
-            .filter(Boolean).join(","),
-          net0: `virtio,bridge=${networkBridge}`,
-          boot: "order=virtio0",
-        });
-        if (serialConsole) createParams.set("serial0", "socket");
-
-        const createResp = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/qemu`,
-          {
-            method: "POST",
-            headers: {
-              ...headers,
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: createParams.toString(),
-            skipTlsVerify,
-          },
-        );
-        if (!createResp.ok) {
+        if (!nextIdResp.ok) {
           throw new Error(
-            `Failed to create VM: ${createResp.status} ${await createResp
-              .text()}`,
+            `Failed to get next VM ID: ${await nextIdResp.text()}`,
           );
         }
+        vmid = parseInt((await nextIdResp.json()).data, 10);
+        log(`VM ID: ${vmid}`);
+      }
 
-        const createUpid = (await createResp.json()).data;
-        log(`VM creation task started, waiting...`);
-        const createResult = await waitForTask(
-          apiUrl,
-          node,
-          createUpid,
-          auth,
+      log(`Creating VM "${vmName}" (${vmid}) with import-from=${importFrom}`);
+      const createParams = new URLSearchParams({
+        vmid: String(vmid),
+        name: vmName,
+        memory: String(memory),
+        cores: String(cores),
+        sockets: String(sockets),
+        cpu,
+        ostype,
+        agent: agent ? "1" : "0",
+        virtio0: [`${diskStorage}:0,import-from=${importFrom}`, diskOptions]
+          .filter(Boolean).join(","),
+        net0: `virtio,bridge=${networkBridge}`,
+        boot: "order=virtio0",
+      });
+      if (serialConsole) createParams.set("serial0", "socket");
+
+      const createResp = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/qemu`,
+        {
+          method: "POST",
+          headers: {
+            ...headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: createParams.toString(),
           skipTlsVerify,
+        },
+      );
+      if (!createResp.ok) {
+        throw new Error(
+          `Failed to create VM: ${createResp.status} ${await createResp
+            .text()}`,
         );
-        if (!createResult.success) {
-          throw new Error(`VM creation failed: ${createResult.exitstatus}`);
-        }
-        log(`VM ${vmid} created (${createResult.pollCount} polls)`);
+      }
 
-        // From here the VM exists. If finishing it fails, remove it again so
-        // a re-run is not blocked by its own half-built VM (vmid-free).
-        try {
-          if (diskSize != null) {
-            // import-from always copies the image at its own size; grow it now,
-            // before the first boot, so the guest's growpart sees the full disk.
-            log(`Growing virtio0 to ${diskSize}G`);
-            const resizeResp = await fetchWithCurl(
-              `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}/resize`,
-              {
-                method: "PUT",
-                headers: {
-                  ...headers,
-                  "Content-Type": "application/x-www-form-urlencoded",
-                },
-                body: new URLSearchParams({
-                  disk: "virtio0",
-                  size: `${diskSize}G`,
-                }).toString(),
-                skipTlsVerify,
-              },
-            );
-            if (!resizeResp.ok) {
-              throw new Error(
-                `Failed to grow virtio0 to ${diskSize}G: ${resizeResp.status} ${await resizeResp
-                  .text()}`,
-              );
-            }
-            // Newer Proxmox runs the resize as a task (returns a UPID); older
-            // versions finish it inline (returns null).
-            const resizeUpid = (await resizeResp.json()).data;
-            if (
-              typeof resizeUpid === "string" && resizeUpid.startsWith("UPID:")
-            ) {
-              const resizeResult = await waitForTask(
-                apiUrl,
-                node,
-                resizeUpid,
-                auth,
-                skipTlsVerify,
-              );
-              if (!resizeResult.success) {
-                throw new Error(
-                  `Growing virtio0 to ${diskSize}G failed: ${resizeResult.exitstatus}`,
-                );
-              }
-            }
-            log(`virtio0 is now ${diskSize}G`);
-          }
+      const createUpid = (await createResp.json()).data;
+      log(`VM creation task started, waiting...`);
+      const createResult = await waitForTask(
+        apiUrl,
+        node,
+        createUpid,
+        auth,
+        skipTlsVerify,
+      );
+      if (!createResult.success) {
+        throw new Error(`VM creation failed: ${createResult.exitstatus}`);
+      }
+      log(`VM ${vmid} created (${createResult.pollCount} polls)`);
 
-          log(`Attaching cloud-init drive and configuring`);
-          const ciParams = new URLSearchParams({
-            ide2: `${diskStorage}:cloudinit`,
-            ipconfig0: ipConfig,
-          });
-          if (ciUser) ciParams.set("ciuser", ciUser);
-          // Proxmox requires sshkeys to be URL-encoded inside the form field (double-encode).
-          if (sshKeys) ciParams.set("sshkeys", encodeURIComponent(sshKeys));
-
-          const ciResp = await fetchWithCurl(
-            `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}/config`,
+      // From here the VM exists. If finishing it fails, remove it again so
+      // a re-run is not blocked by its own half-built VM (vmid-free).
+      try {
+        if (diskSize != null) {
+          // import-from always copies the image at its own size; grow it now,
+          // before the first boot, so the guest's growpart sees the full disk.
+          log(`Growing virtio0 to ${diskSize}G`);
+          const resizeResp = await fetchWithCurl(
+            `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}/resize`,
             {
               method: "PUT",
               headers: {
                 ...headers,
                 "Content-Type": "application/x-www-form-urlencoded",
               },
-              body: ciParams.toString(),
+              body: new URLSearchParams({
+                disk: "virtio0",
+                size: `${diskSize}G`,
+              }).toString(),
               skipTlsVerify,
             },
           );
-          if (!ciResp.ok) {
+          if (!resizeResp.ok) {
             throw new Error(
-              `Failed to configure cloud-init: ${ciResp.status} ${await ciResp
+              `Failed to grow virtio0 to ${diskSize}G: ${resizeResp.status} ${await resizeResp
                 .text()}`,
             );
           }
-          log(
-            `Cloud-init configured (user=${
-              ciUser ?? "default"
-            }, ipConfig=${ipConfig})`,
-          );
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          const removed = await destroyNewVm(
-            apiUrl,
-            node,
-            vmid,
-            auth,
-            skipTlsVerify,
-          );
-          throw new Error(
-            removed.ok
-              ? `${reason} — VM ${vmid} was removed again; it is safe to re-run createFromImage.`
-              : `${reason} — VM ${vmid} was left half-built and could not be removed (${removed.error}); delete it before re-running.`,
-          );
+          // Newer Proxmox runs the resize as a task (returns a UPID); older
+          // versions finish it inline (returns null).
+          const resizeUpid = (await resizeResp.json()).data;
+          if (
+            typeof resizeUpid === "string" && resizeUpid.startsWith("UPID:")
+          ) {
+            const resizeResult = await waitForTask(
+              apiUrl,
+              node,
+              resizeUpid,
+              auth,
+              skipTlsVerify,
+            );
+            if (!resizeResult.success) {
+              throw new Error(
+                `Growing virtio0 to ${diskSize}G failed: ${resizeResult.exitstatus}`,
+              );
+            }
+          }
+          log(`virtio0 is now ${diskSize}G`);
         }
 
-        const handle = await context.writeResource("vm", vmName, {
-          vmid,
-          vmName,
-          status: "stopped",
-          ip: null,
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
+        log(`Attaching cloud-init drive and configuring`);
+        const ciParams = new URLSearchParams({
+          ide2: `${diskStorage}:cloudinit`,
+          ipconfig0: ipConfig,
         });
-        context.logger.info("Created VM {vmName} with vmid {vmid} on {node}", {
-          vmName,
-          vmid,
-          node,
-        });
-        return { dataHandles: [handle] };
-      },
-    },
-
-    configureCloudInit: {
-      description:
-        "Update cloud-init configuration on an existing VM (user, SSH keys, IP config)",
-      arguments: z.object({
-        vmName: z.string().describe("VM name"),
-        ciUser: z.string().optional().describe("Cloud-init username"),
-        sshKeys: z.string().optional().describe(
-          "URL-encoded SSH public key(s)",
-        ),
-        ipConfig: z.string().optional().describe(
-          "IP config (ip=dhcp or ip=x.x.x.x/24,gw=x.x.x.1)",
-        ),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { vmName, ciUser, sshKeys, ipConfig } = args;
-        context.logger.info("Updating cloud-init on VM {vmName} on {node}", {
-          vmName,
-          node,
-        });
-        const logs = [];
-        const log = (msg) => logs.push(msg);
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-
-        const vm = await resolveVmId(
-          apiUrl,
-          node,
-          vmName,
-          auth,
-          skipTlsVerify,
-        );
-        log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
-
-        const ciParams = new URLSearchParams();
         if (ciUser) ciParams.set("ciuser", ciUser);
+        // Proxmox requires sshkeys to be URL-encoded inside the form field (double-encode).
         if (sshKeys) ciParams.set("sshkeys", encodeURIComponent(sshKeys));
-        if (ipConfig) ciParams.set("ipconfig0", ipConfig);
-        if ([...ciParams].length === 0) {
-          throw new Error("No cloud-init params provided");
-        }
 
-        const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/config`,
+        const ciResp = await fetchWithCurl(
+          `${apiUrl}/api2/json/nodes/${node}/qemu/${vmid}/config`,
           {
             method: "PUT",
             headers: {
-              ...authHeaders(auth),
+              ...headers,
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: ciParams.toString(),
             skipTlsVerify,
           },
         );
-        if (!response.ok) {
+        if (!ciResp.ok) {
           throw new Error(
-            `Failed to configure cloud-init: ${response.status} ${await response
+            `Failed to configure cloud-init: ${ciResp.status} ${await ciResp
               .text()}`,
           );
         }
-        log(`Cloud-init updated on VM ${vm.vmid}`);
-
-        const handle = await context.writeResource("vm", vmName, {
-          vmid: vm.vmid,
-          vmName,
-          config: Object.fromEntries(ciParams),
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
-        });
-        context.logger.info("Updated cloud-init on VM {vmName} (vmid {vmid})", {
-          vmName,
-          vmid: vm.vmid,
-        });
-        return { dataHandles: [handle] };
-      },
-    },
-
-    snapshot: {
-      description: "Create a Proxmox VM snapshot",
-      arguments: z.object({
-        vmName: z.string().describe("VM name"),
-        snapname: z.string().describe(
-          "Snapshot name (alphanumeric/underscore, no spaces)",
-        ),
-        description: z.string().optional().describe("Snapshot description"),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { vmName, snapname, description } = args;
-        context.logger.info(
-          "Creating snapshot {snapname} of VM {vmName} on {node}",
-          { snapname, vmName, node },
+        log(
+          `Cloud-init configured (user=${
+            ciUser ?? "default"
+          }, ipConfig=${ipConfig})`,
         );
-        const logs = [];
-        const log = (msg) => logs.push(msg);
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const headers = authHeaders(auth);
-
-        const vm = await resolveVmId(
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        const removed = await destroyNewVm(
           apiUrl,
           node,
-          vmName,
+          vmid,
           auth,
           skipTlsVerify,
         );
-        log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
+        throw new Error(
+          removed.ok
+            ? `${reason} — VM ${vmid} was removed again; it is safe to re-run createFromImage.`
+            : `${reason} — VM ${vmid} was left half-built and could not be removed (${removed.error}); delete it before re-running.`,
+        );
+      }
 
-        const body = new URLSearchParams({ snapname });
-        if (description) body.set("description", description);
+      const handle = await context.writeResource("vm", vmName, {
+        vmid,
+        vmName,
+        status: "stopped",
+        ip: null,
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      context.logger.info("Created VM {vmName} with vmid {vmid} on {node}", {
+        vmName,
+        vmid,
+        node,
+      });
+      return { dataHandles: [handle] };
+    },
+  },
 
-        log(`Creating snapshot "${snapname}"`);
+  configureCloudInit: {
+    description:
+      "Update cloud-init configuration on an existing VM (user, SSH keys, IP config)",
+    arguments: z.object({
+      vmName: z.string().describe("VM name"),
+      ciUser: z.string().optional().describe("Cloud-init username"),
+      sshKeys: z.string().optional().describe(
+        "URL-encoded SSH public key(s)",
+      ),
+      ipConfig: z.string().optional().describe(
+        "IP config (ip=dhcp or ip=x.x.x.x/24,gw=x.x.x.1)",
+      ),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { vmName, ciUser, sshKeys, ipConfig } = args;
+      context.logger.info("Updating cloud-init on VM {vmName} on {node}", {
+        vmName,
+        node,
+      });
+      const logs = [];
+      const log = (msg) => logs.push(msg);
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+
+      const vm = await resolveVmId(
+        apiUrl,
+        node,
+        vmName,
+        auth,
+        skipTlsVerify,
+      );
+      log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
+
+      const ciParams = new URLSearchParams();
+      if (ciUser) ciParams.set("ciuser", ciUser);
+      if (sshKeys) ciParams.set("sshkeys", encodeURIComponent(sshKeys));
+      if (ipConfig) ciParams.set("ipconfig0", ipConfig);
+      if ([...ciParams].length === 0) {
+        throw new Error("No cloud-init params provided");
+      }
+
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/config`,
+        {
+          method: "PUT",
+          headers: {
+            ...authHeaders(auth),
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: ciParams.toString(),
+          skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `Failed to configure cloud-init: ${response.status} ${await response
+            .text()}`,
+        );
+      }
+      log(`Cloud-init updated on VM ${vm.vmid}`);
+
+      const handle = await context.writeResource("vm", vmName, {
+        vmid: vm.vmid,
+        vmName,
+        config: Object.fromEntries(ciParams),
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      context.logger.info("Updated cloud-init on VM {vmName} (vmid {vmid})", {
+        vmName,
+        vmid: vm.vmid,
+      });
+      return { dataHandles: [handle] };
+    },
+  },
+
+  snapshot: {
+    description: "Create a Proxmox VM snapshot",
+    arguments: z.object({
+      vmName: z.string().describe("VM name"),
+      snapname: z.string().describe(
+        "Snapshot name (alphanumeric/underscore, no spaces)",
+      ),
+      description: z.string().optional().describe("Snapshot description"),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { vmName, snapname, description } = args;
+      context.logger.info(
+        "Creating snapshot {snapname} of VM {vmName} on {node}",
+        { snapname, vmName, node },
+      );
+      const logs = [];
+      const log = (msg) => logs.push(msg);
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const headers = authHeaders(auth);
+
+      const vm = await resolveVmId(
+        apiUrl,
+        node,
+        vmName,
+        auth,
+        skipTlsVerify,
+      );
+      log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
+
+      const body = new URLSearchParams({ snapname });
+      if (description) body.set("description", description);
+
+      log(`Creating snapshot "${snapname}"`);
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/snapshot`,
+        {
+          method: "POST",
+          headers: {
+            ...headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: body.toString(),
+          skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `Failed to create snapshot: ${response.status} ${await response
+            .text()}`,
+        );
+      }
+
+      const upid = (await response.json()).data;
+      const taskResult = await waitForTask(
+        apiUrl,
+        node,
+        upid,
+        auth,
+        skipTlsVerify,
+      );
+      if (!taskResult.success) {
+        throw new Error(`Snapshot creation failed: ${taskResult.exitstatus}`);
+      }
+      log(`Snapshot "${snapname}" created (${taskResult.pollCount} polls)`);
+      context.logger.info(
+        "Created snapshot {snapname} of VM {vmName} (vmid {vmid})",
+        { snapname, vmName, vmid: vm.vmid },
+      );
+
+      const handle = await context.writeResource("vm", `${vmName}-ops`, {
+        vmid: vm.vmid,
+        vmName,
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      return { dataHandles: [handle] };
+    },
+  },
+
+  deleteSnapshot: {
+    description: "Delete a Proxmox VM snapshot",
+    arguments: z.object({
+      vmName: z.string().describe("VM name"),
+      snapname: z.string().describe("Snapshot name to delete"),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { vmName, snapname } = args;
+      context.logger.info(
+        "Deleting snapshot {snapname} of VM {vmName} on {node}",
+        { snapname, vmName, node },
+      );
+      const logs = [];
+      const log = (msg) => logs.push(msg);
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const headers = authHeaders(auth);
+
+      const vm = await resolveVmId(
+        apiUrl,
+        node,
+        vmName,
+        auth,
+        skipTlsVerify,
+      );
+      log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
+
+      log(`Deleting snapshot "${snapname}"`);
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/snapshot/${
+          encodeURIComponent(snapname)
+        }`,
+        {
+          method: "DELETE",
+          headers,
+          skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `Failed to delete snapshot: ${response.status} ${await response
+            .text()}`,
+        );
+      }
+
+      const upid = (await response.json()).data;
+      const taskResult = await waitForTask(
+        apiUrl,
+        node,
+        upid,
+        auth,
+        skipTlsVerify,
+      );
+      if (!taskResult.success) {
+        throw new Error(`Snapshot deletion failed: ${taskResult.exitstatus}`);
+      }
+      log(`Snapshot "${snapname}" deleted (${taskResult.pollCount} polls)`);
+      context.logger.info(
+        "Deleted snapshot {snapname} of VM {vmName} (vmid {vmid})",
+        { snapname, vmName, vmid: vm.vmid },
+      );
+
+      const handle = await context.writeResource("vm", `${vmName}-ops`, {
+        vmid: vm.vmid,
+        vmName,
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      return { dataHandles: [handle] };
+    },
+  },
+
+  moveDisk: {
+    description:
+      "Move a VM's disk to a different storage backend (VM should be stopped first for safety)",
+    arguments: z.object({
+      vmName: z.string().describe("VM name"),
+      disk: z.string().default("virtio0").describe(
+        "Disk identifier to move (e.g. virtio0, scsi0)",
+      ),
+      targetStorage: z.string().describe("Destination storage pool name"),
+      deleteSource: z.boolean().default(true).describe(
+        "Delete the source disk after a successful move",
+      ),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { vmName, disk, targetStorage, deleteSource } = args;
+      context.logger.info(
+        "Moving disk {disk} of VM {vmName} to storage {targetStorage}",
+        { disk, vmName, targetStorage },
+      );
+      const logs = [];
+      const log = (msg) => logs.push(msg);
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const headers = authHeaders(auth);
+
+      const vm = await resolveVmId(
+        apiUrl,
+        node,
+        vmName,
+        auth,
+        skipTlsVerify,
+      );
+      log(`Found VM "${vmName}" → vmid ${vm.vmid} [${vm.status}]`);
+      if (vm.status === "running") {
+        log(
+          `Warning: VM is running — moving disk live. Stop it first for a safer migration.`,
+        );
+      }
+
+      const body = new URLSearchParams({
+        disk,
+        storage: targetStorage,
+        delete: deleteSource ? "1" : "0",
+      });
+
+      log(`Moving disk "${disk}" to storage "${targetStorage}"`);
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/move_disk`,
+        {
+          method: "POST",
+          headers: {
+            ...headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: body.toString(),
+          skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `Failed to move disk: ${response.status} ${await response.text()}`,
+        );
+      }
+
+      const upid = (await response.json()).data;
+      const taskResult = await waitForTask(
+        apiUrl,
+        node,
+        upid,
+        auth,
+        skipTlsVerify,
+      );
+      if (!taskResult.success) {
+        throw new Error(`Disk move failed: ${taskResult.exitstatus}`);
+      }
+      log(
+        `Disk "${disk}" moved to "${targetStorage}" (${taskResult.pollCount} polls)`,
+      );
+      context.logger.info(
+        "Moved disk {disk} of VM {vmName} (vmid {vmid}) to storage {targetStorage}",
+        { disk, vmName, vmid: vm.vmid, targetStorage },
+      );
+
+      const handle = await context.writeResource("vm", `${vmName}-ops`, {
+        vmid: vm.vmid,
+        vmName,
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      return { dataHandles: [handle] };
+    },
+  },
+
+  listSnapshots: {
+    description: "List snapshots for a Proxmox VM",
+    arguments: z.object({
+      vmName: z.string().describe("VM name"),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { vmName } = args;
+      context.logger.info("Listing snapshots of VM {vmName} on {node}", {
+        vmName,
+        node,
+      });
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+
+      const vm = await resolveVmId(
+        apiUrl,
+        node,
+        vmName,
+        auth,
+        skipTlsVerify,
+      );
+
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/snapshot`,
+        {
+          method: "GET",
+          headers: authHeaders(auth),
+          skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `Failed to list snapshots: ${response.status} ${await response
+            .text()}`,
+        );
+      }
+      const snapshots = (await response.json()).data;
+      const names = snapshots.map((s) => s.name).filter((n) => n !== "current");
+
+      const handle = await context.writeResource("vm", `${vmName}-ops`, {
+        vmid: vm.vmid,
+        vmName,
+        success: true,
+        logs: `Snapshots: ${names.join(", ") || "(none)"}`,
+        timestamp: new Date().toISOString(),
+      });
+      context.logger.info("Listed {count} snapshots of VM {vmName}", {
+        count: names.length,
+        vmName,
+      });
+      return { dataHandles: [handle] };
+    },
+  },
+
+  lxcStop: {
+    description: "Stop a Proxmox LXC container",
+    arguments: z.object({
+      ctName: z.string().describe("LXC container name"),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { ctName } = args;
+      context.logger.info("Stopping LXC {ctName} on {node}", {
+        ctName,
+        node,
+      });
+      const logs = [];
+      const log = (msg) => logs.push(msg);
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const headers = authHeaders(auth);
+
+      const ct = await resolveLxcId(
+        apiUrl,
+        node,
+        ctName,
+        auth,
+        skipTlsVerify,
+      );
+      log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
+
+      if (ct.status === "stopped") {
+        log(`Already stopped`);
+      } else {
         const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/snapshot`,
+          `${apiUrl}/api2/json/nodes/${node}/lxc/${ct.vmid}/status/stop`,
           {
             method: "POST",
-            headers: {
-              ...headers,
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: body.toString(),
-            skipTlsVerify,
-          },
-        );
-        if (!response.ok) {
-          throw new Error(
-            `Failed to create snapshot: ${response.status} ${await response
-              .text()}`,
-          );
-        }
-
-        const upid = (await response.json()).data;
-        const taskResult = await waitForTask(
-          apiUrl,
-          node,
-          upid,
-          auth,
-          skipTlsVerify,
-        );
-        if (!taskResult.success) {
-          throw new Error(`Snapshot creation failed: ${taskResult.exitstatus}`);
-        }
-        log(`Snapshot "${snapname}" created (${taskResult.pollCount} polls)`);
-        context.logger.info(
-          "Created snapshot {snapname} of VM {vmName} (vmid {vmid})",
-          { snapname, vmName, vmid: vm.vmid },
-        );
-
-        const handle = await context.writeResource("vm", `${vmName}-ops`, {
-          vmid: vm.vmid,
-          vmName,
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
-        });
-        return { dataHandles: [handle] };
-      },
-    },
-
-    deleteSnapshot: {
-      description: "Delete a Proxmox VM snapshot",
-      arguments: z.object({
-        vmName: z.string().describe("VM name"),
-        snapname: z.string().describe("Snapshot name to delete"),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { vmName, snapname } = args;
-        context.logger.info(
-          "Deleting snapshot {snapname} of VM {vmName} on {node}",
-          { snapname, vmName, node },
-        );
-        const logs = [];
-        const log = (msg) => logs.push(msg);
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const headers = authHeaders(auth);
-
-        const vm = await resolveVmId(
-          apiUrl,
-          node,
-          vmName,
-          auth,
-          skipTlsVerify,
-        );
-        log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
-
-        log(`Deleting snapshot "${snapname}"`);
-        const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/snapshot/${
-            encodeURIComponent(snapname)
-          }`,
-          {
-            method: "DELETE",
             headers,
             skipTlsVerify,
           },
         );
         if (!response.ok) {
           throw new Error(
-            `Failed to delete snapshot: ${response.status} ${await response
-              .text()}`,
+            `Failed to stop LXC: ${response.status} ${await response.text()}`,
           );
         }
-
         const upid = (await response.json()).data;
         const taskResult = await waitForTask(
           apiUrl,
@@ -1011,90 +1266,70 @@ export const extension = {
           skipTlsVerify,
         );
         if (!taskResult.success) {
-          throw new Error(`Snapshot deletion failed: ${taskResult.exitstatus}`);
+          throw new Error(`LXC stop failed: ${taskResult.exitstatus}`);
         }
-        log(`Snapshot "${snapname}" deleted (${taskResult.pollCount} polls)`);
-        context.logger.info(
-          "Deleted snapshot {snapname} of VM {vmName} (vmid {vmid})",
-          { snapname, vmName, vmid: vm.vmid },
-        );
+        log(`LXC ${ct.vmid} stopped (${taskResult.pollCount} polls)`);
+      }
+      context.logger.info("LXC {ctName} (vmid {vmid}) is stopped", {
+        ctName,
+        vmid: ct.vmid,
+      });
 
-        const handle = await context.writeResource("vm", `${vmName}-ops`, {
-          vmid: vm.vmid,
-          vmName,
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
-        });
-        return { dataHandles: [handle] };
-      },
+      const handle = await context.writeResource("vm", `${ctName}-ops`, {
+        vmid: ct.vmid,
+        vmName: ctName,
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      return { dataHandles: [handle] };
     },
+  },
 
-    moveDisk: {
-      description:
-        "Move a VM's disk to a different storage backend (VM should be stopped first for safety)",
-      arguments: z.object({
-        vmName: z.string().describe("VM name"),
-        disk: z.string().default("virtio0").describe(
-          "Disk identifier to move (e.g. virtio0, scsi0)",
-        ),
-        targetStorage: z.string().describe("Destination storage pool name"),
-        deleteSource: z.boolean().default(true).describe(
-          "Delete the source disk after a successful move",
-        ),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { vmName, disk, targetStorage, deleteSource } = args;
-        context.logger.info(
-          "Moving disk {disk} of VM {vmName} to storage {targetStorage}",
-          { disk, vmName, targetStorage },
-        );
-        const logs = [];
-        const log = (msg) => logs.push(msg);
+  lxcStart: {
+    description: "Start a Proxmox LXC container",
+    arguments: z.object({
+      ctName: z.string().describe("LXC container name"),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { ctName } = args;
+      context.logger.info("Starting LXC {ctName} on {node}", {
+        ctName,
+        node,
+      });
+      const logs = [];
+      const log = (msg) => logs.push(msg);
 
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const headers = authHeaders(auth);
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const headers = authHeaders(auth);
 
-        const vm = await resolveVmId(
-          apiUrl,
-          node,
-          vmName,
-          auth,
-          skipTlsVerify,
-        );
-        log(`Found VM "${vmName}" → vmid ${vm.vmid} [${vm.status}]`);
-        if (vm.status === "running") {
-          log(
-            `Warning: VM is running — moving disk live. Stop it first for a safer migration.`,
-          );
-        }
+      const ct = await resolveLxcId(
+        apiUrl,
+        node,
+        ctName,
+        auth,
+        skipTlsVerify,
+      );
+      log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
 
-        const body = new URLSearchParams({
-          disk,
-          storage: targetStorage,
-          delete: deleteSource ? "1" : "0",
-        });
-
-        log(`Moving disk "${disk}" to storage "${targetStorage}"`);
+      if (ct.status === "running") {
+        log(`Already running`);
+      } else {
         const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/move_disk`,
+          `${apiUrl}/api2/json/nodes/${node}/lxc/${ct.vmid}/status/start`,
           {
             method: "POST",
-            headers: {
-              ...headers,
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: body.toString(),
+            headers,
             skipTlsVerify,
           },
         );
         if (!response.ok) {
           throw new Error(
-            `Failed to move disk: ${response.status} ${await response.text()}`,
+            `Failed to start LXC: ${response.status} ${await response
+              .text()}`,
           );
         }
-
         const upid = (await response.json()).data;
         const taskResult = await waitForTask(
           apiUrl,
@@ -1104,498 +1339,305 @@ export const extension = {
           skipTlsVerify,
         );
         if (!taskResult.success) {
-          throw new Error(`Disk move failed: ${taskResult.exitstatus}`);
+          throw new Error(`LXC start failed: ${taskResult.exitstatus}`);
         }
+        log(`LXC ${ct.vmid} started (${taskResult.pollCount} polls)`);
+      }
+      context.logger.info("LXC {ctName} (vmid {vmid}) is running", {
+        ctName,
+        vmid: ct.vmid,
+      });
+
+      const handle = await context.writeResource("vm", `${ctName}-ops`, {
+        vmid: ct.vmid,
+        vmName: ctName,
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      return { dataHandles: [handle] };
+    },
+  },
+
+  lxcMoveVolume: {
+    description:
+      "Move an LXC container's volume (rootfs or mount point) to a different storage backend",
+    arguments: z.object({
+      ctName: z.string().describe("LXC container name"),
+      volume: z.string().default("rootfs").describe(
+        "Volume identifier (e.g. rootfs, mp0)",
+      ),
+      targetStorage: z.string().describe("Destination storage pool name"),
+      deleteSource: z.boolean().default(true).describe(
+        "Delete the source volume after a successful move",
+      ),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { ctName, volume, targetStorage, deleteSource } = args;
+      context.logger.info(
+        "Moving volume {volume} of LXC {ctName} to storage {targetStorage}",
+        { volume, ctName, targetStorage },
+      );
+      const logs = [];
+      const log = (msg) => logs.push(msg);
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const headers = authHeaders(auth);
+
+      const ct = await resolveLxcId(
+        apiUrl,
+        node,
+        ctName,
+        auth,
+        skipTlsVerify,
+      );
+      log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
+      if (ct.status === "running") {
         log(
-          `Disk "${disk}" moved to "${targetStorage}" (${taskResult.pollCount} polls)`,
+          `Warning: LXC is running — moving volume live. Stop it first for a safer migration.`,
         );
-        context.logger.info(
-          "Moved disk {disk} of VM {vmName} (vmid {vmid}) to storage {targetStorage}",
-          { disk, vmName, vmid: vm.vmid, targetStorage },
-        );
+      }
 
-        const handle = await context.writeResource("vm", `${vmName}-ops`, {
-          vmid: vm.vmid,
-          vmName,
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
-        });
-        return { dataHandles: [handle] };
-      },
-    },
+      const body = new URLSearchParams({
+        volume,
+        storage: targetStorage,
+        delete: deleteSource ? "1" : "0",
+      });
 
-    listSnapshots: {
-      description: "List snapshots for a Proxmox VM",
-      arguments: z.object({
-        vmName: z.string().describe("VM name"),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { vmName } = args;
-        context.logger.info("Listing snapshots of VM {vmName} on {node}", {
-          vmName,
-          node,
-        });
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-
-        const vm = await resolveVmId(
-          apiUrl,
-          node,
-          vmName,
-          auth,
-          skipTlsVerify,
-        );
-
-        const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/snapshot`,
-          {
-            method: "GET",
-            headers: authHeaders(auth),
-            skipTlsVerify,
+      log(`Moving volume "${volume}" to storage "${targetStorage}"`);
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/lxc/${ct.vmid}/move_volume`,
+        {
+          method: "POST",
+          headers: {
+            ...headers,
+            "Content-Type": "application/x-www-form-urlencoded",
           },
+          body: body.toString(),
+          skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `Failed to move volume: ${response.status} ${await response
+            .text()}`,
         );
-        if (!response.ok) {
-          throw new Error(
-            `Failed to list snapshots: ${response.status} ${await response
-              .text()}`,
-          );
-        }
-        const snapshots = (await response.json()).data;
-        const names = snapshots.map((s) => s.name).filter((n) =>
-          n !== "current"
-        );
+      }
 
-        const handle = await context.writeResource("vm", `${vmName}-ops`, {
-          vmid: vm.vmid,
+      const upid = (await response.json()).data;
+      const taskResult = await waitForTask(
+        apiUrl,
+        node,
+        upid,
+        auth,
+        skipTlsVerify,
+      );
+      if (!taskResult.success) {
+        throw new Error(`Volume move failed: ${taskResult.exitstatus}`);
+      }
+      log(
+        `Volume "${volume}" moved to "${targetStorage}" (${taskResult.pollCount} polls)`,
+      );
+      context.logger.info(
+        "Moved volume {volume} of LXC {ctName} (vmid {vmid}) to storage {targetStorage}",
+        { volume, ctName, vmid: ct.vmid, targetStorage },
+      );
+
+      const handle = await context.writeResource("vm", `${ctName}-ops`, {
+        vmid: ct.vmid,
+        vmName: ctName,
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      return { dataHandles: [handle] };
+    },
+  },
+
+  getConfig: {
+    description: "Read the raw config for a Proxmox VM or LXC container",
+    arguments: z.object({
+      vmName: z.string().describe("VM or LXC name"),
+      kind: z.enum(["qemu", "lxc"]).default("qemu").describe(
+        "Whether vmName is a QEMU VM or an LXC container",
+      ),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { vmName, kind } = args;
+      context.logger.info("Reading {kind} config of {vmName} on {node}", {
+        kind,
+        vmName,
+        node,
+      });
+
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+
+      const entity = kind === "lxc"
+        ? await resolveLxcId(
+          apiUrl,
+          node,
           vmName,
-          success: true,
-          logs: `Snapshots: ${names.join(", ") || "(none)"}`,
-          timestamp: new Date().toISOString(),
-        });
-        context.logger.info("Listed {count} snapshots of VM {vmName}", {
-          count: names.length,
+          auth,
+          skipTlsVerify,
+        )
+        : await resolveVmId(
+          apiUrl,
+          node,
           vmName,
-        });
-        return { dataHandles: [handle] };
-      },
-    },
-
-    lxcStop: {
-      description: "Stop a Proxmox LXC container",
-      arguments: z.object({
-        ctName: z.string().describe("LXC container name"),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { ctName } = args;
-        context.logger.info("Stopping LXC {ctName} on {node}", {
-          ctName,
-          node,
-        });
-        const logs = [];
-        const log = (msg) => logs.push(msg);
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const headers = authHeaders(auth);
-
-        const ct = await resolveLxcId(
-          apiUrl,
-          node,
-          ctName,
           auth,
           skipTlsVerify,
         );
-        log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
 
-        if (ct.status === "stopped") {
-          log(`Already stopped`);
-        } else {
-          const response = await fetchWithCurl(
-            `${apiUrl}/api2/json/nodes/${node}/lxc/${ct.vmid}/status/stop`,
-            {
-              method: "POST",
-              headers,
-              skipTlsVerify,
-            },
-          );
-          if (!response.ok) {
-            throw new Error(
-              `Failed to stop LXC: ${response.status} ${await response.text()}`,
-            );
-          }
-          const upid = (await response.json()).data;
-          const taskResult = await waitForTask(
-            apiUrl,
-            node,
-            upid,
-            auth,
-            skipTlsVerify,
-          );
-          if (!taskResult.success) {
-            throw new Error(`LXC stop failed: ${taskResult.exitstatus}`);
-          }
-          log(`LXC ${ct.vmid} stopped (${taskResult.pollCount} polls)`);
-        }
-        context.logger.info("LXC {ctName} (vmid {vmid}) is stopped", {
-          ctName,
-          vmid: ct.vmid,
-        });
-
-        const handle = await context.writeResource("vm", `${ctName}-ops`, {
-          vmid: ct.vmid,
-          vmName: ctName,
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
-        });
-        return { dataHandles: [handle] };
-      },
-    },
-
-    lxcStart: {
-      description: "Start a Proxmox LXC container",
-      arguments: z.object({
-        ctName: z.string().describe("LXC container name"),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { ctName } = args;
-        context.logger.info("Starting LXC {ctName} on {node}", {
-          ctName,
-          node,
-        });
-        const logs = [];
-        const log = (msg) => logs.push(msg);
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const headers = authHeaders(auth);
-
-        const ct = await resolveLxcId(
-          apiUrl,
-          node,
-          ctName,
-          auth,
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/${kind}/${entity.vmid}/config`,
+        {
+          method: "GET",
+          headers: authHeaders(auth),
           skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `Failed to get config: ${response.status} ${await response.text()}`,
         );
-        log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
+      }
+      const config = (await response.json()).data;
 
-        if (ct.status === "running") {
-          log(`Already running`);
-        } else {
-          const response = await fetchWithCurl(
-            `${apiUrl}/api2/json/nodes/${node}/lxc/${ct.vmid}/status/start`,
-            {
-              method: "POST",
-              headers,
-              skipTlsVerify,
-            },
-          );
-          if (!response.ok) {
-            throw new Error(
-              `Failed to start LXC: ${response.status} ${await response
-                .text()}`,
-            );
-          }
-          const upid = (await response.json()).data;
-          const taskResult = await waitForTask(
-            apiUrl,
-            node,
-            upid,
-            auth,
-            skipTlsVerify,
-          );
-          if (!taskResult.success) {
-            throw new Error(`LXC start failed: ${taskResult.exitstatus}`);
-          }
-          log(`LXC ${ct.vmid} started (${taskResult.pollCount} polls)`);
-        }
-        context.logger.info("LXC {ctName} (vmid {vmid}) is running", {
-          ctName,
-          vmid: ct.vmid,
-        });
-
-        const handle = await context.writeResource("vm", `${ctName}-ops`, {
-          vmid: ct.vmid,
-          vmName: ctName,
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
-        });
-        return { dataHandles: [handle] };
-      },
-    },
-
-    lxcMoveVolume: {
-      description:
-        "Move an LXC container's volume (rootfs or mount point) to a different storage backend",
-      arguments: z.object({
-        ctName: z.string().describe("LXC container name"),
-        volume: z.string().default("rootfs").describe(
-          "Volume identifier (e.g. rootfs, mp0)",
-        ),
-        targetStorage: z.string().describe("Destination storage pool name"),
-        deleteSource: z.boolean().default(true).describe(
-          "Delete the source volume after a successful move",
-        ),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { ctName, volume, targetStorage, deleteSource } = args;
-        context.logger.info(
-          "Moving volume {volume} of LXC {ctName} to storage {targetStorage}",
-          { volume, ctName, targetStorage },
-        );
-        const logs = [];
-        const log = (msg) => logs.push(msg);
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const headers = authHeaders(auth);
-
-        const ct = await resolveLxcId(
-          apiUrl,
-          node,
-          ctName,
-          auth,
-          skipTlsVerify,
-        );
-        log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
-        if (ct.status === "running") {
-          log(
-            `Warning: LXC is running — moving volume live. Stop it first for a safer migration.`,
-          );
-        }
-
-        const body = new URLSearchParams({
-          volume,
-          storage: targetStorage,
-          delete: deleteSource ? "1" : "0",
-        });
-
-        log(`Moving volume "${volume}" to storage "${targetStorage}"`);
-        const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/lxc/${ct.vmid}/move_volume`,
-          {
-            method: "POST",
-            headers: {
-              ...headers,
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: body.toString(),
-            skipTlsVerify,
-          },
-        );
-        if (!response.ok) {
-          throw new Error(
-            `Failed to move volume: ${response.status} ${await response
-              .text()}`,
-          );
-        }
-
-        const upid = (await response.json()).data;
-        const taskResult = await waitForTask(
-          apiUrl,
-          node,
-          upid,
-          auth,
-          skipTlsVerify,
-        );
-        if (!taskResult.success) {
-          throw new Error(`Volume move failed: ${taskResult.exitstatus}`);
-        }
-        log(
-          `Volume "${volume}" moved to "${targetStorage}" (${taskResult.pollCount} polls)`,
-        );
-        context.logger.info(
-          "Moved volume {volume} of LXC {ctName} (vmid {vmid}) to storage {targetStorage}",
-          { volume, ctName, vmid: ct.vmid, targetStorage },
-        );
-
-        const handle = await context.writeResource("vm", `${ctName}-ops`, {
-          vmid: ct.vmid,
-          vmName: ctName,
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
-        });
-        return { dataHandles: [handle] };
-      },
-    },
-
-    getConfig: {
-      description: "Read the raw config for a Proxmox VM or LXC container",
-      arguments: z.object({
-        vmName: z.string().describe("VM or LXC name"),
-        kind: z.enum(["qemu", "lxc"]).default("qemu").describe(
-          "Whether vmName is a QEMU VM or an LXC container",
-        ),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-        const { vmName, kind } = args;
-        context.logger.info("Reading {kind} config of {vmName} on {node}", {
+      const handle = await context.writeResource("vm", `${vmName}-ops`, {
+        vmid: entity.vmid,
+        vmName,
+        success: true,
+        logs: JSON.stringify(config, null, 2),
+        timestamp: new Date().toISOString(),
+      });
+      context.logger.info(
+        "Read {kind} config of {vmName} (vmid {vmid}): {keyCount} keys",
+        {
           kind,
           vmName,
-          node,
-        });
-
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-
-        const entity = kind === "lxc"
-          ? await resolveLxcId(
-            apiUrl,
-            node,
-            vmName,
-            auth,
-            skipTlsVerify,
-          )
-          : await resolveVmId(
-            apiUrl,
-            node,
-            vmName,
-            auth,
-            skipTlsVerify,
-          );
-
-        const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/${kind}/${entity.vmid}/config`,
-          {
-            method: "GET",
-            headers: authHeaders(auth),
-            skipTlsVerify,
-          },
-        );
-        if (!response.ok) {
-          throw new Error(
-            `Failed to get config: ${response.status} ${await response.text()}`,
-          );
-        }
-        const config = (await response.json()).data;
-
-        const handle = await context.writeResource("vm", `${vmName}-ops`, {
           vmid: entity.vmid,
-          vmName,
-          success: true,
-          logs: JSON.stringify(config, null, 2),
-          timestamp: new Date().toISOString(),
-        });
-        context.logger.info(
-          "Read {kind} config of {vmName} (vmid {vmid}): {keyCount} keys",
-          {
-            kind,
-            vmName,
-            vmid: entity.vmid,
-            keyCount: Object.keys(config ?? {}).length,
-          },
-        );
-        return { dataHandles: [handle] };
-      },
+          keyCount: Object.keys(config ?? {}).length,
+        },
+      );
+      return { dataHandles: [handle] };
     },
+  },
 
-    migrate: {
-      description:
-        "Live-migrate a VM to another Proxmox node. Requires shared storage (NFS/Ceph) — disk is not copied, only VM state is transferred.",
-      arguments: z.object({
-        vmName: z.string().describe("VM name to migrate"),
-        target: z.string().describe(
-          "Destination node name (e.g. pve2)",
-        ),
-        sourceNode: z.string().optional().describe(
-          "Source node name — overrides the model's globalArguments node. Use when the VM has already been migrated away from the default node.",
-        ),
-        online: z.boolean().default(true).describe(
-          "Live migration — VM keeps running during transfer",
-        ),
-      }),
-      execute: async (args, context) => {
-        const { apiUrl, node: defaultNode, skipTlsVerify } = context.globalArgs;
-        const { vmName, target, sourceNode, online } = args;
-        const node = sourceNode ?? defaultNode;
-        const logs: string[] = [];
-        const log = (msg: string) => logs.push(msg);
-        context.logger.info(
-          "Migrating VM {vmName} from {sourceNode} to {target} (online={online})",
-          { vmName, sourceNode: node, target, online },
-        );
+  migrate: {
+    description:
+      "Live-migrate a VM to another Proxmox node. Requires shared storage (NFS/Ceph) — disk is not copied, only VM state is transferred.",
+    arguments: z.object({
+      vmName: z.string().describe("VM name to migrate"),
+      target: z.string().describe(
+        "Destination node name (e.g. pve2)",
+      ),
+      sourceNode: z.string().optional().describe(
+        "Source node name — overrides the model's globalArguments node. Use when the VM has already been migrated away from the default node.",
+      ),
+      online: z.boolean().default(true).describe(
+        "Live migration — VM keeps running during transfer",
+      ),
+    }),
+    execute: async (args, context) => {
+      const { apiUrl, node: defaultNode, skipTlsVerify } = context.globalArgs;
+      const { vmName, target, sourceNode, online } = args;
+      const node = sourceNode ?? defaultNode;
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
+      context.logger.info(
+        "Migrating VM {vmName} from {sourceNode} to {target} (online={online})",
+        { vmName, sourceNode: node, target, online },
+      );
 
-        const auth = await resolveAuth(context.globalArgs, context, authOpts());
-        const headers = authHeaders(auth);
+      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const headers = authHeaders(auth);
 
-        const vm = await resolveVmId(
-          apiUrl,
-          node,
-          vmName,
-          auth,
-          skipTlsVerify,
-        );
-        log(`Found VM "${vmName}" → vmid ${vm.vmid} [${vm.status}] on ${node}`);
+      const vm = await resolveVmId(
+        apiUrl,
+        node,
+        vmName,
+        auth,
+        skipTlsVerify,
+      );
+      log(`Found VM "${vmName}" → vmid ${vm.vmid} [${vm.status}] on ${node}`);
 
-        if (online && vm.status !== "running") {
-          log(`Warning: VM is not running — falling back to offline migration`);
-        }
+      if (online && vm.status !== "running") {
+        log(`Warning: VM is not running — falling back to offline migration`);
+      }
 
-        const body = new URLSearchParams({
-          target,
-          online: online && vm.status === "running" ? "1" : "0",
-        });
+      const body = new URLSearchParams({
+        target,
+        online: online && vm.status === "running" ? "1" : "0",
+      });
 
-        log(
-          `Migrating vmid ${vm.vmid} from ${node} → ${target} (online=${
-            body.get("online")
-          })`,
-        );
-        const response = await fetchWithCurl(
-          `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/migrate`,
-          {
-            method: "POST",
-            headers: {
-              ...headers,
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: body.toString(),
-            skipTlsVerify,
+      log(
+        `Migrating vmid ${vm.vmid} from ${node} → ${target} (online=${
+          body.get("online")
+        })`,
+      );
+      const response = await fetchWithCurl(
+        `${apiUrl}/api2/json/nodes/${node}/qemu/${vm.vmid}/migrate`,
+        {
+          method: "POST",
+          headers: {
+            ...headers,
+            "Content-Type": "application/x-www-form-urlencoded",
           },
-        );
-        if (!response.ok) {
-          throw new Error(
-            `Migration failed to start: ${response.status} ${await response
-              .text()}`,
-          );
-        }
-
-        const upid = (await response.json()).data;
-        log(`Migration task started: ${upid}`);
-
-        const taskResult = await waitForTask(
-          apiUrl,
-          node,
-          upid,
-          auth,
+          body: body.toString(),
           skipTlsVerify,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `Migration failed to start: ${response.status} ${await response
+            .text()}`,
         );
-        if (!taskResult.success) {
-          throw new Error(`Migration failed: ${taskResult.exitstatus}`);
-        }
-        log(
-          `Migration complete (${taskResult.pollCount} polls) — VM is now on ${target}`,
-        );
+      }
 
-        const handle = await context.writeResource("vm", `${vmName}-ops`, {
-          vmid: vm.vmid,
-          vmName,
-          sourceNode: node,
-          targetNode: target,
-          success: true,
-          logs: logs.join("\n"),
-          timestamp: new Date().toISOString(),
-        });
-        context.logger.info(
-          "Migrated VM {vmName} (vmid {vmid}) from {sourceNode} to {target}",
-          { vmName, vmid: vm.vmid, sourceNode: node, target },
-        );
-        return { dataHandles: [handle] };
-      },
+      const upid = (await response.json()).data;
+      log(`Migration task started: ${upid}`);
+
+      const taskResult = await waitForTask(
+        apiUrl,
+        node,
+        upid,
+        auth,
+        skipTlsVerify,
+      );
+      if (!taskResult.success) {
+        throw new Error(`Migration failed: ${taskResult.exitstatus}`);
+      }
+      log(
+        `Migration complete (${taskResult.pollCount} polls) — VM is now on ${target}`,
+      );
+
+      const handle = await context.writeResource("vm", `${vmName}-ops`, {
+        vmid: vm.vmid,
+        vmName,
+        sourceNode: node,
+        targetNode: target,
+        success: true,
+        logs: logs.join("\n"),
+        timestamp: new Date().toISOString(),
+      });
+      context.logger.info(
+        "Migrated VM {vmName} (vmid {vmid}) from {sourceNode} to {target}",
+        { vmName, vmid: vm.vmid, sourceNode: node, target },
+      );
+      return { dataHandles: [handle] };
     },
-  }],
+  },
+};
+
+/**
+ * VM and LXC lifecycle extensions for `@keeb/proxmox/vm`. Kept for one release
+ * while definitions move to `@dmc/proxmox/vm`, which has the same methods and
+ * takes API-token auth.
+ */
+export const extension = {
+  type: "@keeb/proxmox/vm",
+  checks: [vmExtraChecks],
+  methods: [vmExtraMethods],
 };

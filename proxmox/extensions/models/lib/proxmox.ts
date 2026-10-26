@@ -1,4 +1,30 @@
-// Proxmox API helpers — copied from @keeb/proxmox for use in local extensions.
+// Proxmox API helpers. Parts are adapted from @keeb/proxmox
+// (https://github.com/keeb/swamp-proxmox):
+//
+//   MIT License
+//
+//   Copyright (c) 2026 keeb <keeb@systeminit.com>
+//
+//   Permission is hereby granted, free of charge, to any person obtaining a
+//   copy of this software and associated documentation files (the
+//   "Software"), to deal in the Software without restriction, including
+//   without limitation the rights to use, copy, modify, merge, publish,
+//   distribute, sublicense, and/or sell copies of the Software, and to permit
+//   persons to whom the Software is furnished to do so, subject to the
+//   following conditions:
+//
+//   The above copyright notice and this permission notice shall be included
+//   in all copies or substantial portions of the Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+//   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+//   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+//   NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+//   DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+//   OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+//   USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+import { z } from "npm:zod@4";
 
 /** Quote a value for a curl config file (double-quoted string). */
 export function quoteCurlConfig(value) {
@@ -83,15 +109,23 @@ async function runCurl(args) {
   };
 }
 
+/**
+ * Poll a Proxmox task (UPID) until it stops. With `timeoutSeconds`, throw if
+ * it is still running after that long; without it, wait as long as it takes.
+ */
 export async function waitForTask(
   apiUrl,
   node,
   upid,
   auth,
   skipTlsVerify,
+  timeoutSeconds?: number,
 ) {
   const encodedUpid = encodeURIComponent(upid);
   const url = `${apiUrl}/api2/json/nodes/${node}/tasks/${encodedUpid}/status`;
+  const deadline = timeoutSeconds === undefined
+    ? Infinity
+    : Date.now() + timeoutSeconds * 1000;
   let pollCount = 0;
 
   while (true) {
@@ -117,6 +151,11 @@ export async function waitForTask(
       };
     }
 
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Proxmox task ${upid} did not finish within ${timeoutSeconds}s`,
+      );
+    }
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 }
@@ -284,3 +323,199 @@ export async function resolveAuth(
     freshAuth: true,
   };
 }
+
+/** Base URL for a node-scoped API path. */
+export function nodePath(
+  conn: { apiUrl: string; node: string },
+  suffix: string,
+): string {
+  return `${conn.apiUrl}/api2/json/nodes/${
+    encodeURIComponent(conn.node)
+  }${suffix}`;
+}
+
+/**
+ * Call the Proxmox API and return `data` from the JSON envelope. Throws a
+ * descriptive error (operation, HTTP status, response body) on a non-2xx.
+ */
+export async function pveCall(
+  conn: { skipTlsVerify?: boolean },
+  auth,
+  method: string,
+  url: string,
+  what: string,
+  body?: string,
+): Promise<unknown> {
+  const headers = authHeaders(auth);
+  if (body !== undefined || method !== "GET") {
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+  }
+  const response = await fetchWithCurl(url, {
+    method,
+    headers,
+    body,
+    skipTlsVerify: conn.skipTlsVerify ?? true,
+  });
+  if (!response.ok) {
+    throw new Error(
+      `${what} failed: HTTP ${response.status} ${
+        response.text().slice(0, 500)
+      }`,
+    );
+  }
+  return response.json()?.data;
+}
+
+/**
+ * Pick the first routable IPv4 address from QEMU guest-agent interfaces,
+ * skipping loopback and link-local addresses.
+ */
+export function pickGuestIpv4(interfaces: unknown): string | null {
+  if (!Array.isArray(interfaces)) return null;
+  for (const iface of interfaces) {
+    if (!iface || iface.name === "lo") continue;
+    for (const ip of iface["ip-addresses"] ?? []) {
+      const addr = ip?.["ip-address"];
+      if (ip?.["ip-address-type"] !== "ipv4" || typeof addr !== "string") {
+        continue;
+      }
+      if (addr.startsWith("127.") || addr.startsWith("169.254.")) continue;
+      return addr;
+    }
+  }
+  return null;
+}
+
+/**
+ * Ask the QEMU guest agent for the VM's IPv4, retrying until `waitSeconds`
+ * elapse. Always makes at least one attempt. Returns null if none is found.
+ */
+export async function getVmIpWithRetry(
+  conn: { apiUrl: string; node: string; skipTlsVerify?: boolean },
+  auth,
+  vmid: number,
+  waitSeconds = 120,
+  pollInterval = 5,
+): Promise<string | null> {
+  const deadline = Date.now() + waitSeconds * 1000;
+  const pollMs = pollInterval * 1000;
+  const url = nodePath(conn, `/qemu/${vmid}/agent/network-get-interfaces`);
+
+  while (true) {
+    let response = null;
+    try {
+      response = await fetchWithCurl(url, {
+        method: "GET",
+        headers: authHeaders(auth),
+        skipTlsVerify: conn.skipTlsVerify ?? true,
+      });
+    } catch {
+      response = null; // transport error: the guest agent is not reachable yet
+    }
+    if (response?.ok) {
+      let interfaces: unknown = null;
+      try {
+        interfaces = response.json()?.data?.result;
+      } catch {
+        interfaces = null;
+      }
+      const ip = pickGuestIpv4(interfaces);
+      if (ip) return ip;
+    }
+    if (Date.now() + pollMs >= deadline) return null;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
+/** Pre-flight validation of the connection global arguments. */
+export function validateConnection(
+  globalArgs: { apiUrl?: unknown; node?: unknown },
+): { pass: boolean; errors?: string[] } {
+  const errors: string[] = [];
+  const { apiUrl, node } = globalArgs;
+  if (isUnresolvedRef(apiUrl) || isUnresolvedRef(node)) return { pass: true };
+  if (typeof apiUrl !== "string" || apiUrl.length === 0) {
+    errors.push("apiUrl is required");
+  } else {
+    try {
+      const u = new URL(apiUrl);
+      if (u.protocol !== "https:" && u.protocol !== "http:") {
+        errors.push(`apiUrl must be http(s), got "${u.protocol}"`);
+      }
+      if (u.username || u.password) {
+        errors.push("apiUrl must not embed credentials");
+      }
+    } catch {
+      errors.push(`apiUrl is not a valid URL: ${JSON.stringify(apiUrl)}`);
+    }
+  }
+  if (typeof node !== "string" || node.trim().length === 0) {
+    errors.push("node is required");
+  }
+  return errors.length ? { pass: false, errors } : { pass: true };
+}
+
+/** Render `{key}` placeholders for the human-readable `logs` field. */
+export function renderTemplate(
+  template: string,
+  props: Record<string, unknown> = {},
+): string {
+  return template.replace(
+    /\{(\w+)\}/g,
+    (m, k) => (k in props ? String(props[k]) : m),
+  );
+}
+
+/**
+ * Method logger: forwards structured messages to `context.logger` and keeps a
+ * rendered copy for the resource `logs` field.
+ */
+export function createMethodLogger(context: { logger? }) {
+  const lines: string[] = [];
+  return {
+    lines,
+    info(template: string, props: Record<string, unknown> = {}) {
+      lines.push(renderTemplate(template, props));
+      context.logger?.info(template, props);
+    },
+    warn(template: string, props: Record<string, unknown> = {}) {
+      lines.push(renderTemplate(template, props));
+      const l = context.logger;
+      const warnFn = l?.warning ?? l?.warn;
+      if (warnFn) warnFn.call(l, template, props);
+      else l?.info(template, props);
+    },
+    text() {
+      return lines.join("\n");
+    },
+  };
+}
+
+/** Global arguments shared by every `@dmc/proxmox` model that calls the API. */
+export const ProxmoxConnectionArgs = z.object({
+  apiUrl: z.string().describe(
+    "Proxmox API base URL (e.g., https://192.0.2.10:8006)",
+  ),
+  node: z.string().describe("Proxmox node name"),
+  skipTlsVerify: z.boolean().default(true).describe(
+    "Skip TLS certificate verification",
+  ),
+  tokenId: z.string().optional().describe(
+    "Proxmox API token id, user@realm!tokenname (preferred auth; used with tokenSecret)",
+  ),
+  tokenSecret: z.string().optional().describe("Proxmox API token secret")
+    .meta({ sensitive: true }),
+  ticket: z.string().optional().describe("Auth ticket (ticket auth)").meta({
+    sensitive: true,
+  }),
+  csrfToken: z.string().optional().describe("CSRF token (ticket auth)").meta({
+    sensitive: true,
+  }),
+  username: z.string().optional().describe(
+    "Proxmox username (password auth fallback)",
+  ),
+  password: z.string().optional().describe(
+    "Proxmox password (password auth fallback)",
+  ).meta({ sensitive: true }),
+  realm: z.string().default("pam").describe("Authentication realm"),
+});
