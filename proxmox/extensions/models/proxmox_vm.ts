@@ -13,11 +13,13 @@
 import { z } from "npm:zod@4";
 import {
   createMethodLogger,
+  dropRemovedAuthArgs,
   getVmIpWithRetry,
   nodePath,
   ProxmoxConnectionArgs,
   pveCall,
   resolveAuth,
+  tlsOptions,
   validateConnection,
   waitForTask,
 } from "./lib/proxmox.ts";
@@ -168,8 +170,8 @@ export function buildCreateParams(
   return params;
 }
 
-function vmAuth(g: VmGlobalArgs, context: Ctx): Promise<PveAuth> {
-  return resolveAuth(g, context, { skipCache: true });
+function vmAuth(g: VmGlobalArgs): Promise<PveAuth> {
+  return resolveAuth(g);
 }
 
 async function listVms(g: VmGlobalArgs, auth: PveAuth): Promise<PveVm[]> {
@@ -193,13 +195,13 @@ async function resolveVm(
 }
 
 function runTask(g: VmGlobalArgs, auth: PveAuth, upid: unknown) {
-  return waitForTask(g.apiUrl, g.node, upid, auth, g.skipTlsVerify ?? true);
+  return waitForTask(g.apiUrl, g.node, upid, auth, tlsOptions(g));
 }
 
 /** Swamp model definition for `@dmc/proxmox/vm`. */
 export const model = {
   type: "@dmc/proxmox/vm",
-  version: "2026.10.26.1",
+  version: "2026.11.07.1",
   globalArguments: ProxmoxConnectionArgs,
   upgrades: [
     {
@@ -207,6 +209,12 @@ export const model = {
       description:
         "First release. Definitions moved from @keeb/proxmox/vm keep their attributes; set tokenId/tokenSecret for token auth",
       upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.07.1",
+      description:
+        "Breaking: API tokens are the only auth. The upgrade drops the ticket, csrfToken, username, password and realm global args; a definition that used them needs tokenId and tokenSecret. The @keeb/proxmox/vm extension is removed: move those definitions to @dmc/proxmox/vm. Additive: optional caCert (verify a self-signed API certificate). Set skipTlsVerify false or caCert, so the token is not sent unverified",
+      upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
   resources: {
@@ -241,7 +249,7 @@ export const model = {
           node: g.node,
         });
 
-        const auth = await vmAuth(g, context);
+        const auth = await vmAuth(g);
         const vm = await resolveVm(g, auth, vmName);
         log.info("Found VM {vmName}: vmid {vmid} [{status}]", {
           vmName,
@@ -287,7 +295,7 @@ export const model = {
           node: g.node,
         });
 
-        const auth = await vmAuth(g, context);
+        const auth = await vmAuth(g);
         const vm = await resolveVm(g, auth, vmName);
         log.info("Found VM {vmName}: vmid {vmid} [{status}]", {
           vmName,
@@ -368,7 +376,7 @@ export const model = {
           node: g.node,
         });
 
-        const auth = await vmAuth(g, context);
+        const auth = await vmAuth(g);
         const vm = await resolveVm(g, auth, vmName);
         log.info("Found VM {vmName}: vmid {vmid} [{status}]", {
           vmName,
@@ -425,7 +433,7 @@ export const model = {
           node: g.node,
         });
 
-        const auth = await vmAuth(g, context);
+        const auth = await vmAuth(g);
 
         // Idempotent: Proxmox allows duplicate names, so never create a
         // second VM with the same name.
@@ -519,7 +527,7 @@ export const model = {
           node: g.node,
         });
 
-        const auth = await vmAuth(g, context);
+        const auth = await vmAuth(g);
         const vm = (await listVms(g, auth)).find((v) => v.name === vmName);
 
         if (!vm) {
@@ -609,7 +617,7 @@ export const model = {
           boot,
         });
 
-        const auth = await vmAuth(g, context);
+        const auth = await vmAuth(g);
         const vm = await resolveVm(g, auth, vmName);
 
         await pveCall(
@@ -660,7 +668,7 @@ export const model = {
           keys: [...configParams.keys()].join(", "),
         });
 
-        const auth = await vmAuth(g, context);
+        const auth = await vmAuth(g);
         const vm = await resolveVm(g, auth, vmName);
 
         await pveCall(
@@ -694,7 +702,7 @@ export const model = {
         const log = createMethodLogger(context);
         log.info("Syncing all VMs from node {node}", { node: g.node });
 
-        const auth = await vmAuth(g, context);
+        const auth = await vmAuth(g);
         const vms = await listVms(g, auth);
         log.info("Found {count} VMs, resolving IPs for running VMs", {
           count: vms.length,

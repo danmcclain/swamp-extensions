@@ -1,18 +1,17 @@
 manifestVersion: 1
 name: "@dmc/proxmox"
-version: "2026.10.26.1"
-description: "Proxmox VE extensions with API-token auth — node status and guest discovery, VM snapshot guarding, VM/LXC lifecycle (provisioning from cloud images, snapshots, migration), cloud image storage, and safe snapshot-guarded updates for community-scripts LXCs"
+version: "2026.11.07.1"
+description: "Proxmox VE extensions with API-token auth and TLS verification — node status, cluster health and guest discovery, VM and CT snapshots through a least-privilege token, VM/LXC lifecycle (provisioning from cloud images, snapshots, migration), cloud image storage, and safe snapshot-guarded updates for community-scripts LXCs"
 repository: "https://github.com/danmcclain/swamp-extensions"
+license: MIT
 labels:
   - proxmox
   - infrastructure
 dependencies:
-  - "@keeb/proxmox"
   - "@swamp/ssh"
 models:
   - proxmox_node.ts
   - proxmox_vm.ts
-  - proxmox_vm_extras.ts
   - proxmox_storage.ts
   - proxmox_community_script.ts
 additionalFiles:

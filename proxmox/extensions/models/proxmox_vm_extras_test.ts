@@ -7,14 +7,16 @@ import {
   createModelTestContext,
   withMockedCommand,
 } from "jsr:@systeminit/swamp-testing@0.20260604.20";
-import { extension } from "./proxmox_vm_extras.ts";
+import * as extras from "./proxmox_vm_extras.ts";
+
+const { vmExtraChecks, vmExtraMethods } = extras;
 
 const globalArgs = {
   apiUrl: "https://proxmox.test:8006",
   node: "pve",
   skipTlsVerify: true,
-  ticket: "test-ticket",
-  csrfToken: "test-csrf",
+  tokenId: "swamp@pve!automation",
+  tokenSecret: "11111111-2222-3333-4444-555555555555",
 };
 
 function httpOutput(status: number, body: unknown) {
@@ -24,8 +26,8 @@ function httpOutput(status: number, body: unknown) {
   };
 }
 
-const clusterCheck = extension.checks[0]["cluster-has-migration-target"];
-const migrate = extension.methods[0].migrate;
+const clusterCheck = vmExtraChecks["cluster-has-migration-target"];
+const migrate = vmExtraMethods.migrate;
 
 Deno.test("cluster-has-migration-target passes for a healthy multi-node cluster", async () => {
   const { context } = createModelTestContext({ globalArgs });
@@ -131,7 +133,7 @@ Deno.test("migrate throws when the VM is not found", async () => {
 
 // ---- createFromImage --------------------------------------------------------
 
-const createFromImage = extension.methods[0].createFromImage;
+const createFromImage = vmExtraMethods.createFromImage;
 const baseCreateArgs = {
   vmName: "new-vm",
   vmid: 300,
@@ -139,9 +141,9 @@ const baseCreateArgs = {
   diskStorage: "nfs",
 };
 
-/** The `-d` form body of one recorded curl call, parsed. */
-function formBody(call: { args: string[] }): URLSearchParams {
-  return new URLSearchParams(call.args[call.args.indexOf("-d") + 1]);
+/** The form body of one recorded curl call (read from its --data-binary file during the call), parsed. */
+function formBody(call: { body: string | null }): URLSearchParams {
+  return new URLSearchParams(call.body ?? "");
 }
 
 async function runCreate(
@@ -155,11 +157,23 @@ async function runCreate(
     ...baseCreateArgs,
     ...args,
   });
+  // The body file is removed when the call returns, so read it during the call.
+  const bodies: (string | null)[] = [];
+  let next = 0;
   const { calls } = await withMockedCommand(
-    responses,
+    (_cmd: string, a: string[]) => {
+      const i = a.indexOf("--data-binary");
+      bodies.push(
+        i === -1 ? null : Deno.readTextFileSync(a[i + 1].replace(/^@/, "")),
+      );
+      return responses[next++];
+    },
     () => createFromImage.execute(parsed, context),
   );
-  return { calls, written: getWrittenResources()[0]?.data };
+  return {
+    calls: calls.map((c, i) => ({ ...c, body: bodies[i] })),
+    written: getWrittenResources()[0]?.data,
+  };
 }
 
 const createOk = [
@@ -358,7 +372,7 @@ Deno.test("createFromImage rejects a non-positive diskSize", () => {
 
 // ---- pre-flight checks ------------------------------------------------------
 
-const preflight = extension.checks[0];
+const preflight = vmExtraChecks;
 type PreflightName = Exclude<
   keyof typeof preflight,
   "cluster-has-migration-target"
@@ -425,7 +439,7 @@ Deno.test("read-only methods are not covered by any check", () => {
 
 Deno.test("every method is classified as mutating or read-only", () => {
   assertEquals(
-    Object.keys(extension.methods[0]).sort(),
+    Object.keys(vmExtraMethods).sort(),
     [...MUTATING_METHODS, ...READ_ONLY_METHODS].sort(),
   );
 });

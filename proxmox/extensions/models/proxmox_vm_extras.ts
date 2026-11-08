@@ -4,26 +4,24 @@ import {
   fetchWithCurl,
   hasUnresolvedAuth,
   resolveAuth,
+  type TlsOptions,
+  tlsOptions,
   waitForTask,
 } from "./lib/proxmox.ts";
-
-function authOpts() {
-  return { modelType: "@keeb/proxmox/vm" };
-}
 
 async function resolveVmId(
   apiUrl,
   node,
   vmName,
   auth,
-  skipTlsVerify,
+  tls: TlsOptions,
 ) {
   const response = await fetchWithCurl(
     `${apiUrl}/api2/json/nodes/${node}/qemu`,
     {
       method: "GET",
       headers: authHeaders(auth),
-      skipTlsVerify,
+      tls,
     },
   );
   if (!response.ok) {
@@ -46,14 +44,14 @@ async function resolveLxcId(
   node,
   ctName,
   auth,
-  skipTlsVerify,
+  tls: TlsOptions,
 ) {
   const response = await fetchWithCurl(
     `${apiUrl}/api2/json/nodes/${node}/lxc`,
     {
       method: "GET",
       headers: authHeaders(auth),
-      skipTlsVerify,
+      tls,
     },
   );
   if (!response.ok) {
@@ -81,7 +79,7 @@ async function destroyNewVm(
   node: string,
   vmid: number,
   auth: Awaited<ReturnType<typeof resolveAuth>>,
-  skipTlsVerify: boolean | undefined,
+  tls: TlsOptions,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const resp = await fetchWithCurl(
@@ -89,7 +87,7 @@ async function destroyNewVm(
       {
         method: "DELETE",
         headers: authHeaders(auth),
-        skipTlsVerify,
+        tls,
       },
     );
     if (!resp.ok) {
@@ -102,7 +100,7 @@ async function destroyNewVm(
         node,
         upid,
         auth,
-        skipTlsVerify,
+        tls,
       );
       if (!result.success) {
         return { ok: false, error: `delete task: ${result.exitstatus}` };
@@ -137,8 +135,9 @@ interface VmCheckContext {
     apiUrl: string;
     node: string;
     skipTlsVerify?: boolean;
-    ticket?: string;
-    csrfToken?: string;
+    caCert?: string;
+    tokenId?: string;
+    tokenSecret?: string;
   };
   methodName: string;
   /** Method args merged over global args (raw, before expression resolution). */
@@ -182,12 +181,13 @@ async function checkApiGet(
   what: string,
 ): Promise<ApiGet> {
   try {
-    const { apiUrl, skipTlsVerify } = ctx.globalArgs;
-    const auth = await resolveAuth(ctx.globalArgs, ctx, authOpts());
+    const { apiUrl } = ctx.globalArgs;
+    const tls = tlsOptions(ctx.globalArgs);
+    const auth = await resolveAuth(ctx.globalArgs);
     const response = await fetchWithCurl(`${apiUrl}/api2/json${path}`, {
       method: "GET",
       headers: authHeaders(auth),
-      skipTlsVerify,
+      tls,
     });
     if (!response.ok) {
       return {
@@ -500,8 +500,7 @@ function skipLiveWhenAuthUnresolved<
 }
 
 /**
- * Pre-flight checks for the VM/LXC extras. Shared by the `@keeb/proxmox/vm`
- * extension below and the `@dmc/proxmox/vm` model.
+ * Pre-flight checks for the VM/LXC extras, used by the `@dmc/proxmox/vm` model.
  */
 export const vmExtraChecks = skipLiveWhenAuthUnresolved({
   "cluster-has-migration-target": {
@@ -511,15 +510,16 @@ export const vmExtraChecks = skipLiveWhenAuthUnresolved({
     appliesTo: ["migrate"],
     execute: async (context) => {
       if (!selected(context, "migrate")) return { pass: true };
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
+      const auth = await resolveAuth(context.globalArgs);
 
       const response = await fetchWithCurl(
         `${apiUrl}/api2/json/cluster/status`,
         {
           method: "GET",
           headers: authHeaders(auth),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -559,8 +559,7 @@ export const vmExtraChecks = skipLiveWhenAuthUnresolved({
 
 /**
  * VM and LXC lifecycle methods — provisioning, snapshots, disk/node migration,
- * and container control. Shared by the `@keeb/proxmox/vm` extension below and
- * the `@dmc/proxmox/vm` model.
+ * and container control, used by the `@dmc/proxmox/vm` model.
  */
 export const vmExtraMethods = {
   createFromImage: {
@@ -612,7 +611,8 @@ export const vmExtraMethods = {
       ),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const {
         vmName,
         importFrom,
@@ -638,7 +638,7 @@ export const vmExtraMethods = {
       const logs = [];
       const log = (msg) => logs.push(msg);
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
 
       let vmid: number;
@@ -652,7 +652,7 @@ export const vmExtraMethods = {
           {
             method: "GET",
             headers,
-            skipTlsVerify,
+            tls,
           },
         );
         if (!nextIdResp.ok) {
@@ -690,7 +690,7 @@ export const vmExtraMethods = {
             "Content-Type": "application/x-www-form-urlencoded",
           },
           body: createParams.toString(),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!createResp.ok) {
@@ -707,7 +707,7 @@ export const vmExtraMethods = {
         node,
         createUpid,
         auth,
-        skipTlsVerify,
+        tls,
       );
       if (!createResult.success) {
         throw new Error(`VM creation failed: ${createResult.exitstatus}`);
@@ -733,7 +733,7 @@ export const vmExtraMethods = {
                 disk: "virtio0",
                 size: `${diskSize}G`,
               }).toString(),
-              skipTlsVerify,
+              tls,
             },
           );
           if (!resizeResp.ok) {
@@ -753,7 +753,7 @@ export const vmExtraMethods = {
               node,
               resizeUpid,
               auth,
-              skipTlsVerify,
+              tls,
             );
             if (!resizeResult.success) {
               throw new Error(
@@ -782,7 +782,7 @@ export const vmExtraMethods = {
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: ciParams.toString(),
-            skipTlsVerify,
+            tls,
           },
         );
         if (!ciResp.ok) {
@@ -803,7 +803,7 @@ export const vmExtraMethods = {
           node,
           vmid,
           auth,
-          skipTlsVerify,
+          tls,
         );
         throw new Error(
           removed.ok
@@ -844,7 +844,8 @@ export const vmExtraMethods = {
       ),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { vmName, ciUser, sshKeys, ipConfig } = args;
       context.logger.info("Updating cloud-init on VM {vmName} on {node}", {
         vmName,
@@ -853,14 +854,14 @@ export const vmExtraMethods = {
       const logs = [];
       const log = (msg) => logs.push(msg);
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
 
       const vm = await resolveVmId(
         apiUrl,
         node,
         vmName,
         auth,
-        skipTlsVerify,
+        tls,
       );
       log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
 
@@ -881,7 +882,7 @@ export const vmExtraMethods = {
             "Content-Type": "application/x-www-form-urlencoded",
           },
           body: ciParams.toString(),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -918,7 +919,8 @@ export const vmExtraMethods = {
       description: z.string().optional().describe("Snapshot description"),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { vmName, snapname, description } = args;
       context.logger.info(
         "Creating snapshot {snapname} of VM {vmName} on {node}",
@@ -927,7 +929,7 @@ export const vmExtraMethods = {
       const logs = [];
       const log = (msg) => logs.push(msg);
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
 
       const vm = await resolveVmId(
@@ -935,7 +937,7 @@ export const vmExtraMethods = {
         node,
         vmName,
         auth,
-        skipTlsVerify,
+        tls,
       );
       log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
 
@@ -952,7 +954,7 @@ export const vmExtraMethods = {
             "Content-Type": "application/x-www-form-urlencoded",
           },
           body: body.toString(),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -968,7 +970,7 @@ export const vmExtraMethods = {
         node,
         upid,
         auth,
-        skipTlsVerify,
+        tls,
       );
       if (!taskResult.success) {
         throw new Error(`Snapshot creation failed: ${taskResult.exitstatus}`);
@@ -997,7 +999,8 @@ export const vmExtraMethods = {
       snapname: z.string().describe("Snapshot name to delete"),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { vmName, snapname } = args;
       context.logger.info(
         "Deleting snapshot {snapname} of VM {vmName} on {node}",
@@ -1006,7 +1009,7 @@ export const vmExtraMethods = {
       const logs = [];
       const log = (msg) => logs.push(msg);
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
 
       const vm = await resolveVmId(
@@ -1014,7 +1017,7 @@ export const vmExtraMethods = {
         node,
         vmName,
         auth,
-        skipTlsVerify,
+        tls,
       );
       log(`Found VM "${vmName}" → vmid ${vm.vmid}`);
 
@@ -1026,7 +1029,7 @@ export const vmExtraMethods = {
         {
           method: "DELETE",
           headers,
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -1042,7 +1045,7 @@ export const vmExtraMethods = {
         node,
         upid,
         auth,
-        skipTlsVerify,
+        tls,
       );
       if (!taskResult.success) {
         throw new Error(`Snapshot deletion failed: ${taskResult.exitstatus}`);
@@ -1078,7 +1081,8 @@ export const vmExtraMethods = {
       ),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { vmName, disk, targetStorage, deleteSource } = args;
       context.logger.info(
         "Moving disk {disk} of VM {vmName} to storage {targetStorage}",
@@ -1087,7 +1091,7 @@ export const vmExtraMethods = {
       const logs = [];
       const log = (msg) => logs.push(msg);
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
 
       const vm = await resolveVmId(
@@ -1095,7 +1099,7 @@ export const vmExtraMethods = {
         node,
         vmName,
         auth,
-        skipTlsVerify,
+        tls,
       );
       log(`Found VM "${vmName}" → vmid ${vm.vmid} [${vm.status}]`);
       if (vm.status === "running") {
@@ -1120,7 +1124,7 @@ export const vmExtraMethods = {
             "Content-Type": "application/x-www-form-urlencoded",
           },
           body: body.toString(),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -1135,7 +1139,7 @@ export const vmExtraMethods = {
         node,
         upid,
         auth,
-        skipTlsVerify,
+        tls,
       );
       if (!taskResult.success) {
         throw new Error(`Disk move failed: ${taskResult.exitstatus}`);
@@ -1165,21 +1169,22 @@ export const vmExtraMethods = {
       vmName: z.string().describe("VM name"),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { vmName } = args;
       context.logger.info("Listing snapshots of VM {vmName} on {node}", {
         vmName,
         node,
       });
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
 
       const vm = await resolveVmId(
         apiUrl,
         node,
         vmName,
         auth,
-        skipTlsVerify,
+        tls,
       );
 
       const response = await fetchWithCurl(
@@ -1187,7 +1192,7 @@ export const vmExtraMethods = {
         {
           method: "GET",
           headers: authHeaders(auth),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -1220,7 +1225,8 @@ export const vmExtraMethods = {
       ctName: z.string().describe("LXC container name"),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { ctName } = args;
       context.logger.info("Stopping LXC {ctName} on {node}", {
         ctName,
@@ -1229,7 +1235,7 @@ export const vmExtraMethods = {
       const logs = [];
       const log = (msg) => logs.push(msg);
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
 
       const ct = await resolveLxcId(
@@ -1237,7 +1243,7 @@ export const vmExtraMethods = {
         node,
         ctName,
         auth,
-        skipTlsVerify,
+        tls,
       );
       log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
 
@@ -1249,7 +1255,7 @@ export const vmExtraMethods = {
           {
             method: "POST",
             headers,
-            skipTlsVerify,
+            tls,
           },
         );
         if (!response.ok) {
@@ -1263,7 +1269,7 @@ export const vmExtraMethods = {
           node,
           upid,
           auth,
-          skipTlsVerify,
+          tls,
         );
         if (!taskResult.success) {
           throw new Error(`LXC stop failed: ${taskResult.exitstatus}`);
@@ -1292,7 +1298,8 @@ export const vmExtraMethods = {
       ctName: z.string().describe("LXC container name"),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { ctName } = args;
       context.logger.info("Starting LXC {ctName} on {node}", {
         ctName,
@@ -1301,7 +1308,7 @@ export const vmExtraMethods = {
       const logs = [];
       const log = (msg) => logs.push(msg);
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
 
       const ct = await resolveLxcId(
@@ -1309,7 +1316,7 @@ export const vmExtraMethods = {
         node,
         ctName,
         auth,
-        skipTlsVerify,
+        tls,
       );
       log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
 
@@ -1321,7 +1328,7 @@ export const vmExtraMethods = {
           {
             method: "POST",
             headers,
-            skipTlsVerify,
+            tls,
           },
         );
         if (!response.ok) {
@@ -1336,7 +1343,7 @@ export const vmExtraMethods = {
           node,
           upid,
           auth,
-          skipTlsVerify,
+          tls,
         );
         if (!taskResult.success) {
           throw new Error(`LXC start failed: ${taskResult.exitstatus}`);
@@ -1373,7 +1380,8 @@ export const vmExtraMethods = {
       ),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { ctName, volume, targetStorage, deleteSource } = args;
       context.logger.info(
         "Moving volume {volume} of LXC {ctName} to storage {targetStorage}",
@@ -1382,7 +1390,7 @@ export const vmExtraMethods = {
       const logs = [];
       const log = (msg) => logs.push(msg);
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
 
       const ct = await resolveLxcId(
@@ -1390,7 +1398,7 @@ export const vmExtraMethods = {
         node,
         ctName,
         auth,
-        skipTlsVerify,
+        tls,
       );
       log(`Found LXC "${ctName}" → vmid ${ct.vmid} [${ct.status}]`);
       if (ct.status === "running") {
@@ -1415,7 +1423,7 @@ export const vmExtraMethods = {
             "Content-Type": "application/x-www-form-urlencoded",
           },
           body: body.toString(),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -1431,7 +1439,7 @@ export const vmExtraMethods = {
         node,
         upid,
         auth,
-        skipTlsVerify,
+        tls,
       );
       if (!taskResult.success) {
         throw new Error(`Volume move failed: ${taskResult.exitstatus}`);
@@ -1464,7 +1472,8 @@ export const vmExtraMethods = {
       ),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { vmName, kind } = args;
       context.logger.info("Reading {kind} config of {vmName} on {node}", {
         kind,
@@ -1472,7 +1481,7 @@ export const vmExtraMethods = {
         node,
       });
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
 
       const entity = kind === "lxc"
         ? await resolveLxcId(
@@ -1480,14 +1489,14 @@ export const vmExtraMethods = {
           node,
           vmName,
           auth,
-          skipTlsVerify,
+          tls,
         )
         : await resolveVmId(
           apiUrl,
           node,
           vmName,
           auth,
-          skipTlsVerify,
+          tls,
         );
 
       const response = await fetchWithCurl(
@@ -1495,7 +1504,7 @@ export const vmExtraMethods = {
         {
           method: "GET",
           headers: authHeaders(auth),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -1541,7 +1550,8 @@ export const vmExtraMethods = {
       ),
     }),
     execute: async (args, context) => {
-      const { apiUrl, node: defaultNode, skipTlsVerify } = context.globalArgs;
+      const { apiUrl, node: defaultNode } = context.globalArgs;
+      const tls = tlsOptions(context.globalArgs);
       const { vmName, target, sourceNode, online } = args;
       const node = sourceNode ?? defaultNode;
       const logs: string[] = [];
@@ -1551,7 +1561,7 @@ export const vmExtraMethods = {
         { vmName, sourceNode: node, target, online },
       );
 
-      const auth = await resolveAuth(context.globalArgs, context, authOpts());
+      const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
 
       const vm = await resolveVmId(
@@ -1559,7 +1569,7 @@ export const vmExtraMethods = {
         node,
         vmName,
         auth,
-        skipTlsVerify,
+        tls,
       );
       log(`Found VM "${vmName}" → vmid ${vm.vmid} [${vm.status}] on ${node}`);
 
@@ -1586,7 +1596,7 @@ export const vmExtraMethods = {
             "Content-Type": "application/x-www-form-urlencoded",
           },
           body: body.toString(),
-          skipTlsVerify,
+          tls,
         },
       );
       if (!response.ok) {
@@ -1604,7 +1614,7 @@ export const vmExtraMethods = {
         node,
         upid,
         auth,
-        skipTlsVerify,
+        tls,
       );
       if (!taskResult.success) {
         throw new Error(`Migration failed: ${taskResult.exitstatus}`);
@@ -1629,15 +1639,4 @@ export const vmExtraMethods = {
       return { dataHandles: [handle] };
     },
   },
-};
-
-/**
- * VM and LXC lifecycle extensions for `@keeb/proxmox/vm`. Kept for one release
- * while definitions move to `@dmc/proxmox/vm`, which has the same methods and
- * takes API-token auth.
- */
-export const extension = {
-  type: "@keeb/proxmox/vm",
-  checks: [vmExtraChecks],
-  methods: [vmExtraMethods],
 };

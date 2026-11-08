@@ -38,9 +38,8 @@ export function quoteCurlConfig(value) {
 }
 
 /**
- * curl config file text for request headers. Headers carry the auth cookie,
- * CSRF token or API token secret, so they go in a 0600 temp file read with
- * `-K`, never on the command line where `ps` shows them.
+ * curl config file text for request headers. Headers carry the API token secret, so
+ * they go in a 0600 temp file read with `-K`, never on the command line where `ps` shows them.
  */
 export function buildHeaderConfig(headers) {
   return Object.entries(headers)
@@ -55,17 +54,72 @@ export function buildHeaderConfig(headers) {
     .join("\n") + "\n";
 }
 
-export async function fetchWithCurl(url, options) {
-  const { method = "GET", headers = {}, body, skipTlsVerify } = options;
+/**
+ * TLS settings for one API call. With `caCert`, curl checks the server
+ * certificate and host name with `--cacert`, and `skipTlsVerify` has no
+ * effect. Linux curl then trusts that CA only; Apple's /usr/bin/curl also
+ * keeps trusting the macOS system roots. Without `caCert`, `skipTlsVerify`
+ * turns off all certificate checks (`-k`), and false verifies against the
+ * system roots.
+ */
+export interface TlsOptions {
+  skipTlsVerify?: boolean;
+  caCert?: string;
+}
 
-  const args = ["-s", "-S"];
-  if (skipTlsVerify) args.push("-k");
+const PEM_CERT_RE =
+  /^\s*(?:-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*)+$/;
+
+/** The TLS settings in a model's global arguments. */
+export function tlsOptions(
+  g: { skipTlsVerify?: boolean; caCert?: string },
+): TlsOptions {
+  return { skipTlsVerify: g.skipTlsVerify ?? true, caCert: g.caCert };
+}
+
+/**
+ * The CA bundle to pin, or null when no `caCert` is set. A `caCert` that is
+ * set but is not a PEM certificate bundle is an error, never a fall back to
+ * `-k`: that would send the token to whoever answers.
+ */
+export function pinnedCaCert(tls: TlsOptions | undefined): string | null {
+  const ca: unknown = tls?.caCert;
+  if (ca === undefined || ca === null) return null;
+  if (isUnresolvedRef(ca)) {
+    throw new Error(
+      "Proxmox caCert is still an unresolved ${{ }} expression; check the reference.",
+    );
+  }
+  if (typeof ca !== "string" || !PEM_CERT_RE.test(ca)) {
+    throw new Error(
+      "Proxmox caCert is not a PEM certificate bundle (-----BEGIN CERTIFICATE----- ...).",
+    );
+  }
+  return ca;
+}
+
+export async function fetchWithCurl(url, options) {
+  const { method = "GET", headers = {}, body, tls } = options;
+
+  const caCert = pinnedCaCert(tls);
+  // -q (first) skips ~/.curlrc, which could turn verification off.
+  const args = ["-q", "-s", "-S"];
+  if (caCert === null && tls?.skipTlsVerify) args.push("-k");
   args.push("-X", method);
   const config = Object.keys(headers).length > 0
     ? buildHeaderConfig(headers)
     : null;
   let configPath;
+  let caPath;
+  let bodyPath;
   try {
+    if (caCert !== null) {
+      // @ts-ignore - Deno API
+      caPath = await Deno.makeTempFile({ prefix: "pve-ca-", suffix: ".pem" });
+      // @ts-ignore - Deno API
+      await Deno.writeTextFile(caPath, caCert, { mode: 0o600 });
+      args.push("--cacert", caPath);
+    }
     if (config !== null) {
       // @ts-ignore - Deno API
       configPath = await Deno.makeTempFile({ prefix: "pve-curl-" });
@@ -73,12 +127,24 @@ export async function fetchWithCurl(url, options) {
       await Deno.writeTextFile(configPath, config, { mode: 0o600 });
       args.push("-K", configPath);
     }
-    if (body) args.push("-d", body);
+    if (body) {
+      // The body can hold cloud-init secrets (a password or keys), so it goes in
+      // a 0600 file like the headers: an argument shows in `ps`.
+      // @ts-ignore - Deno API
+      bodyPath = await Deno.makeTempFile({ prefix: "pve-body-" });
+      // @ts-ignore - Deno API
+      await Deno.writeTextFile(bodyPath, body, { mode: 0o600 });
+      args.push("--data-binary", `@${bodyPath}`);
+    }
     args.push("-i", url);
     return await runCurl(args);
   } finally {
     // @ts-ignore - Deno API
+    if (bodyPath) await Deno.remove(bodyPath).catch(() => {});
+    // @ts-ignore - Deno API
     if (configPath) await Deno.remove(configPath).catch(() => {});
+    // @ts-ignore - Deno API
+    if (caPath) await Deno.remove(caPath).catch(() => {});
   }
 }
 
@@ -118,7 +184,7 @@ export async function waitForTask(
   node,
   upid,
   auth,
-  skipTlsVerify,
+  tls: TlsOptions,
   timeoutSeconds?: number,
 ) {
   const encodedUpid = encodeURIComponent(upid);
@@ -133,7 +199,7 @@ export async function waitForTask(
     const response = await fetchWithCurl(url, {
       method: "GET",
       headers: authHeaders(auth),
-      skipTlsVerify,
+      tls,
     });
 
     if (!response.ok) {
@@ -160,8 +226,6 @@ export async function waitForTask(
   }
 }
 
-export const AUTH_TTL_MS = 2 * 60 * 60 * 1000;
-
 /** True when `value` is a still-unresolved `${{ ... }}` vault/CEL reference. */
 export function isUnresolvedRef(value) {
   return typeof value === "string" && value.includes("${{");
@@ -173,155 +237,84 @@ export function isUnresolvedRef(value) {
  * leave auth to the method run.
  */
 export function hasUnresolvedAuth(globalArgs) {
-  return [
-    "tokenId",
-    "tokenSecret",
-    "ticket",
-    "csrfToken",
-    "username",
-    "password",
-  ]
+  return ["tokenId", "tokenSecret"]
     .some((k) => isUnresolvedRef(globalArgs?.[k]));
+}
+
+/**
+ * Global arguments that 2026.11.07.1 removed with password and ticket login.
+ * The upgrade drops them; a definition left with only these has no auth and
+ * fails at the first API call.
+ */
+export const REMOVED_AUTH_ARGS = [
+  "ticket",
+  "csrfToken",
+  "username",
+  "password",
+  "realm",
+] as const;
+
+/** Upgrade step for 2026.11.07.1: drop the removed password and ticket args. */
+export function dropRemovedAuthArgs(
+  old: Record<string, unknown>,
+): Record<string, unknown> {
+  const out = { ...old };
+  for (const k of REMOVED_AUTH_ARGS) delete out[k];
+  return out;
 }
 
 /** Proxmox API token id: `user@realm!tokenname`. */
 const TOKEN_ID_RE = /^[^@!\s]+@[^@!\s]+![A-Za-z][A-Za-z0-9._-]*$/;
 
+/** A resolved Proxmox API token. */
+export interface ProxmoxAuth {
+  tokenId: string;
+  tokenSecret: string;
+}
+
 /**
- * Request headers for a resolved auth. Token auth sends only the
- * `Authorization: PVEAPIToken=...` header: Proxmox needs no CSRF token for
- * token requests. Ticket auth sends the cookie and, when known, the CSRF token.
+ * Request headers for a resolved token: only `Authorization: PVEAPIToken=...`.
+ * Proxmox needs no CSRF token for token requests.
  */
-export function authHeaders(auth) {
-  if (auth.source === "token") {
-    return {
-      "Authorization": `PVEAPIToken=${auth.tokenId}=${auth.tokenSecret}`,
-    };
-  }
+export function authHeaders(auth: ProxmoxAuth): Record<string, string> {
   return {
-    "Cookie": `PVEAuthCookie=${auth.ticket}`,
-    ...(auth.csrfToken && { "CSRFPreventionToken": auth.csrfToken }),
+    "Authorization": `PVEAPIToken=${auth.tokenId}=${auth.tokenSecret}`,
   };
 }
 
 /**
- * Resolve Proxmox auth, in order:
- * 1. API token (`tokenId` + `tokenSecret` global args),
- * 2. explicit `ticket` + `csrfToken` global args,
- * 3. a fresh ticket cached in the model's `auth` data,
- * 4. username/password login via POST /access/ticket.
+ * Resolve Proxmox auth from the `tokenId` + `tokenSecret` global args. API
+ * tokens are the only auth: password and ticket login were removed in
+ * 2026.11.07.1. Fails closed when the token is missing, unresolved or
+ * malformed.
  */
-export async function resolveAuth(
-  globalArgs,
-  context,
-  opts: { modelType?: string; skipCache?: boolean } = {},
-) {
-  const { apiUrl, skipTlsVerify } = globalArgs;
-
-  const { tokenId, tokenSecret } = globalArgs;
-  if (tokenId || tokenSecret) {
-    if (!tokenId || !tokenSecret) {
-      throw new Error(
-        "Proxmox token auth needs both tokenId and tokenSecret global args.",
-      );
-    }
-    if (isUnresolvedRef(tokenId) || isUnresolvedRef(tokenSecret)) {
-      throw new Error(
+export function resolveAuth(globalArgs): Promise<ProxmoxAuth> {
+  const { tokenId, tokenSecret } = globalArgs ?? {};
+  if (!tokenId || !tokenSecret) {
+    return Promise.reject(
+      new Error(
+        "Proxmox auth needs the tokenId and tokenSecret global args (an API token). Password and ticket login were removed in 2026.11.07.1.",
+      ),
+    );
+  }
+  if (isUnresolvedRef(tokenId) || isUnresolvedRef(tokenSecret)) {
+    return Promise.reject(
+      new Error(
         "Proxmox tokenId/tokenSecret is still an unresolved ${{ }} expression; check the vault reference.",
-      );
-    }
-    if (!TOKEN_ID_RE.test(tokenId)) {
-      throw new Error(
-        `Proxmox tokenId "${tokenId}" is not in the form user@realm!tokenname.`,
-      );
-    }
-    return { tokenId, tokenSecret, source: "token", freshAuth: false };
-  }
-
-  const { ticket: explicitTicket, csrfToken: explicitCsrf } = globalArgs;
-  if (explicitTicket && explicitCsrf) {
-    return {
-      ticket: explicitTicket,
-      csrfToken: explicitCsrf,
-      source: "explicit",
-      freshAuth: false,
-    };
-  }
-
-  if (!opts.skipCache) {
-    try {
-      const modelType = opts.modelType || "@dmc/proxmox";
-      const defId = context.definition.id;
-      const authDir =
-        `${context.repoDir}/.swamp/data/${modelType}/${defId}/auth`;
-      const entries = [];
-      // @ts-ignore - Deno API
-      for await (const entry of Deno.readDir(authDir)) {
-        if (entry.isDirectory) entries.push(entry);
-      }
-      if (entries.length > 0) {
-        const versions = entries.map((e) => parseInt(e.name, 10)).filter((n) =>
-          !isNaN(n)
-        );
-        const latest = Math.max(...versions);
-        const rawPath = `${authDir}/${latest}/raw`;
-        const metaPath = `${authDir}/${latest}/metadata.yaml`;
-        // @ts-ignore - Deno API
-        const metaText = await Deno.readTextFile(metaPath);
-        const createdAtMatch = metaText.match(/createdAt:\s*'([^']+)'/);
-        if (createdAtMatch) {
-          const createdAt = new Date(createdAtMatch[1]);
-          if (Date.now() - createdAt.getTime() < AUTH_TTL_MS) {
-            // @ts-ignore - Deno API
-            const rawText = await Deno.readTextFile(rawPath);
-            const cached = JSON.parse(rawText);
-            return {
-              ticket: cached.ticket,
-              csrfToken: cached.csrfToken,
-              source: "cache",
-              freshAuth: false,
-            };
-          }
-        }
-      }
-    } catch (_e) {
-      // No cached auth — fall through
-    }
-  }
-
-  const { username, password, realm } = globalArgs;
-  if (!username || !password) {
-    throw new Error(
-      "No auth available: provide tokenId/tokenSecret, explicit ticket/csrfToken, or username/password global args.",
+      ),
     );
   }
-
-  const formData = new URLSearchParams();
-  formData.append("username", `${username}@${realm || "pam"}`);
-  formData.append("password", password);
-
-  const response = await fetchWithCurl(`${apiUrl}/api2/json/access/ticket`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: formData.toString(),
-    skipTlsVerify: skipTlsVerify ?? true,
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Authentication failed: ${response.status} - ${await response.text()}`,
+  if (typeof tokenId !== "string" || !TOKEN_ID_RE.test(tokenId)) {
+    return Promise.reject(
+      new Error(
+        "Proxmox tokenId is not in the form user@realm!tokenname (the value is not shown, in case it is a secret).",
+      ),
     );
   }
-
-  const result = await response.json();
-  const { ticket, CSRFPreventionToken } = result.data;
-  return {
-    ticket,
-    csrfToken: CSRFPreventionToken,
-    username: `${username}@${realm || "pam"}`,
-    source: "password",
-    freshAuth: true,
-  };
+  if (typeof tokenSecret !== "string") {
+    return Promise.reject(new Error("Proxmox tokenSecret must be a string."));
+  }
+  return Promise.resolve({ tokenId, tokenSecret });
 }
 
 /** Base URL for a node-scoped API path. */
@@ -339,7 +332,7 @@ export function nodePath(
  * descriptive error (operation, HTTP status, response body) on a non-2xx.
  */
 export async function pveCall(
-  conn: { skipTlsVerify?: boolean },
+  conn: TlsOptions,
   auth,
   method: string,
   url: string,
@@ -354,7 +347,7 @@ export async function pveCall(
     method,
     headers,
     body,
-    skipTlsVerify: conn.skipTlsVerify ?? true,
+    tls: tlsOptions(conn),
   });
   if (!response.ok) {
     throw new Error(
@@ -391,7 +384,7 @@ export function pickGuestIpv4(interfaces: unknown): string | null {
  * elapse. Always makes at least one attempt. Returns null if none is found.
  */
 export async function getVmIpWithRetry(
-  conn: { apiUrl: string; node: string; skipTlsVerify?: boolean },
+  conn: { apiUrl: string; node: string } & TlsOptions,
   auth,
   vmid: number,
   waitSeconds = 120,
@@ -407,7 +400,7 @@ export async function getVmIpWithRetry(
       response = await fetchWithCurl(url, {
         method: "GET",
         headers: authHeaders(auth),
-        skipTlsVerify: conn.skipTlsVerify ?? true,
+        tls: tlsOptions(conn),
       });
     } catch {
       response = null; // transport error: the guest agent is not reachable yet
@@ -498,24 +491,14 @@ export const ProxmoxConnectionArgs = z.object({
   ),
   node: z.string().describe("Proxmox node name"),
   skipTlsVerify: z.boolean().default(true).describe(
-    "Skip TLS certificate verification",
+    "Skip TLS certificate verification (curl -k). Ignored when caCert is set.",
+  ),
+  caCert: z.string().optional().describe(
+    "PEM CA certificate(s) that sign a self-signed API certificate (for a cluster, /etc/pve/pve-root-ca.pem). When set, every API call checks the certificate and host name with curl --cacert, and skipTlsVerify has no effect. Linux curl then trusts this CA only; the macOS system curl also keeps trusting the system roots. Not needed when the API has a publicly trusted certificate: set skipTlsVerify false instead.",
   ),
   tokenId: z.string().optional().describe(
-    "Proxmox API token id, user@realm!tokenname (preferred auth; used with tokenSecret)",
+    "Proxmox API token id, user@realm!tokenname (used with tokenSecret; the only auth)",
   ),
   tokenSecret: z.string().optional().describe("Proxmox API token secret")
     .meta({ sensitive: true }),
-  ticket: z.string().optional().describe("Auth ticket (ticket auth)").meta({
-    sensitive: true,
-  }),
-  csrfToken: z.string().optional().describe("CSRF token (ticket auth)").meta({
-    sensitive: true,
-  }),
-  username: z.string().optional().describe(
-    "Proxmox username (password auth fallback)",
-  ),
-  password: z.string().optional().describe(
-    "Proxmox password (password auth fallback)",
-  ).meta({ sensitive: true }),
-  realm: z.string().default("pam").describe("Authentication realm"),
 });

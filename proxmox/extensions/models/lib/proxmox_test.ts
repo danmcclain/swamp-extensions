@@ -13,7 +13,9 @@ import {
 import {
   authHeaders,
   buildHeaderConfig,
+  dropRemovedAuthArgs,
   fetchWithCurl,
+  hasUnresolvedAuth,
   resolveAuth,
   waitForTask,
 } from "./proxmox.ts";
@@ -38,7 +40,6 @@ function readHeaderConfig(args: string[]): string {
 Deno.test("authHeaders sends only the PVEAPIToken header for token auth", () => {
   assertEquals(
     authHeaders({
-      source: "token",
       tokenId: TOKEN_ID,
       tokenSecret: TOKEN_SECRET,
     }),
@@ -46,37 +47,95 @@ Deno.test("authHeaders sends only the PVEAPIToken header for token auth", () => 
   );
 });
 
-Deno.test("authHeaders sends the cookie and CSRF token for ticket auth", () => {
-  assertEquals(
-    authHeaders({ source: "explicit", ticket: "t", csrfToken: "c" }),
-    { "Cookie": "PVEAuthCookie=t", "CSRFPreventionToken": "c" },
-  );
+Deno.test("resolveAuth returns only the API token and makes no API call", async () => {
+  const { result, calls } = await withMockedCommand([], () =>
+    resolveAuth({
+      apiUrl: "https://pve.test:8006",
+      tokenId: TOKEN_ID,
+      tokenSecret: TOKEN_SECRET,
+    }));
+  assertEquals(calls.length, 0);
+  assertEquals(result, { tokenId: TOKEN_ID, tokenSecret: TOKEN_SECRET });
 });
 
-Deno.test("resolveAuth prefers the API token over a ticket and makes no login call", async () => {
-  const { result, calls } = await withMockedCommand([], () =>
-    resolveAuth(
-      {
-        apiUrl: "https://pve.test:8006",
-        tokenId: TOKEN_ID,
-        tokenSecret: TOKEN_SECRET,
-        ticket: "stale-ticket",
-        csrfToken: "stale-csrf",
-      },
-      {},
-    ));
+Deno.test("resolveAuth fails closed on password or ticket args alone: no login call", async () => {
+  const { calls } = await withMockedCommand([], async () => {
+    for (
+      const g of [
+        { username: "root", password: "pw", realm: "pam" },
+        { ticket: "PVE:root@pam:TICKET", csrfToken: "csrf" },
+      ]
+    ) {
+      await assertRejects(
+        () => resolveAuth({ apiUrl: "https://pve.test:8006", ...g }),
+        Error,
+        "Password and ticket login were removed",
+      );
+    }
+  });
   assertEquals(calls.length, 0);
-  assertEquals(result.source, "token");
-  assertEquals(result.tokenId, TOKEN_ID);
+});
+
+Deno.test("resolveAuth rejects a missing or empty global args object", async () => {
+  await assertRejects(() => resolveAuth(undefined), Error, "tokenId");
+  await assertRejects(() => resolveAuth({}), Error, "tokenId");
 });
 
 Deno.test("resolveAuth rejects a token id without a secret", async () => {
   await assertRejects(
-    () =>
-      resolveAuth({ apiUrl: "https://pve.test:8006", tokenId: TOKEN_ID }, {}),
+    () => resolveAuth({ apiUrl: "https://pve.test:8006", tokenId: TOKEN_ID }),
     Error,
-    "both tokenId and tokenSecret",
+    "tokenId and tokenSecret",
   );
+});
+
+Deno.test("hasUnresolvedAuth looks only at the token args", () => {
+  assert(hasUnresolvedAuth({ tokenSecret: "${{ vault.get('a', 'b') }}" }));
+  assertFalse(hasUnresolvedAuth({ password: "${{ vault.get('a', 'b') }}" }));
+  assertFalse(hasUnresolvedAuth({ tokenId: TOKEN_ID, tokenSecret: "x" }));
+});
+
+Deno.test("dropRemovedAuthArgs removes the password and ticket args and keeps the rest", () => {
+  const old = {
+    apiUrl: "https://pve.test:8006",
+    node: "node1",
+    tokenId: TOKEN_ID,
+    tokenSecret: TOKEN_SECRET,
+    ticket: "t",
+    csrfToken: "c",
+    username: "root",
+    password: "pw",
+    realm: "pam",
+  };
+  assertEquals(dropRemovedAuthArgs(old), {
+    apiUrl: "https://pve.test:8006",
+    node: "node1",
+    tokenId: TOKEN_ID,
+    tokenSecret: TOKEN_SECRET,
+  });
+  assertEquals(old.password, "pw", "the input is not changed");
+});
+
+Deno.test("every API model's last upgrade drops the removed auth args", async () => {
+  const { model: node } = await import("../proxmox_node.ts");
+  const { model: vm } = await import("../proxmox_vm.ts");
+  for (const m of [node, vm, storageModel]) {
+    const last = m.upgrades[m.upgrades.length - 1];
+    assertEquals(last.toVersion, m.version);
+    assertEquals(
+      last.upgradeAttributes({ node: "n", password: "pw", ticket: "t" }),
+      { node: "n" },
+      m.type,
+    );
+    for (const k of ["ticket", "csrfToken", "username", "password", "realm"]) {
+      assertFalse(k in m.globalArguments.shape, `${m.type} still has ${k}`);
+    }
+  }
+});
+
+Deno.test("the @keeb/proxmox/vm shim is gone", async () => {
+  const extras = await import("../proxmox_vm_extras.ts");
+  assertFalse("extension" in extras);
 });
 
 Deno.test("resolveAuth rejects a token id that is not user@realm!name", async () => {
@@ -86,7 +145,7 @@ Deno.test("resolveAuth rejects a token id that is not user@realm!name", async ()
         apiUrl: "https://pve.test:8006",
         tokenId: "swamp@pve",
         tokenSecret: TOKEN_SECRET,
-      }, {}),
+      }),
     Error,
     "user@realm!tokenname",
   );
@@ -100,7 +159,6 @@ Deno.test("fetchWithCurl puts headers in a -K config file, not on the command li
   }, () =>
     fetchWithCurl("https://pve.test:8006/api2/json/nodes", {
       headers: authHeaders({
-        source: "token",
         tokenId: TOKEN_ID,
         tokenSecret: TOKEN_SECRET,
       }),
@@ -164,7 +222,7 @@ Deno.test("resolveAuth rejects a token that is still an unresolved expression", 
         apiUrl: "https://pve.test:8006",
         tokenId: TOKEN_ID,
         tokenSecret: "${{ vault.get(infra, PROXMOX_TOKEN_SECRET) }}",
-      }, {}),
+      }),
     Error,
     "unresolved",
   );
@@ -196,8 +254,8 @@ Deno.test("waitForTask polls with token auth headers", async () => {
       "https://pve.test:8006",
       "pve",
       "UPID:pve:1:",
-      { source: "token", tokenId: TOKEN_ID, tokenSecret: TOKEN_SECRET },
-      true,
+      { tokenId: TOKEN_ID, tokenSecret: TOKEN_SECRET },
+      { skipTlsVerify: true },
     ));
   assert(result.success);
   assertStringIncludes(config, "PVEAPIToken=");
@@ -213,7 +271,6 @@ Deno.test("storage downloadImage authenticates every call with the API token", a
       skipTlsVerify: true,
       tokenId: TOKEN_ID,
       tokenSecret: TOKEN_SECRET,
-      realm: "pam",
     },
   });
   const outputs = [
@@ -265,4 +322,13 @@ Deno.test("storage-target-exists reports refused credentials, not a missing stor
   );
   assertFalse(result.pass);
   assertStringIncludes(result.errors[0], "refused the credentials (401)");
+});
+
+Deno.test("resolveAuth does not echo a malformed tokenId, which may be the secret", async () => {
+  const err = await assertRejects(
+    () => resolveAuth({ tokenId: TOKEN_SECRET, tokenSecret: TOKEN_SECRET }),
+    Error,
+  );
+  assertFalse(err.message.includes(TOKEN_SECRET));
+  assertStringIncludes(err.message, "user@realm!tokenname");
 });

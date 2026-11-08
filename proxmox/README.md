@@ -6,8 +6,9 @@ from cloud images, snapshots, disk and node migration, container control), cloud
 image storage, and safe updates for community-scripts LXCs.
 
 `@dmc/proxmox/node` and `@dmc/proxmox/vm` replace `@keeb/proxmox/node` and
-`@keeb/proxmox/vm`. The `@keeb/proxmox/vm` extension is still included for one
-release so existing definitions keep working while they move — see
+`@keeb/proxmox/vm`. Since 2026.11.07.1 this package no longer extends
+`@keeb/proxmox/vm` and takes API tokens only — see
+[Upgrading to 2026.11.07.1](#upgrading-to-202611071) and
 [Moving from @keeb/proxmox](#moving-from-keebproxmox).
 
 ## Models
@@ -19,17 +20,38 @@ expects, so a `proxmoxNodes` / `proxmoxNode` entry can point at a definition of
 this type.
 
 - `status` — node memory, CPU and uptime (`status` resource).
+- `clusterHealth` — judge one node (default: the configured `node`) from
+  `/cluster/status`. The node is healthy when the cluster lists it online and,
+  in a cluster, the cluster is quorate and lists as many nodes as it says it
+  has. An unhealthy node is a result, not an error. A failed call, or an answer
+  that does not parse, is an error. Needs `Sys.Audit` on `/` (see
+  [A limited token for snapshots and health](#a-limited-token-for-snapshots-and-health)).
 - `listGuests` — every VM and CT on the cluster with type, vmid, name, status,
   node and IPv4 (`guests` resource).
-- `snapshotVm` / `rollbackVm` / `deleteVmSnapshot` — run the snapshot task and
-  wait for it; `listVmSnapshots` lists them (`snapshot` resource,
-  `snapshot-<vmid>`). Snapshot names must start with a letter and use letters,
-  digits, `_` or `-`.
+- `snapshotVm` / `rollbackVm` / `deleteVmSnapshot` / `listVmSnapshots`, and
+  `snapshotCt` / `rollbackCt` / `deleteCtSnapshot` / `listCtSnapshots` — run the
+  snapshot task and wait for it (`snapshot` resource, `snapshot-<vmid>`, with
+  the guest's type and node). Each one first finds the guest in
+  `/cluster/resources` and acts on the node the guest runs on now, so one model
+  reaches every guest in the cluster, also after a migration. It stops before
+  any change when the guest is not listed (it does not exist, or the token has
+  no `VM.Audit` on it), is listed twice, or is the other kind (a CT id for a VM
+  method). `rollbackCt` starts the CT again (Proxmox stops a CT to roll it
+  back), which needs `VM.PowerMgmt`. Snapshot names must start with a letter and
+  use letters, digits, `_` or `-`.
+- `permissions` — read-only: the effective privileges of the calling token or
+  user, or of another `userid`, optionally for one ACL `path`, with their
+  propagate flags.
+- `ensureSnapshotAccess` — make a least-privilege API token for snapshots and,
+  optionally, cluster health. See
+  [A limited token for snapshots and health](#a-limited-token-for-snapshots-and-health).
 
-**Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, and auth (see
-[Authentication](#authentication)).
+**Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, `caCert`, and auth (see
+[Authentication](#authentication) and [TLS](#tls)).
 
-**Checks:** `valid-connection` (policy), `node-reachable` (live).
+**Checks:** `valid-connection` (policy), `node-reachable` (live). The
+`node-reachable` check reads `/version`, which every valid token can read, so a
+limited token passes it.
 
 ### `@dmc/proxmox/vm`
 
@@ -38,8 +60,8 @@ QEMU VM (and LXC) lifecycle: `lookup`, `start`, `stop`, `create`, `delete`,
 `spiceConnect`), plus every method and check listed under
 [the VM/LXC methods](#vmlxc-methods) below.
 
-**Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, and auth (see
-[Authentication](#authentication)).
+**Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, `caCert`, and auth (see
+[Authentication](#authentication) and [TLS](#tls)).
 
 Each method description lists the Proxmox privileges it needs.
 
@@ -50,9 +72,9 @@ download-url API. Proxmox fetches the image server-side — no local bandwidth
 required. The resulting `storageRef` can be passed directly to
 `createFromImage`.
 
-**Global arguments:** `apiUrl`, `node`, `storage`, `skipTlsVerify`, and auth
-(`tokenId`/`tokenSecret`, `ticket`/`csrfToken`, or `username`/`password`/`realm`
-— see [Authentication](#authentication)).
+**Global arguments:** `apiUrl`, `node`, `storage`, `skipTlsVerify`, `caCert`,
+and auth (`tokenId`/`tokenSecret` — see [Authentication](#authentication) and
+[TLS](#tls)).
 
 **Checks:**
 
@@ -75,17 +97,37 @@ container: snapshot the container, run its in-container `update` helper
 and **roll back to the snapshot automatically** if it does not. One model
 instance == one container.
 
-Because the Proxmox API cannot run a command _inside_ an LXC, this model reaches
-the hypervisor node's shell through a
-[`@swamp/ssh`](https://swamp.club/extensions/@swamp/ssh) instance (named by
-`sshModel`, required) rather than opening its own connection — it shells out to
-`swamp model method run <sshModel> exec`. This requires the `swamp` binary on
-PATH (override with `SWAMP_BIN`) and a configured `@swamp/ssh` instance whose
-host list includes the PVE node.
+The Proxmox API cannot run a command _inside_ an LXC, so this model runs its
+commands through a [`@swamp/ssh`](https://swamp.club/extensions/@swamp/ssh)
+instance (named by `sshModel`, required) and does not open its own connection —
+it shells out to `swamp model method run <sshModel> exec`. This requires the
+`swamp` binary on PATH (override with `SWAMP_BIN`). `reach` sets which host that
+instance connects to:
+
+- `reach: pct` (default) — the ssh instance reaches the PVE node (`node`), and
+  every command runs as root through `pct exec`. The ssh instance's host list
+  must include the node.
+- `reach: ssh` — the ssh instance reaches the container itself (`ctHost`) as a
+  non-root login. Health, version and package probes run as that login. The
+  update runs as one exact argv through `sudo -n`, so one sudoers entry can
+  grant it (see `privileges`). Snapshots, rollbacks and deletes go only through
+  `nodeModel`, a `@dmc/proxmox/node` model with a limited snapshot token (see
+  [A limited token for snapshots and health](#a-limited-token-for-snapshots-and-health)).
+  Without `nodeModel`, a step that needs a snapshot stops before it runs a
+  command. `install` needs `reach: pct`.
+
+With `reach: ssh`, `updateCommand` is not run by a shell. It must have the form
+`[NAME=value ...] /absolute/bin [args]` (values use `A-Za-z0-9._/:=+-`), and env
+pairs go through `env`. The default, `PHS_SILENT=1 /usr/bin/update`, becomes
+`sudo -n env PHS_SILENT=1 /usr/bin/update`.
+
+`nodeModel` also works with `reach: pct`. Snapshots then go through the API in
+place of `pct snapshot`.
 
 **Key global arguments:** `node` (PVE host), `ctid` (LXC id), `service` (systemd
-unit to health-check), optional `versionCommand` /`releaseApiUrl` (enable update
-detection), optional `healthUrl` (end-to-end HTTP readiness probe).
+unit to health-check; `serviceActiveCommand` for OpenRC), `reach`, `ctHost` and
+`nodeModel` (see above), optional `versionCommand` /`releaseApiUrl` (enable
+update detection), optional `healthUrl` (end-to-end HTTP readiness probe).
 
 **Methods:**
 
@@ -109,8 +151,25 @@ detection), optional `healthUrl` (end-to-end HTTP readiness probe).
 - `checkUpdate` — read-only: compare the installed version against the latest
   upstream release tag; sets `updateAvailable`
 - `safeUpdate` — snapshot → update → validate → auto-rollback on failure.
-  Refuses to run on an already-unhealthy container unless `force: true`.
-  Arguments:
+  Refuses to run on an already-unhealthy container unless `force: true`. With
+  `reach: ssh`, two more checks run before the snapshot, as the login and
+  without root:
+  - The update's bin must start with `#!` or be an ELF file. The
+    community-scripts `/usr/bin/update` can have no `#!` line, and busybox `env`
+    on musl (Alpine) cannot run such a file ("Exec format error"). The error
+    gives the fix.
+  - Each http(s) URL that the update script fetches (on `curl` and `wget` lines,
+    with `$NAME`, `${NAME}` and `${NAME:-default}` expanded from the script's
+    own literal assignments) must answer 2xx from `ctHost`. The check refuses a
+    script it cannot read or that is over 64 KiB, a URL with unsafe characters,
+    more than 8 URLs, a missing `curl`, and output it cannot parse. A URL that
+    it cannot resolve is logged as not checked.
+
+  With either reach, the update output is also checked. A `curl: (NN)` line, or
+  the helper saying that the app script was removed or that no update script
+  exists, is a failed update even when the update exits 0. The run then rolls
+  back (or, with `snapshot: false`, records `failed`), because an empty script
+  that "succeeds" is not an up-to-date app. Arguments:
   - `force` (default `false`) — proceed even if the container is unhealthy
     before the update.
   - `keepSnapshot` (default `true`) — keep the `preupdate-*` snapshot after a
@@ -125,18 +184,26 @@ detection), optional `healthUrl` (end-to-end HTTP readiness probe).
     `rolledBack: false`) and throws, so the caller can roll back.
 - `rollback` — roll back to a named snapshot, or the most recent `preupdate-*`
   one
+- `privileges` — read-only, runs nothing: declares the root commands that the
+  update needs, for the `@dmc/patch` plug-in contract. With `reach: ssh` it
+  declares the one `sudo` argv, with `remoteCode: true` and
+  `remoteSources: ["community-scripts/ProxmoxVE@main", "community-scripts/core@main"]`
+  (the helper fetches and runs code from both repositories as root). With
+  `reach: pct` it refuses: `pct` runs every command as root on the node, and no
+  sudo grant can limit that.
 
 **Pre-flight checks** (run before the mutating methods; `status`, `discoverApp`,
 `previewInstall` and `checkUpdate` have none):
 
-| Check                 | Label    | Methods                             | Verifies                                                                   |
-| --------------------- | -------- | ----------------------------------- | -------------------------------------------------------------------------- |
-| `manage-args-present` | `policy` | `install`, `safeUpdate`, `rollback` | `node`, `ctid` and `service` are set                                       |
-| `install-app-present` | `policy` | `install`                           | `app` is set                                                               |
-| `node-reachable`      | `live`   | `install`, `safeUpdate`, `rollback` | the node answers over the ssh model and has `pct`                          |
-| `ctid-free`           | `live`   | `install`                           | no container or VM uses the ctid in the cluster (passes with `force=true`) |
-| `container-exists`    | `live`   | `safeUpdate`                        | `pct status` answers for the ctid (the app need not be healthy)            |
-| `snapshot-available`  | `live`   | `rollback`                          | the named snapshot, or at least one `preupdate-*` snapshot, exists         |
+| Check                 | Label    | Methods                             | Verifies                                                                                                                                                                                   |
+| --------------------- | -------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `manage-args-present` | `policy` | `install`, `safeUpdate`, `rollback` | `node`, `ctid` and `service` are set                                                                                                                                                       |
+| `install-app-present` | `policy` | `install`                           | `app` is set                                                                                                                                                                               |
+| `reach-ssh-ready`     | `policy` | `install`, `safeUpdate`, `rollback` | with `reach: ssh`: `updateCommand` is an exact argv that sudo can grant, a `nodeModel` is set when the method needs a snapshot, and the method is not `install` (passes with `reach: pct`) |
+| `node-reachable`      | `live`   | `install`, `safeUpdate`, `rollback` | `reach: pct`: the node answers over the ssh model and has `pct`. `reach: ssh` with a `nodeModel`: the node model lists the CT's snapshots                                                  |
+| `ctid-free`           | `live`   | `install`                           | no container or VM uses the ctid in the cluster (passes with `force=true`)                                                                                                                 |
+| `container-exists`    | `live`   | `safeUpdate`                        | `reach: pct`: `pct status` answers for the ctid. `reach: ssh`: the container answers over ssh on `ctHost`. The app need not be healthy                                                     |
+| `snapshot-available`  | `live`   | `rollback`                          | the named snapshot, or at least one `preupdate-*` snapshot, exists                                                                                                                         |
 
 The `rollback` checks never need the container to be running or healthy: a
 broken container is the reason to roll back. Skip checks with
@@ -152,9 +219,7 @@ only when their method is selected — a real run, or
 ### VM/LXC methods
 
 Provisioning, snapshot, disk/node migration, and LXC container control. These
-are methods of `@dmc/proxmox/vm`, and also an extension of `@keeb/proxmox/vm`
-for one release (ticket auth only there, because a type extension cannot add
-global arguments).
+are methods of `@dmc/proxmox/vm`.
 
 **VM provisioning:**
 
@@ -338,17 +403,12 @@ applies its Alpine defaults).
 
 ## Authentication
 
-Every API call goes through one auth layer (`lib/proxmox.ts`). It uses the first
-of these that is set:
-
-1. **API token** — `tokenId` (`user@realm!tokenname`) and `tokenSecret`.
-   Requests carry `Authorization: PVEAPIToken=<tokenId>=<tokenSecret>` and no
-   CSRF token. There is no login call, no 2-hour ticket expiry, and no ticket is
-   stored as data.
-2. **Ticket** — `ticket` and `csrfToken` global args.
-3. **Cached ticket** — a ticket under 2 hours old in the model's `auth` data.
-4. **Password** — `username`, `password` and `realm`; logs in with
-   `POST /access/ticket`.
+Every API call goes through one auth layer (`lib/proxmox.ts`), and it takes an
+API token only: `tokenId` (`user@realm!tokenname`) and `tokenSecret`. Requests
+carry `Authorization: PVEAPIToken=<tokenId>=<tokenSecret>` and no CSRF token.
+There is no login call, no 2-hour ticket expiry, and no ticket is stored as
+data. A method or live check with no token, or a malformed one, fails before it
+calls the API. Password and ticket login were removed in 2026.11.07.1.
 
 Keep `tokenSecret` in a vault:
 
@@ -358,16 +418,114 @@ globalArguments:
   tokenSecret: ${{ vault.get(infra, PROXMOX_TOKEN_SECRET) }}
 ```
 
-Request headers (cookie, CSRF token, token secret) go to curl in a 0600 temp
-config file (`-K`), so they do not show on the command line.
+Request headers (the token secret) and request bodies (for example cloud-init
+passwords) go to curl in 0600 temp files (`-K` and `--data-binary @file`), so
+they do not show on the command line. curl runs on the swamp host, not on the
+node.
 
 Token args are available on `@dmc/proxmox/node`, `@dmc/proxmox/vm` and
-`@dmc/proxmox/storage`. The `@keeb/proxmox/vm` extension methods use the same
-layer but keep ticket auth (a type extension cannot add global arguments).
+`@dmc/proxmox/storage`.
 
 Live checks pass when the auth args are still unresolved `${{ }}` expressions
 (as under `swamp model validate`); a method run resolves them and runs the
 checks for real.
+
+### TLS
+
+Every API call sends the token to `apiUrl`, so verify the API certificate:
+
+- **A publicly trusted certificate** (for example Tailscale Serve or a reverse
+  proxy with a Let's Encrypt certificate in front of port 8006): set
+  `skipTlsVerify: false`. curl then checks the certificate and the host name
+  against the system roots.
+- **The self-signed Proxmox certificate** (port 8006 directly): set `caCert` to
+  the PEM CA that signs it (for a cluster, `/etc/pve/pve-root-ca.pem`). curl
+  then gets `--cacert` and never `-k`, whatever `skipTlsVerify` says. Linux curl
+  then trusts this CA only. Apple's `/usr/bin/curl` also keeps trusting the
+  macOS system roots, so on macOS `caCert` is not an exclusive pin. A `caCert`
+  that is not a PEM certificate bundle, or is still an unresolved expression,
+  stops the call before curl runs.
+- `skipTlsVerify: true` with no `caCert` turns all certificate checks off
+  (`curl -k`). Anyone on the network path to the API can then read the token. It
+  is the default only so that existing definitions keep working.
+
+curl gets `-q` first, so a `~/.curlrc` on the swamp host cannot turn
+verification off.
+
+```yaml
+globalArguments:
+  apiUrl: https://pve1.example.net:8006/api2/json
+  skipTlsVerify: false
+  caCert: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
+```
+
+### A limited token for snapshots and health
+
+`@dmc/patch` (or any automation that only snapshots guests) does not need an
+admin token. `ensureSnapshotAccess` on a `@dmc/proxmox/node` model with an admin
+token makes a token that may only audit, snapshot, roll back and power the
+guests in one pool. With the default arguments (`role`, `auditRole`, `user`,
+`tokenName` and `pool` change the names) it makes:
+
+- role `SwampPatch` with exactly `VM.Audit`, `VM.PowerMgmt`, `VM.Snapshot` and
+  `VM.Snapshot.Rollback` (`VM.PowerMgmt` because a CT rollback with start checks
+  it);
+- user `swamp-patch@pve`, pool `patch` with the `members` you list, ACLs on
+  `/pool/patch` with propagate 0, and a privilege-separated token `patch`.
+
+With `clusterAudit: true` it also adds role `SwampPatchAudit` with exactly
+`Sys.Audit`, granted on `/` with propagate 0 to the user and the token, so the
+token can run `clusterHealth`. `Sys.Audit` on `/` also reads cluster-level
+status and configuration (HA status, cluster options, firewall rules, backup and
+replication jobs). It gives no right on a node, guest, pool or storage path, and
+no write.
+
+It is a dry run by default (`dryRun: false` to write). It reads the roles,
+users, ACLs, pools and guests, and the caller's own privileges, first. It writes
+nothing when anything is off: a role with other privileges, a user in a group, a
+token without privilege separation, any other grant for the user, token or role,
+a propagated grant, a guest in another pool, or a missing caller privilege. It
+creates only what is missing, and never changes or removes an existing object.
+The new token secret is stored only as a sensitive output (vault key
+`snapshot-token`), before any other step, and never in data, logs or errors. A
+live run then checks that the token holds exactly the expected privileges on
+each path.
+
+```bash
+# Plan (dry run), then apply
+swamp model method run proxmox-admin ensureSnapshotAccess \
+  --input clusterAudit=true --input 'members:json=[100,101,200]'
+swamp model method run proxmox-admin ensureSnapshotAccess \
+  --input clusterAudit=true --input 'members:json=[100,101,200]' \
+  --input dryRun=false
+```
+
+Point a second `@dmc/proxmox/node` model at that token
+(`tokenId: swamp-patch@pve!patch`), and use it as the `nodeModel` of a
+community-script, or as a `@dmc/patch` snapshot or health-check model.
+
+## Upgrading to 2026.11.07.1
+
+This release has breaking changes for `@dmc/proxmox/node`, `@dmc/proxmox/vm` and
+`@dmc/proxmox/storage`:
+
+- **API tokens are the only auth.** The upgrade removes the `ticket`,
+  `csrfToken`, `username`, `password` and `realm` global arguments from each
+  definition. A definition that used them needs `tokenId` and `tokenSecret` (see
+  [Authentication](#authentication) and
+  [A limited token for snapshots and health](#a-limited-token-for-snapshots-and-health)).
+  Until then its methods fail before they call the API.
+- **The `@keeb/proxmox/vm` extension is removed.** Definitions of that type no
+  longer get the VM/LXC methods from this package. Move them to
+  `@dmc/proxmox/vm` (below).
+- Old `auth` data that `@keeb/proxmox/node` wrote is no longer read. You can
+  delete it with `swamp data` when nothing else uses it.
+
+Set `skipTlsVerify: false` or `caCert` too, so the token is not sent to an
+unverified server (see [TLS](#tls)).
 
 ## Moving from @keeb/proxmox
 
@@ -386,14 +544,13 @@ wrote.
 ## Requirements
 
 - Proxmox VE 7+ (download-url API required for `@dmc/proxmox/storage`)
-- Auth via an API token (preferred), a ticket/CSRF token, or
-  `username`/`password` global args — see [Authentication](#authentication)
-- [`@keeb/proxmox`](https://swamp.club/extensions/@keeb/proxmox) only for
-  definitions still on `@keeb/proxmox/vm`
+- `curl` on the swamp host (API calls run there)
+- A Proxmox API token — see [Authentication](#authentication)
 - For `@dmc/proxmox/community-script`:
   [`@swamp/ssh`](https://swamp.club/extensions/@swamp/ssh) installed with an
-  instance reaching the PVE node, the `swamp` binary on PATH, and an LXC created
-  by the Proxmox VE community-scripts project
+  instance reaching the PVE node (`reach: pct`) or the container (`reach: ssh`),
+  the `swamp` binary on PATH, and an LXC created by the Proxmox VE
+  community-scripts project
 
 ## License
 

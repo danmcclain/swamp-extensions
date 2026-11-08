@@ -10,9 +10,8 @@ const globalArgs = {
   node: "pve",
   storage: "local",
   skipTlsVerify: true,
-  ticket: "test-ticket",
-  csrfToken: "test-csrf",
-  realm: "pam",
+  tokenId: "swamp@pve!automation",
+  tokenSecret: "11111111-2222-3333-4444-555555555555",
 };
 
 function httpOutput(status: number, body: unknown) {

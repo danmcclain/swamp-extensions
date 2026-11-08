@@ -10,7 +10,9 @@ import {
   withMockedCommand,
 } from "jsr:@systeminit/swamp-testing@0.20260604.20";
 import { model } from "./proxmox_vm.ts";
-import { extension } from "./proxmox_vm_extras.ts";
+import * as extras from "./proxmox_vm_extras.ts";
+
+const { vmExtraChecks, vmExtraMethods } = extras;
 
 const TOKEN_ID = "swamp@pve!automation";
 const TOKEN_SECRET = "11111111-2222-3333-4444-555555555555";
@@ -21,7 +23,6 @@ const globalArgs = {
   skipTlsVerify: true,
   tokenId: TOKEN_ID,
   tokenSecret: TOKEN_SECRET,
-  realm: "pam",
 };
 
 function httpOutput(status: number, body: unknown) {
@@ -84,7 +85,7 @@ const taskDone = {
   },
 };
 
-Deno.test("@dmc/proxmox/vm has the keeb base methods and every extra, but no spiceConnect", () => {
+Deno.test("@dmc/proxmox/vm has the base methods and every extra, but no spiceConnect", () => {
   for (
     const m of [
       "lookup",
@@ -97,12 +98,12 @@ Deno.test("@dmc/proxmox/vm has the keeb base methods and every extra, but no spi
       "sync",
     ]
   ) assert(m in model.methods, m);
-  for (const m of Object.keys(extension.methods[0])) {
+  for (const m of Object.keys(vmExtraMethods)) {
     assert(m in model.methods, `extra ${m}`);
-    assertEquals(model.methods[m], extension.methods[0][m]);
+    assertEquals(model.methods[m], vmExtraMethods[m]);
   }
   assertFalse("spiceConnect" in model.methods);
-  for (const c of Object.keys(extension.checks[0])) {
+  for (const c of Object.keys(vmExtraChecks)) {
     assert(c in model.checks, c);
   }
 });

@@ -11,6 +11,13 @@
  * required): it shells out to `swamp model method run <sshModel> exec`
  * so SSH transport, auth, and host-key handling live in one place.
  *
+ * With `reach: "ssh"` the model never needs the node: it reaches the container
+ * itself (`ctHost`, a host in the sshModel) as a non-root login. Health and
+ * version probes run as that login; the update runs as ONE exact command through
+ * `sudo -n` (the `privileges` method declares it, so @dmc/patch can grant just
+ * that); snapshots, rollbacks and deletes go through `nodeModel`, a
+ * @dmc/proxmox/node model with a limited API token. Install stays pct only.
+ *
  * Prerequisites for the consumer:
  *   - the `@swamp/ssh` extension installed and an instance configured whose host
  *     list includes the PVE node named by `node`;
@@ -40,7 +47,16 @@ const GlobalArgsSchema = z.object({
     "Name of the @swamp/ssh model instance used to reach the PVE node (required, no default)",
   ),
   node: z.string().min(1).optional().describe(
-    'Fleet host name (a host in the sshModel) of the PVE hypervisor running the container, e.g. "pve1". Required for every method except discoverApp/previewInstall (which only read the community-scripts sources).',
+    'Fleet host name (a host in the sshModel) of the PVE hypervisor running the container, e.g. "pve1". Required with reach pct for every method except discoverApp/previewInstall (which only read the community-scripts sources).',
+  ),
+  reach: z.enum(["pct", "ssh"]).default("pct").describe(
+    "How the container is reached: pct (default) runs every command as root through pct on `node`; ssh reaches the container itself (`ctHost`) as a non-root login, runs the update through `sudo -n` with one exact command (see the privileges method), and takes snapshots only through `nodeModel`",
+  ),
+  ctHost: z.string().min(1).optional().describe(
+    "With reach ssh: the container's own host name in the sshModel (required there)",
+  ),
+  nodeModel: z.string().min(1).optional().describe(
+    "A @dmc/proxmox/node model whose API token may snapshot this CT. When set, snapshots, rollbacks, deletes and snapshot lists go through its snapshotCt / rollbackCt / deleteCtSnapshot / listCtSnapshots instead of pct. With reach ssh it is the only way to take a snapshot",
   ),
   ctid: z.number().int().positive().optional().describe(
     "LXC container ID, e.g. 601. Required for every method except discoverApp/previewInstall.",
@@ -55,7 +71,7 @@ const GlobalArgsSchema = z.object({
     'Command run inside the container (via `sh -c`) whose exit 0 means the service is up. Overrides the default `systemctl is-active <service>` — set this for non-systemd containers, e.g. Alpine/OpenRC: "rc-service <service> status".',
   ),
   updateCommand: z.string().default("PHS_SILENT=1 /usr/bin/update").describe(
-    "Command run inside the container (via `bash -lc`) to perform the update. Default runs the community-scripts helper in forced-silent mode (PHS_SILENT=1) so it never prompts. Add `var_ignore_os_mismatch=1` here to bypass the OS-version guard.",
+    "Command run inside the container (via `bash -lc`) to perform the update. Default runs the community-scripts helper in forced-silent mode (PHS_SILENT=1) so it never prompts. Add `var_ignore_os_mismatch=1` here to bypass the OS-version guard. With reach ssh it is not run by a shell: it must be `[NAME=value ...] /absolute/bin [args]` (values A-Za-z0-9._/:=+-), and runs as exactly that argv through `sudo -n` (env pairs through env).",
   ),
   versionCommand: z.string().optional().describe(
     'Optional command run inside the container to capture a version string before/after, e.g. "forgejo --version"',
@@ -109,19 +125,39 @@ const GlobalArgsSchema = z.object({
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
-/** Global args with the container-management fields guaranteed present. */
-type ManageArgs = GlobalArgs & { node: string; ctid: number; service: string };
+/** Global args with the container-management fields guaranteed present. `node` is
+ *  set with reach pct, `ctHost` with reach ssh. */
+type ManageArgs = GlobalArgs & { ctid: number; service: string };
 
-/**
- * Assert the container-management global args (node/ctid/service) are set, and
- * narrow the type. discoverApp/previewInstall don't call this — they only read
- * the community-scripts sources and need just `app`.
- */
-function requireManage(ga: GlobalArgs): ManageArgs {
+/** True when the container is reached over ssh (reach ssh) rather than pct. */
+function viaSsh(ga: GlobalArgs): boolean {
+  return ga.reach === "ssh";
+}
+
+/** The global args a managed container needs for its reach: node (pct) or ctHost (ssh),
+ *  plus ctid and service. */
+function missingManageArgs(ga: GlobalArgs): string[] {
   const missing: string[] = [];
-  if (!ga.node) missing.push("node");
+  if (viaSsh(ga)) {
+    if (!ga.ctHost) missing.push("ctHost");
+  } else if (!ga.node) missing.push("node");
   if (ga.ctid === undefined) missing.push("ctid");
   if (!ga.service) missing.push("service");
+  return missing;
+}
+
+/** Where the container is reached, for records and logs: the node (pct) or ctHost (ssh). */
+function placeOf(ga: ManageArgs): string {
+  return (viaSsh(ga) ? ga.ctHost : ga.node) ?? "";
+}
+
+/**
+ * Assert the container-management global args (node or ctHost, ctid, service) are
+ * set, and narrow the type. discoverApp/previewInstall don't call this — they only
+ * read the community-scripts sources and need just `app`.
+ */
+function requireManage(ga: GlobalArgs): ManageArgs {
+  const missing = missingManageArgs(ga);
   if (missing.length > 0) {
     throw new Error(
       `This method requires global args: ${
@@ -264,6 +300,53 @@ async function nodeExec(
   command: string,
   timeoutSec: number,
 ): Promise<NodeResult> {
+  if (!ga.node) {
+    throw new Error(
+      viaSsh(ga)
+        ? "reach ssh never runs a command on the node; this step needs reach pct"
+        : "global arg node is not set",
+    );
+  }
+  return await sshExec(ga, "node", ga.node, repoDir, command, timeoutSec);
+}
+
+/** Run a command inside the container: as the ssh login on ctHost (reach ssh), or as root
+ *  through `pct exec <ctid> --` on the node (reach pct). `argv` is a shell word list that
+ *  is safe both ways (pct exec runs it without a shell; ssh runs it through the login's
+ *  shell). */
+async function ctExec(
+  ga: ManageArgs,
+  repoDir: string,
+  argv: string,
+  timeoutSec: number,
+): Promise<NodeResult> {
+  if (viaSsh(ga)) {
+    return await sshExec(
+      ga,
+      "container",
+      ga.ctHost!,
+      repoDir,
+      argv,
+      timeoutSec,
+    );
+  }
+  return await nodeExec(
+    ga,
+    repoDir,
+    `pct exec ${ga.ctid} -- ${argv}`,
+    timeoutSec,
+  );
+}
+
+/** Run a shell command on one host of the sshModel (the node, or the container itself). */
+async function sshExec(
+  ga: GlobalArgs,
+  what: "node" | "container",
+  host: string,
+  repoDir: string,
+  command: string,
+  timeoutSec: number,
+): Promise<NodeResult> {
   const wrapped = `{ ${command}; } 2>&1; printf '\\n${RC_SENTINEL}=%s\\n' "$?"`;
   // @ts-ignore - Deno API
   const proc = new Deno.Command(SWAMP_BIN, {
@@ -278,7 +361,7 @@ async function nodeExec(
       "--repo-dir",
       repoDir,
       "--input",
-      `hosts:json=[${JSON.stringify(ga.node)}]`,
+      `hosts:json=[${JSON.stringify(host)}]`,
       "--input",
       `command=${wrapped}`,
       "--input",
@@ -297,7 +380,7 @@ async function nodeExec(
     // Tailscale re-auth needed, model error) — the remote command can't fail
     // the CLI because we wrapped it to always exit 0.
     throw new Error(
-      `SSH transport to node "${ga.node}" via ${ga.sshModel} failed (exit ${result.code}): ${
+      `SSH transport to ${what} "${host}" via ${ga.sshModel} failed (exit ${result.code}): ${
         stderr.slice(-800)
       }`,
     );
@@ -322,10 +405,83 @@ async function nodeExec(
   return { rc, out: out.trim(), stderr: attrs?.stderr ?? "" };
 }
 
-/** True when `pct status <ctid>` reports the container running. */
+/** True when the container runs: `pct status <ctid>` says running (reach pct), or the
+ *  container answers over ssh (reach ssh; a failed transport is "not running", since a
+ *  container that is starting or rolled back does not answer yet). */
 async function isRunning(ga: ManageArgs, repoDir: string): Promise<boolean> {
+  if (viaSsh(ga)) {
+    try {
+      return (await ctExec(ga, repoDir, "true", 30)).rc === 0;
+    } catch {
+      return false;
+    }
+  }
   const r = await nodeExec(ga, repoDir, `pct status ${ga.ctid}`, 30);
   return /status:\s*running/i.test(r.out);
+}
+
+/** The result of one run of another swamp model through the CLI. */
+type ModelRun =
+  | { ok: true; attributes: Record<string, unknown> | null }
+  | { ok: false; error: string };
+
+/** Run a method of the `nodeModel` (a @dmc/proxmox/node instance) through the swamp CLI.
+ *  Never throws: a failed run comes back as `ok: false` with the CLI's error output. */
+async function nodeModelRun(
+  ga: GlobalArgs,
+  repoDir: string,
+  method: string,
+  inputs: Record<string, string | number | boolean>,
+): Promise<ModelRun> {
+  if (!ga.nodeModel) return { ok: false, error: "nodeModel is not set" };
+  const args = [
+    "model",
+    "method",
+    "run",
+    ga.nodeModel,
+    method,
+    "--json",
+    "--quiet",
+    "--repo-dir",
+    repoDir,
+  ];
+  for (const [k, v] of Object.entries(inputs)) {
+    args.push(
+      "--input",
+      typeof v === "string" ? `${k}=${v}` : `${k}:json=${JSON.stringify(v)}`,
+    );
+  }
+  try {
+    // @ts-ignore - Deno API
+    const proc = new Deno.Command(SWAMP_BIN, {
+      args,
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const result = await proc.output();
+    const stdout = new TextDecoder().decode(result.stdout);
+    if (result.code !== 0) {
+      const stderr = new TextDecoder().decode(result.stderr);
+      return {
+        ok: false,
+        error: `${ga.nodeModel} ${method} failed (exit ${result.code}): ${
+          (stderr || stdout).slice(-600)
+        }`,
+      };
+    }
+    const parsed = JSON.parse(stdout) as {
+      dataArtifacts?: Array<{ attributes?: Record<string, unknown> }>;
+    };
+    return {
+      ok: true,
+      attributes: parsed.dataArtifacts?.[0]?.attributes ?? null,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `${ga.nodeModel} ${method}: ${(err as Error).message}`,
+    };
+  }
 }
 
 /**
@@ -339,18 +495,18 @@ async function isServiceActive(
   repoDir: string,
 ): Promise<boolean> {
   if (ga.serviceActiveCommand) {
-    const r = await nodeExec(
+    const r = await ctExec(
       ga,
       repoDir,
-      `pct exec ${ga.ctid} -- sh -c ${shSingleQuote(ga.serviceActiveCommand)}`,
+      `sh -c ${shSingleQuote(ga.serviceActiveCommand)}`,
       30,
     );
     return r.rc === 0;
   }
-  const r = await nodeExec(
+  const r = await ctExec(
     ga,
     repoDir,
-    `pct exec ${ga.ctid} -- systemctl is-active ${shSingleQuote(ga.service)}`,
+    `systemctl is-active ${shSingleQuote(ga.service)}`,
     30,
   );
   return r.rc === 0 && r.out.split("\n").pop()?.trim() === "active";
@@ -369,10 +525,10 @@ async function readVersion(
   // non-empty line so a command that emits a single clean version line works
   // regardless of any leading noise.
   try {
-    const r = await nodeExec(
+    const r = await ctExec(
       ga,
       repoDir,
-      `pct exec ${ga.ctid} -- sh -c ${shSingleQuote(ga.versionCommand)}`,
+      `sh -c ${shSingleQuote(ga.versionCommand)}`,
       60,
     );
     if (r.rc !== 0) return null;
@@ -458,10 +614,10 @@ async function packageManagerVersion(
     `elif command -v apt-cache >/dev/null 2>&1; then apt-cache policy ${pkg}; ` +
     `elif command -v dnf >/dev/null 2>&1; then dnf --quiet list ${pkg} 2>/dev/null; fi`;
   try {
-    const r = await nodeExec(
+    const r = await ctExec(
       ga,
       repoDir,
-      `pct exec ${ga.ctid} -- sh -c ${shSingleQuote(cmd)}`,
+      `sh -c ${shSingleQuote(cmd)}`,
       60,
     );
     if (r.rc !== 0) return null;
@@ -833,13 +989,93 @@ function parseSnapshots(out: string): Array<z.infer<typeof SnapshotSchema>> {
   return snaps;
 }
 
-/** List container snapshots via `pct listsnapshot`. */
+/** How this container's snapshots are taken: through `nodeModel` (the Proxmox API), else
+ *  pct on the node (reach pct only). Null with reach ssh and no nodeModel: no snapshots. */
+function snapshotsVia(ga: GlobalArgs): "api" | "pct" | null {
+  if (ga.nodeModel) return "api";
+  return viaSsh(ga) ? null : "pct";
+}
+
+/** Why a snapshot step cannot run here, or null when it can. */
+function snapshotRefusal(ga: GlobalArgs): string | null {
+  return snapshotsVia(ga) === null
+    ? "reach ssh takes snapshots only through nodeModel (a @dmc/proxmox/node model with a snapshot token); set nodeModel, or pass snapshot=false when the caller owns the snapshot"
+    : null;
+}
+
+/** List container snapshots: `listCtSnapshots` on the nodeModel, or `pct listsnapshot`.
+ *  The API list throws when the node model fails. With no way to snapshot, the list is
+ *  empty. */
 async function listSnapshots(
   ga: ManageArgs,
   repoDir: string,
 ): Promise<Array<z.infer<typeof SnapshotSchema>>> {
+  const via = snapshotsVia(ga);
+  if (via === null) return [];
+  if (via === "api") {
+    const r = await nodeModelRun(ga, repoDir, "listCtSnapshots", {
+      vmid: ga.ctid,
+    });
+    if (!r.ok) throw new Error(r.error);
+    const list = r.attributes?.snapshots;
+    if (!Array.isArray(list)) {
+      throw new Error(`${ga.nodeModel} listCtSnapshots wrote no snapshot list`);
+    }
+    return list.flatMap((s) => {
+      const name = (s as { name?: unknown })?.name;
+      return typeof name === "string" && name !== "current"
+        ? [{ name, description: null }]
+        : [];
+    });
+  }
   const r = await nodeExec(ga, repoDir, `pct listsnapshot ${ga.ctid}`, 30);
   return parseSnapshots(r.out);
+}
+
+/** Take a snapshot: `snapshotCt` on the nodeModel, or `pct snapshot`. Returns rc 0 on
+ *  success, with the failure text in `out` otherwise. */
+async function takeSnapshot(
+  ga: ManageArgs,
+  repoDir: string,
+  name: string,
+): Promise<NodeResult> {
+  const description = `swamp safeUpdate pre-update ${ga.appName}`;
+  if (snapshotsVia(ga) === "api") {
+    const r = await nodeModelRun(ga, repoDir, "snapshotCt", {
+      vmid: ga.ctid,
+      name,
+      description,
+    });
+    return r.ok
+      ? { rc: 0, out: "", stderr: "" }
+      : { rc: 1, out: r.error, stderr: "" };
+  }
+  return await nodeExec(
+    ga,
+    repoDir,
+    `pct snapshot ${ga.ctid} ${name} --description ${
+      shSingleQuote(description)
+    }`,
+    120,
+  );
+}
+
+/** Delete a snapshot: `deleteCtSnapshot` on the nodeModel, or `pct delsnapshot`. */
+async function deleteSnapshot(
+  ga: ManageArgs,
+  repoDir: string,
+  name: string,
+): Promise<NodeResult> {
+  if (snapshotsVia(ga) === "api") {
+    const r = await nodeModelRun(ga, repoDir, "deleteCtSnapshot", {
+      vmid: ga.ctid,
+      name,
+    });
+    return r.ok
+      ? { rc: 0, out: "", stderr: "" }
+      : { rc: 1, out: r.error, stderr: "" };
+  }
+  return await nodeExec(ga, repoDir, `pct delsnapshot ${ga.ctid} ${name}`, 120);
 }
 
 type HealthResult = Awaited<ReturnType<typeof checkHealth>>;
@@ -863,6 +1099,22 @@ async function rollbackTo(
     httpStatus: null,
   };
   try {
+    if (snapshotsVia(ga) === "api") {
+      // Proxmox stops the CT for the rollback; start: true brings it up again.
+      const rb = await nodeModelRun(ga, repoDir, "rollbackCt", {
+        vmid: ga.ctid,
+        name: snap,
+        start: true,
+      });
+      if (!rb.ok) {
+        return { rolledBack: false, restored: dead, failure: rb.error };
+      }
+      log(`Rolled back to ${snap} through ${ga.nodeModel}; container started`);
+      const restored = await waitForHealth(ga, repoDir, log);
+      return { rolledBack: true, restored };
+    }
+    const refusal = snapshotRefusal(ga);
+    if (refusal) return { rolledBack: false, restored: dead, failure: refusal };
     if (await isRunning(ga, repoDir)) {
       log(`Stopping container before rollback`);
       await nodeExec(ga, repoDir, `pct stop ${ga.ctid}`, 120);
@@ -892,6 +1144,309 @@ async function rollbackTo(
 /** Single-quote a string for safe use inside a POSIX shell command. */
 function shSingleQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The git sources the community-scripts `/usr/bin/update` helper fetches and runs as root:
+ * the app script (`ct/<app>.sh`) from ProxmoxVE, and the shared code from core. Since 2026 the
+ * generated helper first runs `core/misc/update.sh`, and every `ct/<app>.sh` sources
+ * `core/build.func`, which loads more files from core.
+ */
+export const COMMUNITY_SCRIPTS_SOURCES: readonly string[] = [
+  "community-scripts/ProxmoxVE@main",
+  "community-scripts/core@main",
+];
+
+const UPDATE_ENV =
+  /^([A-Za-z_][A-Za-z0-9_]{0,63})=([A-Za-z0-9._/:=+-]{1,256})$/;
+const UPDATE_BIN = /^\/[A-Za-z0-9._/+-]+$/;
+const UPDATE_ARG = /^[A-Za-z0-9._/:=+-]{1,256}$/;
+
+/** The update command as an exact argv, for reach ssh (sudo grants one argv, not a shell). */
+export type UpdateArgv =
+  | { ok: true; argv: string[]; env: Record<string, string> }
+  | { ok: false; error: string };
+
+/**
+ * Parse `updateCommand` for reach ssh: `[NAME=value ...] /absolute/bin [args]`, split on
+ * whitespace, with no shell syntax. Each env value and argument uses only
+ * A-Za-z0-9._/:=+- ; the bin is an absolute path with no `.` or `..` segment and no `//`.
+ */
+export function parseUpdateCommand(cmd: string): UpdateArgv {
+  const tokens = cmd.trim().split(/\s+/).filter((t) => t.length > 0);
+  const env: Record<string, string> = {};
+  let i = 0;
+  for (; i < tokens.length; i++) {
+    const m = tokens[i].match(UPDATE_ENV);
+    if (!m) break;
+    if (m[1] in env) {
+      return { ok: false, error: `updateCommand sets ${m[1]} twice` };
+    }
+    env[m[1]] = m[2];
+  }
+  if (Object.keys(env).length > 8) {
+    return { ok: false, error: "updateCommand sets more than 8 env pairs" };
+  }
+  const bin = tokens[i];
+  if (
+    !bin || !UPDATE_BIN.test(bin) || bin.includes("//") ||
+    bin.split("/").some((s) => s === "." || s === "..") || bin.endsWith("/")
+  ) {
+    return {
+      ok: false,
+      error:
+        "with reach ssh, updateCommand must be [NAME=value ...] /absolute/bin [args] with no shell syntax",
+    };
+  }
+  const args = tokens.slice(i + 1);
+  if (args.length > 31) {
+    return { ok: false, error: "updateCommand has more than 31 arguments" };
+  }
+  const bad = args.find((a) => !UPDATE_ARG.test(a) || a.includes(".."));
+  if (bad !== undefined) {
+    return {
+      ok: false,
+      error: `updateCommand argument "${
+        bad.slice(0, 40)
+      }" uses characters outside A-Za-z0-9._/:=+- or ..`,
+    };
+  }
+  return { ok: true, argv: [bin, ...args], env };
+}
+
+/**
+ * The shell text that runs the parsed update as exactly that argv: through `sudo -n` unless
+ * the login is root, with the env pairs through env (resolved to an absolute path, as the
+ * sudoers entry names it). Never calls `exit`, so the exec wrapper still reports the rc.
+ */
+export function sudoUpdateShell(
+  u: { argv: string[]; env: Record<string, string> },
+): string {
+  const words = [
+    ...Object.entries(u.env).map(([k, v]) => shSingleQuote(`${k}=${v}`)),
+    ...u.argv.map(shSingleQuote),
+  ].join(" ");
+  const sudo = `if [ "$(id -u)" = 0 ]; then S=""; else S="sudo -n"; fi`;
+  if (Object.keys(u.env).length === 0) return `${sudo}; $S ${words}`;
+  return `${sudo}; E=$(command -v env); case "$E" in /*) $S "$E" ${words} ;; *) echo "env not found"; (exit 127) ;; esac`;
+}
+
+/**
+ * The shell text that prints the first 4 bytes of the update's bin as hex, or MISSING. Reads
+ * only. execve runs a file that starts with `#!` (2321) or is ELF (7f454c46). A script with
+ * neither runs only when the caller falls back to /bin/sh on ENOEXEC: glibc's execvp does,
+ * but busybox env on musl (Alpine) does not, so under sudo it fails with "Exec format error"
+ * (rc 126). The community-scripts `/usr/bin/update` has no `#!` line.
+ */
+export function execFormatProbeShell(bin: string): string {
+  const q = shSingleQuote(bin);
+  return `if [ -f ${q} ]; then printf 'HEAD='; head -c 4 ${q} | od -An -tx1 | tr -d ' \\n'; echo; else echo MISSING; fi`;
+}
+
+/** The verdict on execFormatProbeShell's output: null when execve can run the bin, else why
+ *  not (fail closed: output that does not parse is a refusal). */
+export function execFormatRefusal(bin: string, out: string): string | null {
+  if (/^MISSING$/m.test(out)) return `${bin} is not a file on ctHost`;
+  const m = out.match(/^HEAD=([0-9a-f]*)$/m);
+  if (!m) return `could not read the start of ${bin} on ctHost`;
+  if (m[1].startsWith("2321") || m[1] === "7f454c46") return null;
+  return `${bin} has no #! line and is not an ELF binary, so sudo cannot run it through env (busybox env on Alpine gives "Exec format error"); make "#!/bin/sh" its first line on ctHost`;
+}
+
+/** The most URLs the pre-update check fetches from one update script. */
+const UPDATE_URL_MAX = 8;
+/** The largest update script the pre-update check reads. */
+const UPDATE_SCRIPT_MAX_BYTES = 65536;
+/** A URL the pre-update check may fetch: http(s), and no character a shell or curl treats
+ *  in a special way. */
+const LITERAL_URL = /^https?:\/\/[A-Za-z0-9._~:/?#@!&+,;=%-]+$/;
+
+/**
+ * The shell text that prints the update's bin for the pre-update URL check, as the login,
+ * with no root: each line with `L:` in front, or `ELF` for a binary, `UNREADABLE` or
+ * `TOOBIG` (over UPDATE_SCRIPT_MAX_BYTES), and `SCRIPT-END` last. updateScriptUrls reads it.
+ */
+export function updateScriptProbeShell(bin: string): string {
+  const q = shSingleQuote(bin);
+  return [
+    `H=$(head -c 4 ${q} 2>/dev/null | od -An -tx1 | tr -d ' \\n')`,
+    `N=$(wc -c < ${q} 2>/dev/null | tr -d ' ')`,
+    `if [ "$H" = 7f454c46 ]; then echo ELF`,
+    `elif [ -z "$N" ]; then echo UNREADABLE`,
+    `elif [ "$N" -gt ${UPDATE_SCRIPT_MAX_BYTES} ]; then echo TOOBIG`,
+    `else sed 's/^/L:/' ${q}; echo; fi`,
+    `echo SCRIPT-END`,
+  ].join("\n");
+}
+
+/** The URLs an update script fetches, or why the check refuses. */
+export type UpdateScriptUrls =
+  | { ok: true; urls: string[]; skipped: string[] }
+  | { ok: false; refusal: string };
+
+/**
+ * The URLs that the update script (updateScriptProbeShell's output) fetches with curl or wget.
+ * The community-scripts helper builds them from its own assignments
+ * (`export COMMUNITY_SCRIPTS_CORE_URL="https://..."`, then `"${COMMUNITY_SCRIPTS_CORE_URL}/misc/update.sh"`),
+ * so `$NAME`, `${NAME}` and `${NAME:-default}` are expanded from the literal assignments in
+ * the script (the last one wins). A URL that still has an expansion in it is `skipped`: the
+ * check cannot resolve it, and the update output check still sees its failure. Fail closed:
+ * output with no SCRIPT-END line, an unreadable or too large script, a URL with characters
+ * outside LITERAL_URL, or more than UPDATE_URL_MAX URLs is a refusal.
+ */
+export function updateScriptUrls(bin: string, out: string): UpdateScriptUrls {
+  const lines = out.split("\n");
+  const marks = lines.filter((l) => !l.startsWith("L:")).map((l) => l.trim());
+  if (!marks.includes("SCRIPT-END")) {
+    return { ok: false, refusal: `could not read ${bin} on ctHost` };
+  }
+  if (marks.includes("ELF")) return { ok: true, urls: [], skipped: [] };
+  if (marks.includes("UNREADABLE")) {
+    return { ok: false, refusal: `could not read ${bin} on ctHost` };
+  }
+  if (marks.includes("TOOBIG")) {
+    return {
+      ok: false,
+      refusal:
+        `${bin} is larger than ${UPDATE_SCRIPT_MAX_BYTES} bytes; the check does not read it`,
+    };
+  }
+  const script = lines.filter((l) => l.startsWith("L:")).map((l) =>
+    l.slice(2).trim()
+  ).filter((l) => l.length > 0 && !l.startsWith("#"));
+  const vars = new Map<string, string>();
+  for (const l of script) {
+    const m = l.match(
+      /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`\\]*)"|'([^']*)'|([^\s"'$`\;&|()<>]*))\s*(?:#.*)?$/,
+    );
+    if (m) vars.set(m[1], m[2] ?? m[3] ?? m[4] ?? "");
+  }
+  const expand = (t: string): string | null => {
+    let unresolved = false;
+    const v = t.replace(
+      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+      (
+        _m,
+        a: string | undefined,
+        d: string | undefined,
+        b: string | undefined,
+      ) => {
+        const val = vars.get((a ?? b)!);
+        if (d !== undefined) return val ? val : d;
+        if (val !== undefined) return val;
+        unresolved = true;
+        return "";
+      },
+    );
+    return unresolved || v.includes("$") ? null : v;
+  };
+  const TOKEN =
+    /(?:https?:\/\/|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*)[^\s"'()<>|;`\\]*/g;
+  const urls: string[] = [];
+  const skipped: string[] = [];
+  for (const l of script) {
+    if (!/\b(?:curl|wget)\b/.test(l)) continue;
+    for (const t of l.match(TOKEN) ?? []) {
+      const v = expand(t);
+      if (v === null) {
+        if (!skipped.includes(t)) skipped.push(t);
+        continue;
+      }
+      if (!/^https?:\/\//.test(v)) continue;
+      if (!LITERAL_URL.test(v)) {
+        return {
+          ok: false,
+          refusal: `${bin} fetches a URL the check cannot fetch safely: ${
+            v.slice(0, 120)
+          }`,
+        };
+      }
+      if (!urls.includes(v)) urls.push(v);
+    }
+  }
+  if (urls.length > UPDATE_URL_MAX) {
+    return {
+      ok: false,
+      refusal:
+        `${bin} fetches more than ${UPDATE_URL_MAX} URLs; the check does not fetch them all`,
+    };
+  }
+  return { ok: true, urls, skipped };
+}
+
+/**
+ * The shell text that fetches each URL on ctHost, as the login, with no root, and prints
+ * `URL <http code> <url>` (000 when curl cannot connect), or `NOCURL`, then URLCHECK-END.
+ * Each URL is one single-quoted word, so the shell expands nothing in it.
+ */
+export function urlFetchShell(urls: readonly string[]): string {
+  return [
+    `if command -v curl >/dev/null 2>&1; then`,
+    `  for u in ${urls.map(shSingleQuote).join(" ")}; do`,
+    `    c=$(curl -sS -L -o /dev/null --max-time 20 -w '%{http_code}' "$u" 2>/dev/null) || true`,
+    `    echo "URL \${c:-000} $u"`,
+    `  done`,
+    `else echo NOCURL; fi`,
+    `echo URLCHECK-END`,
+  ].join("\n");
+}
+
+/** The verdict on urlFetchShell's output for these URLs: null when each one answered 2xx,
+ *  else why not. Fail closed: no URLCHECK-END line, no curl, a line that does not parse, or
+ *  a URL with no answer line is a refusal. */
+export function updateUrlRefusal(
+  bin: string,
+  out: string,
+  urls: readonly string[],
+): string | null {
+  const lines = out.split("\n").map((l) => l.trim());
+  if (!lines.includes("URLCHECK-END")) {
+    return `could not check the URLs that ${bin} fetches on ctHost`;
+  }
+  if (lines.includes("NOCURL")) {
+    return `${bin} fetches ${urls[0]}, but ctHost has no curl`;
+  }
+  const codes = new Map<string, string>();
+  for (const l of lines) {
+    if (!l.startsWith("URL ")) continue;
+    const m = l.match(/^URL (\d{3}) (\S+)$/);
+    if (!m) return `could not read the URL check of ${bin} on ctHost`;
+    codes.set(m[2], m[1]);
+  }
+  for (const u of urls) {
+    const c = codes.get(u);
+    if (c === undefined) {
+      return `the URL check of ${bin} has no answer for ${u}`;
+    }
+    if (!/^2\d\d$/.test(c)) {
+      const why = c === "000" ? "did not answer" : `answered HTTP ${c}`;
+      return `${u}, which ${bin} fetches and runs, ${why} from ctHost`;
+    }
+  }
+  return null;
+}
+
+/** Lines in the update output that show the update did not run, even at rc 0. */
+const UPDATE_NOT_RUN: readonly RegExp[] = [
+  // A failed fetch: `bash -c "$(curl -fsSL <url>)"` then runs an empty script.
+  /^curl: \(\d+\).*$/m,
+  // core/misc/update.sh, when community-scripts.org says the app script was removed.
+  /^.*has been removed from community-scripts.*$/m,
+  // core/misc/update.sh, when no ct/<app>.sh (or a renamed one) exists.
+  /^.*No update script found for .*$/m,
+];
+
+/** The first update-output line that shows the community-scripts update did not run (a curl
+ *  error, or the helper saying the app script is gone), or null. These runs can exit 0, so
+ *  the line is then the only sign. Fail closed: any such line is a failure. */
+export function updateNotRun(out: string): string | null {
+  // deno-lint-ignore no-control-regex
+  const plain = out.replace(/\x1b\[[0-9;]*m/g, "");
+  for (const re of UPDATE_NOT_RUN) {
+    const m = plain.match(re);
+    if (m) return m[0].trim().slice(0, 300);
+  }
+  return null;
 }
 
 /** Timestamp-based snapshot name, e.g. preupdate-20260913T120500Z. */
@@ -983,6 +1538,84 @@ async function probeNode(
   }
 }
 
+/** Run one read-only command in the container over ssh (reach ssh) for a check. Never
+ *  throws, like probeNode. */
+async function probeCt(
+  ctx: CheckContext,
+  command: string,
+): Promise<NodeProbe> {
+  const missing = missingManageArgs(ctx.globalArgs).filter((a) =>
+    a !== "service"
+  );
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      errors: [
+        `Global arg(s) not set: ${
+          missing.join(", ")
+        }. Set them in the model definition (see check manage-args-present).`,
+      ],
+    };
+  }
+  try {
+    const res = await ctExec(
+      ctx.globalArgs as ManageArgs,
+      ctx.repoDir,
+      command,
+      CHECK_PROBE_TIMEOUT_SEC,
+    );
+    return { ok: true, res };
+  } catch (err) {
+    return {
+      ok: false,
+      errors: [`${(err as Error).message} ${SKIP_LIVE_HINT}`],
+    };
+  }
+}
+
+/** The CT's snapshot names for a check, through the nodeModel or pct on the node. */
+async function probeSnapshotNames(
+  ctx: CheckContext,
+): Promise<{ ok: true; names: string[] } | { ok: false; errors: string[] }> {
+  const ga = ctx.globalArgs;
+  const ctid = ga.ctid;
+  const refusal = snapshotRefusal(ga);
+  if (refusal) return { ok: false, errors: [`${refusal}.`] };
+  if (snapshotsVia(ga) === "api") {
+    if (ctid === undefined) {
+      return { ok: false, errors: ["Global arg ctid is not set."] };
+    }
+    try {
+      const names = (await listSnapshots(ga as ManageArgs, ctx.repoDir)).map((
+        s,
+      ) => s.name);
+      return { ok: true, names };
+    } catch (err) {
+      return {
+        ok: false,
+        errors: [
+          `Could not list snapshots of container ${ctid} through ${ga.nodeModel}: ${
+            (err as Error).message.slice(0, 300)
+          }. ${SKIP_LIVE_HINT}`,
+        ],
+      };
+    }
+  }
+  const probe = await probeNode(ctx, `pct listsnapshot ${ctid}`);
+  if (!probe.ok) return probe;
+  if (probe.res.rc !== 0) {
+    return {
+      ok: false,
+      errors: [
+        `Could not list snapshots of container ${ctid} on node "${ga.node}" (${
+          probe.res.out.slice(0, 200)
+        }). Fix node or ctid, or skip with --skip-check snapshot-available.`,
+      ],
+    };
+  }
+  return { ok: true, names: parseSnapshots(probe.res.out).map((s) => s.name) };
+}
+
 /** A string method arg, or undefined when absent or still an unresolved expression. */
 function stringArg(
   ctx: CheckContext,
@@ -1010,15 +1643,11 @@ const CHECK_METHODS = ["install", "safeUpdate", "rollback"];
 const checks = {
   "manage-args-present": {
     description:
-      "Verify the definition sets node, ctid and service — every mutating method needs them to reach the container",
+      "Verify the definition sets node (reach pct) or ctHost (reach ssh), ctid and service — every mutating method needs them to reach the container",
     labels: ["policy"],
     appliesTo: CHECK_METHODS,
     execute: (context: CheckContext): Promise<CheckResult> => {
-      const ga = context.globalArgs;
-      const missing: string[] = [];
-      if (!ga.node) missing.push("node");
-      if (ga.ctid === undefined) missing.push("ctid");
-      if (!ga.service) missing.push("service");
+      const missing = missingManageArgs(context.globalArgs);
       return Promise.resolve(
         missing.length === 0 ? { pass: true } : {
           pass: false,
@@ -1048,12 +1677,50 @@ const checks = {
           },
       ),
   },
+  "reach-ssh-ready": {
+    description:
+      "With reach ssh: updateCommand is an exact argv that sudo can grant ([NAME=value ...] /absolute/bin [args]), and a nodeModel is set when the selected method needs a snapshot (rollback, or safeUpdate without snapshot=false). Passes with reach pct.",
+    labels: ["policy"],
+    appliesTo: ["safeUpdate", "rollback", "install"],
+    execute: (context: CheckContext): Promise<CheckResult> => {
+      const ga = context.globalArgs;
+      if (!viaSsh(ga)) return Promise.resolve({ pass: true });
+      const errors: string[] = [];
+      if (selected(context, "install")) {
+        errors.push(
+          "install creates the container with pct on the node; it needs reach pct.",
+        );
+      }
+      const u = parseUpdateCommand(ga.updateCommand);
+      if (!u.ok) errors.push(`${u.error}.`);
+      const needsSnapshot = selected(context, "rollback") ||
+        (selected(context, "safeUpdate") &&
+          context.unresolvedMethodArgs?.snapshot !== false);
+      const refusal = needsSnapshot ? snapshotRefusal(ga) : null;
+      if (refusal) errors.push(`${refusal}.`);
+      return Promise.resolve(
+        errors.length === 0 ? { pass: true } : {
+          pass: false,
+          errors: errors.map((e) =>
+            `${e} Fix the definition, or skip with --skip-check reach-ssh-ready.`
+          ),
+        },
+      );
+    },
+  },
   "node-reachable": {
     description:
-      "Verify the PVE node answers over the ssh model and has the pct tool. Does not look at the container, so it is safe before a rollback.",
+      "Verify the PVE node answers over the ssh model and has the pct tool (reach pct), or that the nodeModel lists the CT's snapshots (reach ssh with a nodeModel; reach ssh without one uses no node). Does not look inside the container, so it is safe before a rollback.",
     labels: ["live"],
     appliesTo: CHECK_METHODS,
     execute: async (context: CheckContext): Promise<CheckResult> => {
+      if (viaSsh(context.globalArgs)) {
+        if (!context.globalArgs.nodeModel) return { pass: true };
+        const listed = await probeSnapshotNames(context);
+        return listed.ok
+          ? { pass: true }
+          : { pass: false, errors: listed.errors };
+      }
       const probe = await probeNode(context, "command -v pct");
       if (!probe.ok) return { pass: false, errors: probe.errors };
       if (probe.res.rc !== 0) {
@@ -1099,11 +1766,21 @@ const checks = {
   },
   "container-exists": {
     description:
-      "Verify the container answers to pct status on the node. Does not need the app or the container to be healthy: safeUpdate has its own baseline and rollback logic.",
+      "Verify the container answers to pct status on the node (reach pct), or answers over ssh on ctHost (reach ssh). Does not need the app or the container to be healthy: safeUpdate has its own baseline and rollback logic.",
     labels: ["live"],
     appliesTo: ["safeUpdate"],
     execute: async (context: CheckContext): Promise<CheckResult> => {
       const ctid = context.globalArgs.ctid;
+      if (viaSsh(context.globalArgs)) {
+        const answered = await probeCt(context, "true");
+        if (!answered.ok) return { pass: false, errors: answered.errors };
+        return answered.res.rc === 0 ? { pass: true } : {
+          pass: false,
+          errors: [
+            `Container ${ctid} did not answer over ssh on "${context.globalArgs.ctHost}" (rc ${answered.res.rc}). Fix ctHost, or skip with --skip-check container-exists.`,
+          ],
+        };
+      }
       const probe = await probeNode(context, `pct status ${ctid}`);
       if (!probe.ok) return { pass: false, errors: probe.errors };
       if (probe.res.rc !== 0) {
@@ -1127,19 +1804,9 @@ const checks = {
     execute: async (context: CheckContext): Promise<CheckResult> => {
       if (!selected(context, "rollback")) return { pass: true };
       const ctid = context.globalArgs.ctid;
-      const probe = await probeNode(context, `pct listsnapshot ${ctid}`);
-      if (!probe.ok) return { pass: false, errors: probe.errors };
-      if (probe.res.rc !== 0) {
-        return {
-          pass: false,
-          errors: [
-            `Could not list snapshots of container ${ctid} on node "${context.globalArgs.node}" (${
-              probe.res.out.slice(0, 200)
-            }). Fix node or ctid, or skip with --skip-check snapshot-available.`,
-          ],
-        };
-      }
-      const names = parseSnapshots(probe.res.out).map((s) => s.name);
+      const listed = await probeSnapshotNames(context);
+      if (!listed.ok) return { pass: false, errors: listed.errors };
+      const names = listed.names;
       const requested = stringArg(context, "snapshot");
       if (requested) {
         if (!names.includes(requested)) {
@@ -1169,15 +1836,32 @@ const checks = {
   },
 };
 
+/** The privileges declaration, exactly the keys @dmc/patch accepts (it parses strictly). */
+const PrivilegesSchema = z.object({
+  commands: z.array(z.object({
+    argv: z.array(z.string()),
+    env: z.record(z.string(), z.string()).optional(),
+  })),
+  helpers: z.array(z.unknown()),
+  remoteCode: z.boolean(),
+  remoteSources: z.array(z.string()).optional(),
+});
+
 /** Model definition: manage a PVE community-scripts LXC with safe updates. */
 export const model = {
   type: "@dmc/proxmox/community-script",
-  version: "2026.09.30.1",
+  version: "2026.11.03.1",
   upgrades: [
     {
       toVersion: "2026.09.30.1",
       description:
         "Add osManaged and packageName (defaulted); sshModel is now required (no default)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.03.1",
+      description:
+        "Add reach (default pct), ctHost and nodeModel; node is needed only with reach pct",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1221,6 +1905,13 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 5,
     },
+    "privileges": {
+      description:
+        "The root commands the update needs (the @dmc/patch privileges contract)",
+      schema: PrivilegesSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
+    },
   },
   checks,
   methods: {
@@ -1241,7 +1932,7 @@ export const model = {
         const ga = requireManage(context.globalArgs);
         context.logger.info("Checking status of container {ctid} on {node}", {
           ctid: ga.ctid,
-          node: ga.node,
+          node: placeOf(ga),
         });
         const health = await checkHealth(ga, context.repoDir);
         const version = await readVersion(ga, context.repoDir);
@@ -1249,7 +1940,7 @@ export const model = {
         const snapshots = await listSnapshots(ga, context.repoDir);
         const handle = await context.writeResource("state", "state", {
           name: ga.appName,
-          node: ga.node,
+          node: placeOf(ga),
           ctid: ga.ctid,
           running: health.running,
           serviceActive: health.serviceActive,
@@ -1269,7 +1960,7 @@ export const model = {
           "Status of container {ctid} on {node}: healthy={healthy} running={running} version={version}",
           {
             ctid: ga.ctid,
-            node: ga.node,
+            node: placeOf(ga),
             healthy: health.healthy,
             running: health.running,
             version,
@@ -1382,6 +2073,11 @@ export const model = {
       }) => {
         const ga = requireManage(context.globalArgs);
         const repoDir = context.repoDir;
+        if (viaSsh(ga)) {
+          throw new Error(
+            "install creates the container with pct on the node; it needs reach pct",
+          );
+        }
         if (!ga.app) {
           throw new Error(
             '`app` global arg is required for install (the community-scripts slug, e.g. "forgejo")',
@@ -1512,7 +2208,7 @@ export const model = {
           {
             app: ga.app,
             ctid: ga.ctid,
-            node: ga.node,
+            node: placeOf(ga),
             healthy: health.healthy,
             version,
           },
@@ -1537,7 +2233,7 @@ export const model = {
         const ga = requireManage(context.globalArgs);
         context.logger.info(
           "Checking for updates to container {ctid} on {node}",
-          { ctid: ga.ctid, node: ga.node },
+          { ctid: ga.ctid, node: placeOf(ga) },
         );
         const version = await readVersion(ga, context.repoDir);
         const upd = await computeUpdate(ga, version, context.repoDir);
@@ -1546,7 +2242,7 @@ export const model = {
           "updateCheck",
           {
             name: ga.appName,
-            node: ga.node,
+            node: placeOf(ga),
             ctid: ga.ctid,
             installedVersion: upd.installedVersion,
             latestVersion: upd.latestVersion,
@@ -1560,7 +2256,7 @@ export const model = {
           "Update check for container {ctid} on {node}: installed={installed} latest={latest} updateAvailable={updateAvailable}",
           {
             ctid: ga.ctid,
-            node: ga.node,
+            node: placeOf(ga),
             installed: upd.installedVersion,
             latest: upd.latestVersion,
             updateAvailable: upd.updateAvailable,
@@ -1598,6 +2294,17 @@ export const model = {
       ) => {
         const ga = requireManage(context.globalArgs);
         const repoDir = context.repoDir;
+        // Fail closed before any probe: reach ssh runs only an exact argv through sudo,
+        // and takes a snapshot only through nodeModel.
+        const wantSnapshot = args.snapshot !== false;
+        const sshUpdate = viaSsh(ga)
+          ? parseUpdateCommand(ga.updateCommand)
+          : null;
+        if (sshUpdate && !sshUpdate.ok) {
+          throw new Error(`safeUpdate refused: ${sshUpdate.error}`);
+        }
+        const snapRefused = wantSnapshot ? snapshotRefusal(ga) : null;
+        if (snapRefused) throw new Error(`safeUpdate refused: ${snapRefused}`);
         const logs: string[] = [];
         const log = (m: string) => {
           logs.push(`[${new Date().toISOString()}] ${m}`);
@@ -1605,7 +2312,7 @@ export const model = {
         };
         context.logger.info(
           "Starting safe update of {appName} (container {ctid} on {node})",
-          { appName: ga.appName, ctid: ga.ctid, node: ga.node },
+          { appName: ga.appName, ctid: ga.ctid, node: placeOf(ga) },
         );
 
         const writeResult = (data: z.infer<typeof UpdateResultSchema>) =>
@@ -1613,7 +2320,9 @@ export const model = {
 
         // 1. Baseline health.
         log(
-          `Checking baseline health of ${ga.appName} (ctid ${ga.ctid} on ${ga.node})`,
+          `Checking baseline health of ${ga.appName} (ctid ${ga.ctid} on ${
+            placeOf(ga)
+          })`,
         );
         const before = await checkHealth(ga, repoDir);
         const beforeVersion = await readVersion(ga, repoDir);
@@ -1625,7 +2334,7 @@ export const model = {
         if (!before.healthy && !args.force) {
           const handle = await writeResult({
             name: ga.appName,
-            node: ga.node,
+            node: placeOf(ga),
             ctid: ga.ctid,
             outcome: "skipped",
             snapshot: null,
@@ -1653,21 +2362,66 @@ export const model = {
           );
         }
 
-        // 2. Snapshot — skipped when the caller passes `snapshot: false` (it
-        //    holds its own snapshot and owns the rollback).
-        const takeSnapshot = args.snapshot !== false;
-        let snap: string | null = null;
-        if (takeSnapshot) {
-          const name = snapshotName();
-          log(`Creating snapshot ${name}`);
-          const snapRes = await nodeExec(
+        // reach ssh: refuse before the snapshot when execve cannot run the update's bin
+        // (no #! line, not ELF) — it would fail under sudo with rc 126 after the snapshot.
+        if (sshUpdate?.ok) {
+          const bin = sshUpdate.argv[0];
+          const probe = await ctExec(
             ga,
             repoDir,
-            `pct snapshot ${ga.ctid} ${name} --description ${
-              shSingleQuote(`swamp safeUpdate pre-update ${ga.appName}`)
-            }`,
-            120,
+            execFormatProbeShell(bin),
+            30,
           );
+          const refused = execFormatRefusal(bin, probe.out);
+          if (refused) {
+            log(`refused: ${refused}`);
+            throw new Error(`safeUpdate refused: ${refused}`);
+          }
+          // Refuse when a URL the update fetches and runs is gone: the community-scripts
+          // helper then exits 0 with no change, and the run would look like "no-change".
+          const script = await ctExec(
+            ga,
+            repoDir,
+            updateScriptProbeShell(bin),
+            30,
+          );
+          const found = updateScriptUrls(bin, script.out);
+          if (!found.ok) {
+            log(`refused: ${found.refusal}`);
+            throw new Error(`safeUpdate refused: ${found.refusal}`);
+          }
+          for (const u of found.skipped) {
+            log(
+              `not checked (it has an expansion the check cannot resolve): ${u}`,
+            );
+          }
+          if (found.urls.length > 0) {
+            const fetched = await ctExec(
+              ga,
+              repoDir,
+              urlFetchShell(found.urls),
+              30 + 25 * found.urls.length,
+            );
+            const refused = updateUrlRefusal(bin, fetched.out, found.urls);
+            if (refused) {
+              log(`refused: ${refused}`);
+              throw new Error(`safeUpdate refused: ${refused}`);
+            }
+            log(`checked: ${found.urls.join(", ")} answer from ctHost`);
+          }
+        }
+
+        // 2. Snapshot — skipped when the caller passes `snapshot: false` (it
+        //    holds its own snapshot and owns the rollback).
+        let snap: string | null = null;
+        if (wantSnapshot) {
+          const name = snapshotName();
+          log(
+            `Creating snapshot ${name}${
+              ga.nodeModel ? ` through ${ga.nodeModel}` : ""
+            }`,
+          );
+          const snapRes = await takeSnapshot(ga, repoDir, name);
           if (snapRes.rc !== 0) {
             context.logger.error(
               "Snapshot {snapshot} of container {ctid} failed (rc {rc})",
@@ -1704,22 +2458,54 @@ export const model = {
         let afterVersion: string | null = beforeVersion;
         let updateError: string | null = null;
         try {
-          // Run through `bash -lc` so env-var prefixes (PHS_SILENT=1) and PATH
-          // resolution work; `pct exec -- <cmd>` alone execs directly, no shell.
-          log(
-            `Running update: pct exec ${ga.ctid} -- bash -lc '${ga.updateCommand}'`,
-          );
-          const updateRes = await nodeExec(
-            ga,
-            repoDir,
-            `pct exec ${ga.ctid} -- bash -lc ${
-              shSingleQuote(ga.updateCommand)
-            }`,
-            ga.updateTimeoutSec,
-          );
+          // reach ssh: the exact argv through sudo -n (no shell, so the sudoers entry
+          // can name it). reach pct: through `bash -lc` so env-var prefixes
+          // (PHS_SILENT=1) and PATH resolution work; `pct exec -- <cmd>` alone execs
+          // directly, no shell.
+          let updateRes: NodeResult;
+          if (sshUpdate?.ok) {
+            log(
+              `Running update over ssh on ${ga.ctHost}: sudo -n ${
+                [
+                  ...Object.entries(sshUpdate.env).map(([k, v]) =>
+                    `env ${k}=${v}`
+                  ),
+                  ...sshUpdate.argv,
+                ].join(" ")
+              }`,
+            );
+            updateRes = await ctExec(
+              ga,
+              repoDir,
+              sudoUpdateShell(sshUpdate),
+              ga.updateTimeoutSec,
+            );
+          } else {
+            log(
+              `Running update: pct exec ${ga.ctid} -- bash -lc '${ga.updateCommand}'`,
+            );
+            updateRes = await nodeExec(
+              ga,
+              repoDir,
+              `pct exec ${ga.ctid} -- bash -lc ${
+                shSingleQuote(ga.updateCommand)
+              }`,
+              ga.updateTimeoutSec,
+            );
+          }
           updateOutput = updateRes.out;
           updateRc = updateRes.rc;
           log(`update command exited rc=${updateRc}`);
+          // A curl error, or the helper saying the app script is gone, means the update
+          // did not run, even at rc 0 (the community-scripts helper then runs an empty
+          // script, or stops with exit 0). Roll back: the update may have stopped part
+          // of the way.
+          const notRun = updateNotRun(updateOutput);
+          if (notRun) {
+            throw new Error(
+              `the update output shows that the update did not run fully: ${notRun}`,
+            );
+          }
 
           log(`Validating health (timeout ${ga.healthTimeoutSec}s)`);
           after = await waitForHealth(ga, repoDir, log);
@@ -1743,19 +2529,14 @@ export const model = {
         if (!updateError && after.healthy && updateRc === 0) {
           if (snap !== null && !args.keepSnapshot) {
             log(`Deleting snapshot ${snap}`);
-            const del = await nodeExec(
-              ga,
-              repoDir,
-              `pct delsnapshot ${ga.ctid} ${snap}`,
-              120,
-            );
+            const del = await deleteSnapshot(ga, repoDir, snap);
             if (del.rc !== 0) {
               log(`warning: could not delete snapshot: ${del.out.slice(-300)}`);
             }
           }
           const handle = await writeResult({
             name: ga.appName,
-            node: ga.node,
+            node: placeOf(ga),
             ctid: ga.ctid,
             outcome: versionChanged ? "updated" : "no-change",
             snapshot: snap !== null && args.keepSnapshot ? snap : null,
@@ -1790,7 +2571,7 @@ export const model = {
           );
           const handle = await writeResult({
             name: ga.appName,
-            node: ga.node,
+            node: placeOf(ga),
             ctid: ga.ctid,
             outcome: "failed",
             snapshot: null,
@@ -1812,7 +2593,9 @@ export const model = {
             { appName: ga.appName, healthy: after.healthy },
           );
           throw new Error(
-            `${ga.appName} update failed validation (healthy=${after.healthy}, update rc=${updateRc}). No snapshot was taken (snapshot=false): the caller owns the snapshot and rollback. [data: ${
+            `${ga.appName} update failed validation (healthy=${after.healthy}, update rc=${updateRc})${
+              updateError ? `: ${updateError.slice(0, 300)}` : ""
+            }. No snapshot was taken (snapshot=false): the caller owns the snapshot and rollback. [data: ${
               (handle as { name?: string })?.name
             }]`,
           );
@@ -1830,7 +2613,7 @@ export const model = {
         );
         const handle = await writeResult({
           name: ga.appName,
-          node: ga.node,
+          node: placeOf(ga),
           ctid: ga.ctid,
           outcome: "rolled-back",
           snapshot: snap,
@@ -1863,10 +2646,59 @@ export const model = {
           { appName: ga.appName, snapshot: snap, healthy: restored.healthy },
         );
         throw new Error(
-          `${ga.appName} update failed validation and was rolled back to snapshot ${snap} (post-rollback healthy=${restored.healthy}). [data: ${
-            (handle as { name?: string })?.name
-          }]`,
+          `${ga.appName} update failed validation and was rolled back to snapshot ${snap} (post-rollback healthy=${restored.healthy})${
+            updateError ? `: ${updateError.slice(0, 300)}` : ""
+          }. [data: ${(handle as { name?: string })?.name}]`,
         );
+      },
+    },
+    privileges: {
+      description:
+        "Declare the root commands the update needs, for @dmc/patch (the privileges({ host }) contract). Read-only: runs nothing on any host. reach ssh: the update as one exact argv run through sudo -n; it fetches and runs community-scripts code from ProxmoxVE and core, so remoteCode is true with both as remoteSources. reach pct: refused, because pct runs every command as root on the node and no sudo grant covers that.",
+      arguments: z.object({
+        host: z.string().optional().describe(
+          "The @dmc/patch machine that asks; when set it must equal ctHost",
+        ),
+      }),
+      execute: async (args: { host?: string }, context: {
+        globalArgs: GlobalArgs;
+        logger: Logger;
+        writeResource: (
+          spec: string,
+          instance: string,
+          data: unknown,
+        ) => Promise<unknown>;
+      }) => {
+        const ga = context.globalArgs;
+        if (!viaSsh(ga)) {
+          throw new Error(
+            "privileges: reach pct runs the update as root through pct on the node, which no sudo grant covers; use reach ssh, or accept it in @dmc/patch with an unsafe.privilegedUpdater record",
+          );
+        }
+        if (!ga.ctHost) {
+          throw new Error("privileges: reach ssh needs ctHost");
+        }
+        if (args.host !== undefined && args.host !== ga.ctHost) {
+          throw new Error(
+            `privileges: asked for host "${args.host}", but this model updates ctHost "${ga.ctHost}"`,
+          );
+        }
+        const u = parseUpdateCommand(ga.updateCommand);
+        if (!u.ok) throw new Error(`privileges: ${u.error}`);
+        const command = Object.keys(u.env).length > 0
+          ? { argv: u.argv, env: u.env }
+          : { argv: u.argv };
+        const handle = await context.writeResource("privileges", "privileges", {
+          commands: [command],
+          helpers: [],
+          remoteCode: true,
+          remoteSources: [...COMMUNITY_SCRIPTS_SOURCES],
+        });
+        context.logger.info(
+          "Declared one sudo command for {host}: {argv}",
+          { host: ga.ctHost, argv: u.argv.join(" ") },
+        );
+        return { dataHandles: [handle] };
       },
     },
     rollback: {
@@ -1889,6 +2721,8 @@ export const model = {
       }) => {
         const ga = requireManage(context.globalArgs);
         const repoDir = context.repoDir;
+        const refusal = snapshotRefusal(ga);
+        if (refusal) throw new Error(`rollback refused: ${refusal}`);
         const logs: string[] = [];
         const log = (m: string) => {
           logs.push(`[${new Date().toISOString()}] ${m}`);
@@ -1896,7 +2730,7 @@ export const model = {
         };
         context.logger.info(
           "Rolling back container {ctid} on {node}",
-          { ctid: ga.ctid, node: ga.node },
+          { ctid: ga.ctid, node: placeOf(ga) },
         );
 
         let target = args.snapshot;
@@ -1935,7 +2769,7 @@ export const model = {
         const rbUpd = await computeUpdate(ga, rbVersion, context.repoDir);
         const handle = await context.writeResource("state", "state", {
           name: ga.appName,
-          node: ga.node,
+          node: placeOf(ga),
           ctid: ga.ctid,
           running: health.running,
           serviceActive: health.serviceActive,

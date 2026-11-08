@@ -1,9 +1,11 @@
 import { z } from "npm:zod@4";
 import {
   authHeaders,
+  dropRemovedAuthArgs,
   fetchWithCurl,
   hasUnresolvedAuth,
   resolveAuth,
+  tlsOptions,
   waitForTask,
 } from "./lib/proxmox.ts";
 
@@ -14,22 +16,16 @@ const GlobalArgs = z.object({
   node: z.string().describe("Proxmox node name"),
   storage: z.string().describe("Storage name to download into (e.g., local)"),
   skipTlsVerify: z.boolean().default(true).describe(
-    "Skip TLS certificate verification",
+    "Skip TLS certificate verification (curl -k). Ignored when caCert is set.",
+  ),
+  caCert: z.string().optional().describe(
+    "PEM CA certificate(s) that sign a self-signed API certificate (for a cluster, /etc/pve/pve-root-ca.pem). When set, every API call checks the certificate and host name with curl --cacert, and skipTlsVerify has no effect. Linux curl then trusts this CA only; the macOS system curl also keeps trusting the system roots. Not needed when the API has a publicly trusted certificate: set skipTlsVerify false instead.",
   ),
   tokenId: z.string().optional().describe(
-    "Proxmox API token id, user@realm!tokenname (preferred auth; used with tokenSecret)",
+    "Proxmox API token id, user@realm!tokenname (used with tokenSecret; the only auth)",
   ),
   tokenSecret: z.string().optional().describe("Proxmox API token secret")
     .meta({ sensitive: true }),
-  ticket: z.string().optional().describe("Auth ticket from proxmox-node").meta(
-    { sensitive: true },
-  ),
-  csrfToken: z.string().optional().describe("CSRF token from proxmox-node")
-    .meta({ sensitive: true }),
-  username: z.string().optional().describe("Proxmox username (fallback auth)"),
-  password: z.string().optional().describe("Proxmox password (fallback auth)")
-    .meta({ sensitive: true }),
-  realm: z.string().default("pam").describe("Authentication realm"),
 });
 
 const ImageSchema = z.object({
@@ -44,7 +40,7 @@ const ImageSchema = z.object({
 /** Proxmox storage model — downloads cloud images server-side via the Proxmox download-url API. */
 export const model = {
   type: "@dmc/proxmox/storage",
-  version: "2026.10.25.1",
+  version: "2026.11.07.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -57,6 +53,12 @@ export const model = {
       description:
         "Add optional tokenId/tokenSecret global args (API-token auth)",
       upgradeAttributes: (old) => old,
+    },
+    {
+      toVersion: "2026.11.07.1",
+      description:
+        "Breaking: API tokens are the only auth. The upgrade drops the ticket, csrfToken, username, password and realm global args; a definition that used them needs tokenId and tokenSecret. Additive: optional caCert global arg (verify a self-signed API certificate)",
+      upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
   resources: {
@@ -75,18 +77,17 @@ export const model = {
       labels: ["live"],
       appliesTo: ["downloadImage"],
       execute: async (context) => {
-        const { apiUrl, node, storage, skipTlsVerify } = context.globalArgs;
+        const { apiUrl, node, storage } = context.globalArgs;
+        const tls = tlsOptions(context.globalArgs);
         if (hasUnresolvedAuth(context.globalArgs)) return { pass: true };
-        const auth = await resolveAuth(context.globalArgs, context, {
-          modelType: "@dmc/proxmox/storage",
-        });
+        const auth = await resolveAuth(context.globalArgs);
 
         const response = await fetchWithCurl(
           `${apiUrl}/api2/json/nodes/${node}/storage/${storage}/status`,
           {
             method: "GET",
             headers: authHeaders(auth),
-            skipTlsVerify,
+            tls,
           },
         );
         if (response.status === 401 || response.status === 403) {
@@ -136,7 +137,8 @@ export const model = {
         ),
       }),
       execute: async (args, context) => {
-        const { apiUrl, node, storage, skipTlsVerify } = context.globalArgs;
+        const { apiUrl, node, storage } = context.globalArgs;
+        const tls = tlsOptions(context.globalArgs);
         const { url, filename, checksum, checksumAlgorithm } = args;
         const logs = [];
         const log = (msg) => logs.push(msg);
@@ -146,15 +148,13 @@ export const model = {
           { filename, storage, node },
         );
         log(`Authenticating with Proxmox at ${apiUrl}`);
-        const auth = await resolveAuth(context.globalArgs, context, {
-          modelType: "@dmc/proxmox/storage",
-        });
+        const auth = await resolveAuth(context.globalArgs);
         const headers = authHeaders(auth);
 
         log(`Checking if "${filename}" already exists in storage "${storage}"`);
         const existingResp = await fetchWithCurl(
           `${apiUrl}/api2/json/nodes/${node}/storage/${storage}/content`,
-          { method: "GET", headers, skipTlsVerify },
+          { method: "GET", headers, tls },
         );
         if (!existingResp.ok) {
           throw new Error(
@@ -203,7 +203,7 @@ export const model = {
               "Content-Type": "application/x-www-form-urlencoded",
             },
             body: params.toString(),
-            skipTlsVerify,
+            tls,
           },
         );
 
@@ -225,7 +225,7 @@ export const model = {
           node,
           upid,
           auth,
-          skipTlsVerify,
+          tls,
         );
         // A concurrent download of the same file races this check-then-download —
         // Proxmox reports task failure with this message rather than succeeding idempotently.
@@ -246,7 +246,7 @@ export const model = {
         // Proxmox's property-string parser rejects (duplicate "file" key error).
         const contentResp = await fetchWithCurl(
           `${apiUrl}/api2/json/nodes/${node}/storage/${storage}/content`,
-          { method: "GET", headers, skipTlsVerify },
+          { method: "GET", headers, tls },
         );
         if (!contentResp.ok) {
           throw new Error(
