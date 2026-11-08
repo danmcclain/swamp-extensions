@@ -18,6 +18,12 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1";
 import { createModelTestContext } from "jsr:@systeminit/swamp-testing@0.20260604.20";
+import { authorizedKeysLine, PATHS } from "./lib/access_artifacts.ts";
+import {
+  PRIV_COMMANDS,
+  runtimeCommand,
+  shellPaths,
+} from "./lib/access_sudoers.ts";
 
 const FAKE_SWAMP = new URL("./testdata/fake_swamp.sh", import.meta.url)
   .pathname;
@@ -110,6 +116,26 @@ interface ModelDatum {
 
 const TEST_MODEL_TYPE = { normalized: "@dmc/patch/fleet" };
 const TEST_MODEL_ID = "11111111-2222-3333-4444-555555555555";
+
+/** `unsafe` of a CT that is reached through pct: a valid unsafe.pctExec record. */
+const PCT_OK = {
+  pctExec: {
+    reason: "Legacy CT without sshd, reviewed by ops",
+    acceptedBy: "dmc",
+    acceptedAt: "2026-10-29",
+    reviewBy: "2027-04-29",
+  },
+};
+
+/** `unsafe` of a machine with privileged health checks: a valid unsafe.privilegedHealth record. */
+const PRIV_HEALTH_OK = {
+  privilegedHealth: {
+    reason: "Health probe needs root, reviewed by ops",
+    acceptedBy: "dmc",
+    acceptedAt: "2026-10-29",
+    reviewBy: "2027-04-29",
+  },
+};
 
 /**
  * A stub `definitionRepository`. `findByNameGlobal` answers from FAKE_SWAMP_MODEL_GET
@@ -387,7 +413,7 @@ function snapDatum(
 const IMAGE = {
   host: "dock1",
   ref: "nginx:1",
-  imageId: "sha256:0123456789abcdef0123456789abcdef",
+  imageId: `sha256:${"0123456789abcdef".repeat(4)}`,
   replacedBy: "sha256:fedcba9876543210",
   service: "web",
   reason: "safeUpdate",
@@ -445,6 +471,7 @@ Deno.test("schema: command health check defaults (timeoutSec 30)", () => {
   assertEquals(m.health[0], {
     type: "command",
     run: "test -f /ok",
+    privileged: false,
     timeoutSec: 30,
   });
 });
@@ -498,6 +525,16 @@ Deno.test("schema: health checks reject bad fields", () => {
   assertThrows(() =>
     parseMachine({ host: "h", health: [{ type: "service", name: "" }] })
   );
+  // The name goes into a shell command: only unit and service name characters.
+  for (const name of ["nginx; reboot", "a b", "$(id)", "x'y"]) {
+    assertThrows(() =>
+      parseMachine({ host: "h", health: [{ type: "service", name }] })
+    );
+  }
+  parseMachine({
+    host: "h",
+    health: [{ type: "service", name: "getty@tty1.service" }],
+  });
   assertThrows(() =>
     parseMachine({ host: "h", health: [{ type: "command", run: "" }] })
   );
@@ -1086,6 +1123,93 @@ Deno.test("runScript: a failed call recovers fresh runResult records of the requ
   );
 });
 
+Deno.test("runScriptOutcome: a record's stderr is kept, and a record without one gets none", async () => {
+  const s = stubSwamp([{
+    ok: false,
+    error: "script failed on 1/2 host(s): a (exit 255)",
+    artifacts: [
+      {
+        host: "a",
+        stdout: "",
+        exitCode: 255,
+        stderr: "u@a: Permission denied (publickey).\r\n",
+      },
+      { host: "b", stdout: "ok", exitCode: 0 },
+    ],
+  }]);
+  const res = await fleet.runScriptOutcome("ssh", ["a", "b"], "true", 5, s.api);
+  assertEquals(res.runs, [
+    {
+      host: "a",
+      stdout: "",
+      exitCode: 255,
+      stderr: "u@a: Permission denied (publickey).\r\n",
+    },
+    { host: "b", stdout: "ok", exitCode: 0 },
+  ]);
+});
+
+Deno.test("probeOutcome: a failed probe's error names ssh's stderr, after the stdout tail", () => {
+  const kind = "patch-access-user-probe";
+  // ssh refused the key: nothing on stdout, the reason only on stderr.
+  assertEquals(
+    fleet.probeOutcome(kind, {
+      host: "a",
+      stdout: "",
+      exitCode: 255,
+      stderr: "u@a: Permission denied (publickey).\r\n",
+    }),
+    {
+      probe: null,
+      error: "exit 255: stderr: u@a: Permission denied (publickey).",
+    },
+  );
+  // Both streams: stdout first, then stderr.
+  assertEquals(
+    fleet.probeOutcome(kind, {
+      host: "a",
+      stdout: "partial\n",
+      exitCode: 1,
+      stderr: "boom\n",
+    }),
+    { probe: null, error: "exit 1: partial; stderr: boom" },
+  );
+  // No stderr, or only whitespace: the error is as before.
+  assertEquals(
+    fleet.probeOutcome(kind, { host: "a", stdout: "partial", exitCode: 1 }),
+    { probe: null, error: "exit 1: partial" },
+  );
+  assertEquals(
+    fleet.probeOutcome(kind, {
+      host: "a",
+      stdout: "",
+      exitCode: 255,
+      stderr: " \r\n",
+    }),
+    { probe: null, error: "exit 255: " },
+  );
+  // A long stderr keeps only its last 300 characters.
+  const long = fleet.probeOutcome(kind, {
+    host: "a",
+    stdout: "",
+    exitCode: 255,
+    stderr: "x".repeat(400) + "END",
+  });
+  assertEquals(long.probe, null);
+  assertStringIncludes(String(long.error), "END");
+  assert(String(long.error).length < 340);
+  // A good probe line still wins over stderr.
+  assertEquals(
+    fleet.probeOutcome(kind, {
+      host: "a",
+      stdout: `{"_kind":"${kind}","x":1}\n`,
+      exitCode: 0,
+      stderr: "warning\n",
+    }),
+    { probe: { _kind: kind, x: 1 }, error: null },
+  );
+});
+
 Deno.test("runScript through runModel: a partial failure keeps the hosts the ssh model recorded", async () => {
   // The fake prints both hosts and exits 1, like @swamp/ssh when one host fails. The
   // adapter stores them as runResult records and returns no handles, like runModel.
@@ -1239,6 +1363,9 @@ Deno.test("evalHealth: service and command checks run in ONE batch on the machin
     assertStringIncludes(all[0], 'hosts:json=["a"]');
     // Timeout = the command's timeoutSec + 30 per service check.
     assertStringIncludes(all[0], "timeoutSec:json=35");
+    // OpenRC is read with rc-status (no root), never rc-service <name> status.
+    assertStringIncludes(all[0], "rc-status -a -f ini");
+    assertEquals(all[0].includes("rc-service"), false);
   });
   await withFake({ FAKE_SWAMP_HC: hcOut("a", 1, 1) }, async () => {
     const res = await fleet.evalHealth({ host: "a" }, [
@@ -1277,7 +1404,7 @@ Deno.test("evalHealth: each check gets its own rc, and a missing marker is 'no r
 Deno.test("evalHealth: a CT's checks run through pct exec on its node, in one call", async () => {
   await withCallLog({ FAKE_SWAMP_HC: hcOut("pve", 0, 3) }, async (calls) => {
     const res = await fleet.evalHealth(
-      { host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } },
+      { host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 }, unsafe: PCT_OK },
       [
         { type: "service", name: "caddy" },
         { type: "command", run: "exit 3", timeoutSec: 5 },
@@ -1385,6 +1512,7 @@ Deno.test("scan: skips machines with os=false and writes nothing", async () => {
 
 Deno.test("scan: a reachable host writes an inventory record with reachMethod ssh", async () => {
   await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
     FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout()),
   }, async () => {
     const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
@@ -1404,6 +1532,7 @@ Deno.test("scan: evaluates the machine's health checks into the record", async (
   const server = startServer(() => 200);
   try {
     await withFake({
+      FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
       FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout()),
     }, async () => {
       const t = mkCtx({
@@ -1426,6 +1555,7 @@ Deno.test("scan: evaluates the machine's health checks into the record", async (
 
 Deno.test("scan: a host without inventory output gets an error record", async () => {
   await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
     FAKE_SWAMP_SCRIPT_1: scriptOut("web1", "no json here\n", 1),
   }, async () => {
     const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
@@ -1440,7 +1570,10 @@ Deno.test("scan: a host without inventory output gets an error record", async ()
 });
 
 Deno.test("scan: an ssh transport failure is recorded per host, not thrown", async () => {
-  await withFake({ FAKE_SWAMP_SCRIPT_1: "not json" }, async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: "not json",
+  }, async () => {
     const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
     await model.methods.scan.execute({}, t.ctx);
     assertEquals(t.one("inventory").error, "ssh: ssh script failed: not json");
@@ -1454,6 +1587,7 @@ function ctSection(ctid: number, stdout: string, rc = 0): string {
 
 Deno.test("scan: a reach=pct CT is scanned on its node and recorded as pct", async () => {
   await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "pve" }]),
     FAKE_SWAMP_PCT: scriptOut(
       "pve",
       ctSection(200, collectorStdout({ hostname: "ct1" })),
@@ -1465,6 +1599,7 @@ Deno.test("scan: a reach=pct CT is scanned on its node and recorded as pct", asy
         host: "ct1",
         reach: "pct",
         ct: { proxmoxNode: "pve", ctid: 200 },
+        unsafe: PCT_OK,
       }],
     });
     await model.methods.scan.execute({}, t.ctx);
@@ -1479,41 +1614,32 @@ Deno.test("scan: a reach=pct CT is scanned on its node and recorded as pct", asy
   });
 });
 
-Deno.test("scan: a CT falls back to pct when ssh gives no inventory, and reports both errors when pct fails too", async () => {
-  // ssh answers with no marker; the node answers with no section for the CT.
-  await withFake({
+Deno.test("scan: a CT without an unsafe.pctExec record is never reached through pct, even when ssh gives no inventory", async () => {
+  // ssh answers with no marker. The node would answer with a section for the CT, but
+  // there is no fallback to pct: the node is not called at all.
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "ct1" }]),
     FAKE_SWAMP_SCRIPT_1: scriptOut("ct1", "nothing\n", 0),
-    FAKE_SWAMP_PCT: scriptOut("pve", "nothing\n", 0),
-  }, async () => {
+    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, collectorStdout({ hostname: "ct1" }))),
+  }, async (calls) => {
     const t = mkCtx({
       sshModel: "ssh",
       machines: [{ host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } }],
     });
     await model.methods.scan.execute({}, t.ctx);
-    assertEquals(
-      t.one("inventory").error,
-      "no inventory (exit 0); pct: no inventory",
-    );
-  });
-  // A section without the marker line reports the CT's exit code.
-  await withFake({
-    FAKE_SWAMP_SCRIPT_1: scriptOut("ct1", "nothing\n", 0),
-    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, "boom", 7)),
-  }, async () => {
-    const t = mkCtx({
-      sshModel: "ssh",
-      machines: [{ host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } }],
-    });
-    await model.methods.scan.execute({}, t.ctx);
-    assertEquals(
-      t.one("inventory").error,
-      "no inventory (exit 0); pct: no inventory (exit 7)",
-    );
+    const inv = t.one("inventory");
+    assertEquals(inv.error, "no inventory (exit 0)");
+    assertEquals(inv.reachMethod, null);
+    assertEquals(inv.acceptedRisksUsed, []);
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], 'hosts:json=["ct1"]');
   });
 });
 
 Deno.test("scan: the scanned hosts keep their own record each", async () => {
   await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "a" }, { name: "c" }]),
     FAKE_SWAMP_SCRIPT_1: scriptOut("a", collectorStdout({ hostname: "a" })),
   }, async () => {
     const t = mkCtx({
@@ -1530,6 +1656,7 @@ Deno.test("scan: the scanned hosts keep their own record each", async () => {
 
 Deno.test("scan: ONE ssh script call collects every ssh host", async () => {
   await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "a" }, { name: "b" }, { name: "c" }]),
     FAKE_SWAMP_SCRIPT_1: JSON.stringify({
       dataArtifacts: [
         { attributes: { host: "a", stdout: collectorStdout({ hostname: "a" }), exitCode: 0 } },
@@ -1558,6 +1685,7 @@ Deno.test("scan: ONE ssh script call collects every ssh host", async () => {
 
 Deno.test("scan: a partial ssh failure keeps the hosts that ran (recovered from runResult records)", async () => {
   await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "a" }, { name: "b" }, { name: "c" }]),
     FAKE_SWAMP_SCRIPT_1: JSON.stringify({
       dataArtifacts: [
         { attributes: { host: "a", stdout: collectorStdout({ hostname: "a" }), exitCode: 0 } },
@@ -1621,14 +1749,32 @@ function twoNodePct(): string {
 const PCT_FLEET = {
   sshModel: "ssh",
   machines: [
-    { host: "ct1", reach: "pct", ct: { proxmoxNode: "pve", ctid: 200 } },
-    { host: "ct2", reach: "pct", ct: { proxmoxNode: "pve", ctid: 201 } },
-    { host: "ct3", reach: "pct", ct: { proxmoxNode: "pve2", ctid: 300 } },
+    {
+      host: "ct1",
+      reach: "pct",
+      ct: { proxmoxNode: "pve", ctid: 200 },
+      unsafe: PCT_OK,
+    },
+    {
+      host: "ct2",
+      reach: "pct",
+      ct: { proxmoxNode: "pve", ctid: 201 },
+      unsafe: PCT_OK,
+    },
+    {
+      host: "ct3",
+      reach: "pct",
+      ct: { proxmoxNode: "pve2", ctid: 300 },
+      unsafe: PCT_OK,
+    },
   ],
 };
 
 Deno.test("scan: the pct path is grouped per node: one call per node, sections parsed per CT", async () => {
-  await withFake({ FAKE_SWAMP_PCT: twoNodePct() }, async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "pve" }, { name: "pve2" }]),
+    FAKE_SWAMP_PCT: twoNodePct(),
+  }, async () => {
     const t = mkCtx(PCT_FLEET);
     await model.methods.scan.execute({}, t.ctx);
     assertEquals(t.calls.length, 2);
@@ -1653,6 +1799,7 @@ Deno.test("scan: the pct path is grouped per node: one call per node, sections p
 
 Deno.test("scan: a failing node does not affect the other node or the ssh hosts", async () => {
   await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "pve" }, { name: "pve2" }, { name: "web1" }]),
     FAKE_SWAMP_PCT: twoNodePct(),
     FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({ hostname: "web1" })),
   }, async () => {
@@ -1688,17 +1835,34 @@ Deno.test("scan: call budget for 10 machines (3 CTs on 2 nodes, 4 app sources, s
       health,
       ...(i < 3 ? { source: { type: "community-script", model: `app-${host}` } } : {}),
     })),
-    { host: "ct1", reach: "pct", ct: { proxmoxNode: "pve", ctid: 200 }, health },
-    { host: "ct2", reach: "pct", ct: { proxmoxNode: "pve", ctid: 201 }, health },
+    {
+      host: "ct1",
+      reach: "pct",
+      ct: { proxmoxNode: "pve", ctid: 200 },
+      health,
+      unsafe: PCT_OK,
+    },
+    {
+      host: "ct2",
+      reach: "pct",
+      ct: { proxmoxNode: "pve", ctid: 201 },
+      health,
+      unsafe: PCT_OK,
+    },
     {
       host: "ct3",
       reach: "pct",
       ct: { proxmoxNode: "pve2", ctid: 300 },
       source: { type: "community-script", model: "app-ct3" },
       health,
+      unsafe: PCT_OK,
     },
   ];
   await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition(
+      "ops",
+      ["h1", "h2", "h3", "h4", "h5", "h6", "h7", "pve", "pve2"].map((name) => ({ name })),
+    ),
     FAKE_SWAMP_SCRIPT_1: scriptOut("h1", collectorStdout({ hostname: "h1" })),
     FAKE_SWAMP_PCT: twoNodePct(),
     FAKE_SWAMP_HC: hcOut("h1", 0),
@@ -1724,6 +1888,7 @@ Deno.test("scan: call budget for 10 machines (3 CTs on 2 nodes, 4 app sources, s
 Deno.test("scan: when swamp's model-call cap is reached, ONE warn names the cap and the machine count", async () => {
   const health = [{ type: "service", name: "sshd" }];
   await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "a" }, { name: "b" }, { name: "c" }]),
     FAKE_SWAMP_SCRIPT_1: scriptOut("a", collectorStdout({ hostname: "a" })),
     FAKE_SWAMP_HC: hcOut("a", 0),
   }, async () => {
@@ -1809,9 +1974,13 @@ Deno.test("import: seeds a machines block from the ssh host list and Proxmox gue
       yaml,
       "    vm:   # Proxmox VM — snapshot before OS update\n      proxmoxNode: pve\n      vmid: 100",
     );
-    // ct1 is discovered only via Proxmox: a CT with pct reach.
+    // ct1 is discovered only via Proxmox: a CT located by its ct block, reached over ssh.
     assertStringIncludes(yaml, "  - host: ct1   # CT 200, no ip — agent off?");
-    assertStringIncludes(yaml, "    reach: pct");
+    assertEquals(yaml.includes("reach: pct"), false);
+    assertStringIncludes(
+      yaml,
+      "# reached over ssh; to use pct instead add unsafe.pctExec (reason, acceptedBy, acceptedAt, reviewBy)",
+    );
     assertStringIncludes(yaml, "      ctid: 200");
     // Only guests with an ip get an ssh host suggestion.
     assertStringIncludes(yaml, "#     - name: ct2\n#       address: 192.0.2.9");
@@ -1873,10 +2042,10 @@ Deno.test("safeUpdate: rejects a machine without a docker decoration", async () 
 });
 
 Deno.test("safeUpdate: no running containers is a skipped run", async () => {
-  await withFake({ FAKE_SWAMP_PS: execOut("") }, async () => {
+  await withFake({ FAKE_SWAMP_PS: execOut(""), FAKE_SWAMP_INSPECT_1: execOut("") }, async () => {
     const t = mkCtx({
       sshModel: "ssh",
-      machines: [{ host: "dock1", docker: { service: "web" } }],
+      machines: [{ host: "dock1", docker: { composePath: "/srv/app", service: "web" } }],
     });
     await model.methods.safeUpdate.execute(
       model.methods.safeUpdate.arguments.parse({ host: "dock1" }),
@@ -1910,8 +2079,8 @@ Deno.test("safeUpdate: a changed image is diffed, recorded and retained as a rol
   try {
     await withFake({
       FAKE_SWAMP_PS: execOut("abc123\n"),
-      FAKE_SWAMP_INSPECT_1: execOut("nginx:1|sha256:aaaaaaaaaaaaaaaaaaaaaaaa\n"),
-      FAKE_SWAMP_INSPECT_2: execOut("nginx:1|sha256:bbbbbbbbbbbbbbbbbbbbbbbb\n"),
+      FAKE_SWAMP_INSPECT_1: execOut("abc123def456|nginx:1|sha256:aaaaaaaaaaaaaaaaaaaaaaaa|running|none\n"),
+      FAKE_SWAMP_INSPECT_2: execOut("abc123def456|nginx:1|sha256:bbbbbbbbbbbbbbbbbbbbbbbb|running|none\n"),
       FAKE_SWAMP_EXEC: execOut(""),
     }, async () => {
       const t = mkCtx({
@@ -1967,8 +2136,8 @@ Deno.test("safeUpdate: an unchanged image is no-change and retains nothing", asy
   try {
     await withFake({
       FAKE_SWAMP_PS: execOut("abc123\n"),
-      FAKE_SWAMP_INSPECT_1: execOut("nginx:1|sha256:same\n"),
-      FAKE_SWAMP_INSPECT_2: execOut("nginx:1|sha256:same\n"),
+      FAKE_SWAMP_INSPECT_1: execOut("abc123def456|nginx:1|sha256:same|running|none\n"),
+      FAKE_SWAMP_INSPECT_2: execOut("abc123def456|nginx:1|sha256:same|running|none\n"),
       FAKE_SWAMP_EXEC: execOut(""),
     }, async () => {
       const t = mkCtx({
@@ -1994,8 +2163,8 @@ Deno.test("safeUpdate: an unhealthy service is rolled back; without rollback it 
   try {
     const env = {
       FAKE_SWAMP_PS: execOut("abc123\n"),
-      FAKE_SWAMP_INSPECT_1: execOut("nginx:1|sha256:old\n"),
-      FAKE_SWAMP_INSPECT_2: execOut("nginx:1|sha256:new\n"),
+      FAKE_SWAMP_INSPECT_1: execOut("abc123def456|nginx:1|sha256:1111111111111111111111111111111111111111111111111111111111111111|running|none\n"),
+      FAKE_SWAMP_INSPECT_2: execOut("abc123def456|nginx:1|sha256:2222222222222222222222222222222222222222222222222222222222222222|running|none\n"),
       FAKE_SWAMP_EXEC: execOut(""),
     };
     await withFake(env, async () => {
@@ -2313,6 +2482,7 @@ function ctAppFleet(healthUrl: string) {
       ct: { proxmoxNode: "pve", ctid: 200 },
       source: { type: "community-script", model: "app1" },
       health: [{ type: "http", label: "app", url: healthUrl }],
+      unsafe: PCT_OK,
     }],
   };
 }
@@ -2753,11 +2923,15 @@ Deno.test("reboot: a needed reboot runs over ssh; wait=false finishes as reboote
   });
 });
 
-Deno.test("reboot: force reboots when needsReboot is unknown, and a CT goes through pct", async () => {
+Deno.test("reboot: force reboots when needsReboot is unknown, and a CT with an unsafe.pctExec record goes through pct", async () => {
   await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
     const t = mkCtx({
       sshModel: "ssh",
-      machines: [{ host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } }],
+      machines: [{
+        host: "ct1",
+        ct: { proxmoxNode: "pve", ctid: 200 },
+        unsafe: PCT_OK,
+      }],
     });
     await model.methods.reboot.execute(
       model.methods.reboot.arguments.parse({
@@ -2772,6 +2946,35 @@ Deno.test("reboot: force reboots when needsReboot is unknown, and a CT goes thro
     assertEquals(reboot.outcome, "rebooted");
     assertEquals(reboot.neededReboot, null);
     assertStringIncludes(String(reboot.logs), "pct reboot 200 on pve");
+  });
+});
+
+Deno.test("reboot: a CT without an unsafe.pctExec record reboots like a VM: systemd-run over ssh to the CT, never pct on its node", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } }],
+    });
+    await model.methods.reboot.execute(
+      model.methods.reboot.arguments.parse({
+        host: "ct1",
+        force: true,
+        wait: false,
+      }),
+      t.ctx,
+    );
+    const reboot = t.one("reboot");
+    assertEquals(reboot.via, "ssh");
+    assertEquals(reboot.outcome, "rebooted");
+    assertStringIncludes(String(reboot.logs), "scheduling systemctl reboot");
+    const execs = t.calls.filter((c) => c.method === "exec");
+    assertEquals(execs.length, 1);
+    const input = execs[0].arguments as { hosts?: string[]; command?: string };
+    assertEquals(input.hosts, ["ct1"]);
+    assertStringIncludes(String(input.command), "systemd-run");
+    assert(!String(input.command).includes("pct "), String(input.command));
+    // A reboot that does not wait runs no health checks: no accepted risk is used.
+    assertEquals(t.one("run").acceptedRisksUsed, []);
   });
 });
 
@@ -2894,7 +3097,10 @@ Deno.test("rollback: a named snapshot is used, a CT goes through pct, and failur
       t.ctx,
     );
     assertEquals(t.one("run").snapshot, "first");
-    const ct = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, { data });
+    const ct = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "web1", unsafe: PCT_OK }],
+    }, { data });
     await model.methods.rollback.execute(
       model.methods.rollback.arguments.parse({ host: "web1" }),
       ct.ctx,
@@ -2903,7 +3109,10 @@ Deno.test("rollback: a named snapshot is used, a CT goes through pct, and failur
     assertEquals(ct.one("run").outcome, "rolled-back");
   });
   await withFake({ FAKE_SWAMP_EXEC: execOut("", 1) }, async () => {
-    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, { data });
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "web1", unsafe: PCT_OK }],
+    }, { data });
     await model.methods.rollback.execute(
       model.methods.rollback.arguments.parse({ host: "web1" }),
       t.ctx,
@@ -2921,9 +3130,118 @@ Deno.test("rollback: a named snapshot is used, a CT goes through pct, and failur
   });
 });
 
+Deno.test("rollback: a machine that is still booting gets the health grace window", async () => {
+  // The restored machine answers 503 twice (services still starting), then 200.
+  const data = {
+    snapshot: [
+      snapDatum("snap-web1-1", {
+        name: "first",
+        createdAt: "2026-01-01T00:00:00Z",
+      }),
+    ],
+  };
+  const booting = startServer((n) => (n <= 2 ? 503 : 200));
+  try {
+    await withFastPolling(async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          health: [{ type: "http", url: booting.url }],
+        }],
+      }, { data });
+      await model.methods.rollback.execute(
+        model.methods.rollback.arguments.parse({
+          host: "web1",
+          healthGraceSec: 30,
+        }),
+        t.ctx,
+      );
+      assertEquals(t.one("run").outcome, "rolled-back");
+      assertEquals(booting.requests(), 3);
+    });
+  } finally {
+    await booting.stop();
+  }
+  // With no grace window the same machine reads unhealthy after one check.
+  const once = startServer((n) => (n <= 2 ? 503 : 200));
+  try {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "web1", health: [{ type: "http", url: once.url }] }],
+    }, { data });
+    await model.methods.rollback.execute(
+      model.methods.rollback.arguments.parse({
+        host: "web1",
+        healthGraceSec: 0,
+      }),
+      t.ctx,
+    );
+    assertEquals(t.one("run").outcome, "unhealthy");
+    assertEquals(once.requests(), 1);
+  } finally {
+    await once.stop();
+  }
+  // A machine that never recovers is still reported unhealthy after the window.
+  const down = startServer(() => 503);
+  try {
+    await withFastPolling(async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{ host: "web1", health: [{ type: "http", url: down.url }] }],
+      }, { data });
+      await model.methods.rollback.execute(
+        model.methods.rollback.arguments.parse({
+          host: "web1",
+          healthGraceSec: 1,
+        }),
+        t.ctx,
+      );
+      assertEquals(t.one("run").outcome, "unhealthy");
+      assertEquals(down.requests() > 1, true);
+    });
+  } finally {
+    await down.stop();
+  }
+});
+
+Deno.test("rollback: a pct snapshot is refused without the machine's unsafe.pctExec record, before any call", async () => {
+  const data = {
+    snapshot: [
+      snapDatum("snap-web1-2", {
+        name: "ct-snap",
+        kind: "ct",
+        vmid: 200,
+        createdAt: "2026-02-01T00:00:00Z",
+      }),
+    ],
+  };
+  await withCallLog({ FAKE_SWAMP_EXEC: execOut("", 0) }, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, { data });
+    const err = await assertRejects(() =>
+      model.methods.rollback.execute(
+        model.methods.rollback.arguments.parse({ host: "web1" }),
+        t.ctx,
+      )
+    );
+    assertStringIncludes((err as Error).message, "rollback of web1 refused");
+    assertStringIncludes((err as Error).message, "unsafe.pctExec");
+    assertEquals(await calls(), []);
+    assertEquals(t.written("run").length, 0);
+  });
+});
+
 // --- pruneSnapshots (snapshot retention / prune selection) -------------------
 
 const FLEET = { sshModel: "ssh", machines: [{ host: "web1" }] };
+// The fleet of the pruneImages tests: the images belong to two docker hosts, each with a compose project.
+const PRUNE_FLEET = {
+  sshModel: "ssh",
+  machines: [
+    { host: "dock1", docker: { composePath: "/srv/app", service: "web" } },
+    { host: "dock2", docker: { composePath: "/srv/redis" } },
+  ],
+};
 const HEALTHY_NOW = scriptOut("web1", collectorStdout({ needsReboot: false }));
 
 Deno.test("pruneSnapshots: keeps snapshots that are unconfirmed, reboot-pending or still retained", async () => {
@@ -3003,7 +3321,10 @@ Deno.test("pruneSnapshots: a CT snapshot is deleted with pct over the node host"
     FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW,
     FAKE_SWAMP_EXEC: execOut("", 0),
   }, async () => {
-    const t = mkCtx(FLEET, {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "web1", unsafe: PCT_OK }],
+    }, {
       data: { snapshot: [snapDatum("s-ct", { kind: "ct", vmid: 200 })] },
     });
     await model.methods.pruneSnapshots.execute(
@@ -3015,6 +3336,27 @@ Deno.test("pruneSnapshots: a CT snapshot is deleted with pct over the node host"
   });
 });
 
+Deno.test("pruneSnapshots: a CT snapshot is kept, and pct is not run, without the machine's unsafe.pctExec record", async () => {
+  await withCallLog({
+    FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW,
+    FAKE_SWAMP_EXEC: execOut("", 0),
+  }, async (calls) => {
+    const t = mkCtx(FLEET, {
+      data: { snapshot: [snapDatum("s-ct", { kind: "ct", vmid: 200 })] },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({}),
+      t.ctx,
+    );
+    assertEquals(t.one("prune").pruned, []);
+    const kept = t.one("prune").kept as Array<{ reason: string }>;
+    assertEquals(kept.length, 1);
+    assertStringIncludes(kept[0].reason, "unsafe.pctExec");
+    assertEquals((await calls()).filter((c) => c.includes("pct delsnapshot")), []);
+    assertEquals(t.written("snapshot").length, 0);
+  });
+});
+
 Deno.test("pruneSnapshots: the live gate of a CT scans it with pct on its node, not ssh to the CT", async () => {
   await withCallLog({
     FAKE_SWAMP_SCRIPT_1: scriptOut("node1", collectorStdout({ needsReboot: false })),
@@ -3022,7 +3364,11 @@ Deno.test("pruneSnapshots: the live gate of a CT scans it with pct on its node, 
   }, async (calls) => {
     const fleetCt = {
       sshModel: "ssh",
-      machines: [{ host: "ct1", ct: { proxmoxNode: "node1", ctid: 200 } }],
+      machines: [{
+        host: "ct1",
+        ct: { proxmoxNode: "node1", ctid: 200 },
+        unsafe: PCT_OK,
+      }],
     };
     const t = mkCtx(fleetCt, {
       data: {
@@ -3142,7 +3488,7 @@ function imageDatum(
 }
 
 Deno.test("pruneImages: keeps images still inside their retention window or already pruned", async () => {
-  const t = mkCtx(FLEET, {
+  const t = mkCtx(PRUNE_FLEET, {
     data: {
       image: [
         imageDatum("i-a", { retainUntil: "2999-01-01T00:00:00.000Z" }),
@@ -3168,7 +3514,7 @@ Deno.test("pruneImages: keeps images still inside their retention window or alre
 
 Deno.test("pruneImages: an unreachable host keeps its images", async () => {
   await withFake({ FAKE_SWAMP_EXEC: "", FAKE_SWAMP_EXEC_RC: "1" }, async () => {
-    const t = mkCtx(FLEET, { data: { image: [imageDatum("i-1")] } });
+    const t = mkCtx(PRUNE_FLEET, { data: { image: [imageDatum("i-1")] } });
     await model.methods.pruneImages.execute(
       model.methods.pruneImages.arguments.parse({}),
       t.ctx,
@@ -3182,7 +3528,7 @@ Deno.test("pruneImages: an unreachable host keeps its images", async () => {
 
 Deno.test("pruneImages: dryRun lists the image id prefix; a live run removes the image and marks it pruned", async () => {
   await withFake({ FAKE_SWAMP_EXEC: execOut("24.0.7", 0) }, async () => {
-    const dry = mkCtx(FLEET, { data: { image: [imageDatum("i-1")] } });
+    const dry = mkCtx(PRUNE_FLEET, { data: { image: [imageDatum("i-1")] } });
     await model.methods.pruneImages.execute(
       model.methods.pruneImages.arguments.parse({ dryRun: true }),
       dry.ctx,
@@ -3193,7 +3539,7 @@ Deno.test("pruneImages: dryRun lists the image id prefix; a live run removes the
     ]);
     assertEquals(dry.written("image"), []);
 
-    const live = mkCtx(FLEET, { data: { image: [imageDatum("i-1")] } });
+    const live = mkCtx(PRUNE_FLEET, { data: { image: [imageDatum("i-1")] } });
     await model.methods.pruneImages.execute(
       model.methods.pruneImages.arguments.parse({}),
       live.ctx,
@@ -3208,7 +3554,7 @@ Deno.test("pruneImages: dryRun lists the image id prefix; a live run removes the
 
 Deno.test("pruneImages: the host filter limits which images are considered", async () => {
   await withFake({ FAKE_SWAMP_EXEC: execOut("24.0.7", 0) }, async () => {
-    const t = mkCtx(FLEET, {
+    const t = mkCtx(PRUNE_FLEET, {
       data: {
         image: [
           imageDatum("i-1"),
@@ -3239,6 +3585,10 @@ const MUTATING = [
   "pruneSnapshots",
   "pruneImages",
   "clearRetired",
+  "renderAccess",
+  "provisionAccess",
+  "revokeAccess",
+  "auditAccess",
 ];
 const READ_ONLY = ["scan", "import"];
 
@@ -3269,7 +3619,7 @@ const CHECK_FLEET = {
     { host: "bare" },
     { host: "dock", docker: { composePath: "/srv/app", service: "app" } },
     { host: "vm1", vm: { proxmoxNode: "pve-node", vmid: 100 } },
-    { host: "ct1", ct: { proxmoxNode: "pve", ctid: 101 } },
+    { host: "ct1", ct: { proxmoxNode: "pve", ctid: 101 }, unsafe: PCT_OK },
     {
       host: "hc",
       health: [
@@ -3693,6 +4043,24 @@ Deno.test("snapshot-target-resolves: rollback does not need the host to be reach
       );
     },
   );
+});
+
+Deno.test("snapshot-target-resolves: a CT reached over ssh with no snapshotter and no unsafe.pctExec record fails without a call", async () => {
+  await withCallLog({ FAKE_SWAMP_EXEC: execOut("", 0) }, async (calls) => {
+    const fleet = {
+      sshModel: "ssh",
+      machines: [{ host: "ct2", ct: { proxmoxNode: "pve", ctid: 102 } }],
+    };
+    for (const method of ["safeOsUpdate", "pruneSnapshots", "rollback"]) {
+      const r = await runCheck(
+        "snapshot-target-resolves",
+        checkCtx(fleet, method, { host: "ct2" }),
+      );
+      assertEquals(r.pass, false, method);
+      assertStringIncludes(String(r.errors?.[0]), "unsafe.pctExec");
+    }
+    assertEquals(await calls(), []);
+  });
 });
 
 Deno.test("snapshot-target-resolves: a CT is checked with pct listsnapshot on its node", async () => {
@@ -4126,7 +4494,7 @@ Deno.test("own data: pruneSnapshots finds a snapshot record tagged with an old m
 
 Deno.test("own data: pruneImages finds an image record tagged with an old model name", async () => {
   await withFake({ FAKE_SWAMP_EXEC: execOut("24.0.7", 0) }, async () => {
-    const t = mkCtx(FLEET, { data: { image: [old(imageDatum("i-1"))] } });
+    const t = mkCtx(PRUNE_FLEET, { data: { image: [old(imageDatum("i-1"))] } });
     await model.methods.pruneImages.execute(
       model.methods.pruneImages.arguments.parse({}),
       t.ctx,
@@ -4472,7 +4840,7 @@ Deno.test("safeOsUpdate: a failed snapshotter snapshot aborts the update before 
         'snapshotter model "zfs" failed to snapshot web1',
       );
       assertEquals(
-        (await calls()).some((c) => c.includes("apt-get -y upgrade")),
+        (await calls()).some((c) => c.includes("-y upgrade")),
         false,
       );
     },
@@ -4569,6 +4937,7 @@ function plainCtFleet(healthUrl: string) {
       host: "ct1",
       ct: { proxmoxNode: "pve", ctid: 200 },
       health: [{ type: "http", label: "app", url: healthUrl }],
+      unsafe: PCT_OK,
     }],
   };
 }
@@ -4845,16 +5214,16 @@ const execAnswer = (stdout: string, rc = 0) => ({
   }],
 });
 
-Deno.test("transportVia / transportFor: a CT that is not a VM goes through pct on its node; all else over ssh", async () => {
+Deno.test("transportVia / transportFor: a CT with an unsafe.pctExec record goes through pct on its node; all else over ssh", async () => {
   const ct = { proxmoxNode: "pve", ctid: 200 };
   assertEquals(fleet.transportVia({ host: "a" }), "ssh");
   assertEquals(
     fleet.transportVia({ host: "a", vm: { proxmoxNode: "pve", vmid: 1 } }),
     "ssh",
   );
-  assertEquals(fleet.transportVia({ host: "a", ct }), "pct");
+  assertEquals(fleet.transportVia({ host: "a", ct, unsafe: PCT_OK }), "pct");
   const deps = { sshModel: "ssh", swamp: stubSwamp([{ ok: true }]).api };
-  const t = await fleet.transportFor({ host: "a", ct }, deps);
+  const t = await fleet.transportFor({ host: "a", ct, unsafe: PCT_OK }, deps);
   assertEquals(t.via, "pct");
   assertEquals(t.ct, { node: "pve", ctid: 200 });
   assertEquals((await fleet.transportFor({ host: "a" }, deps)).via, "ssh");
@@ -5055,8 +5424,11 @@ Deno.test("safeOsUpdate: the after-update package list is read BEFORE a rollback
         t.ctx,
       );
       const all = await calls();
-      const lastPkgRead = all.map((c, i) => c.includes("dpkg-query") ? i : -1)
-        .filter((i) => i >= 0).pop()!;
+      // The package reads are the `exec` calls that run the manifest. A collector script
+      // (a scan, also the restored-machine scan after a rollback) names dpkg-query too.
+      const lastPkgRead = all.map((c, i) =>
+        c.startsWith("ssh exec ") && c.includes("dpkg-query") ? i : -1
+      ).filter((i) => i >= 0).pop()!;
       const rollback = all.findIndex((c) => c.includes(" rollbackVm "));
       assert(rollback > lastPkgRead, "package diff read before the rollback");
       // So the run record still shows what the update changed.
@@ -5168,10 +5540,116 @@ Deno.test("collector: pacman is detected only after apt, dnf and apk", () => {
 
 Deno.test("osUpgradeScript: apt honours mode; pacman runs a full -Syu non-interactively, last", () => {
   const safe = fleet.osUpgradeScript("safe");
-  assertStringIncludes(safe, "apt-get -y upgrade");
-  assertStringIncludes(fleet.osUpgradeScript("full"), "apt-get -y full-upgrade");
-  assertStringIncludes(safe, "$SUDO pacman -Syu --noconfirm");
-  assert(safe.indexOf("apk upgrade") < safe.indexOf("pacman -Syu"));
+  assertStringIncludes(
+    safe,
+    '$SUDO "$BIN_ENV" DEBIAN_FRONTEND=noninteractive "$BIN_APT_GET" -y upgrade',
+  );
+  assertStringIncludes(
+    fleet.osUpgradeScript("full"),
+    '"$BIN_APT_GET" -y full-upgrade',
+  );
+  assertStringIncludes(safe, '$SUDO "$BIN_PACMAN" -Syu --noconfirm');
+  assert(safe.indexOf('"$BIN_APK" upgrade') < safe.indexOf("BIN_PACMAN"));
+});
+
+/** The privileged words a runtime script runs after $SUDO, one per command (split at && and newlines). */
+function sudoLines(script: string): string[] {
+  const out: string[] = [];
+  for (const piece of script.split("\n").flatMap((l) => l.split(" && "))) {
+    const at = piece.indexOf("$SUDO ");
+    if (at >= 0) out.push(piece.slice(at + "$SUDO ".length).trim());
+  }
+  return out;
+}
+
+Deno.test("contract: every privileged line of the upgrade and reboot scripts is a table entry, and every entry is run", () => {
+  const argvOf = (cmd: (typeof PRIV_COMMANDS)[number]) =>
+    runtimeCommand(cmd, shellPaths(cmd)).join(" ");
+  const emitted = new Set<string>();
+  for (const mode of ["safe", "full"] as const) {
+    for (const l of sudoLines(fleet.osUpgradeScript(mode))) emitted.add(l);
+  }
+  for (const l of sudoLines(fleet.SSH_REBOOT_CMD)) emitted.add(l);
+  const table = new Set(PRIV_COMMANDS.map(argvOf));
+  for (const l of emitted) {
+    assert(table.has(l), `a privileged line is not a table entry: ${l}`);
+  }
+  for (const cmd of PRIV_COMMANDS) {
+    assert(emitted.has(argvOf(cmd)), `no script runs the ${cmd.id} entry`);
+  }
+  assertEquals(emitted.size, PRIV_COMMANDS.length);
+});
+
+Deno.test("contract: the runtime runs each privileged binary by its resolved absolute path, never by a bare name", () => {
+  for (
+    const s of [
+      fleet.osUpgradeScript("safe"),
+      fleet.osUpgradeScript("full"),
+      fleet.SSH_REBOOT_CMD,
+    ]
+  ) {
+    assertStringIncludes(s, "abs_cmd() {");
+    assertStringIncludes(s, "/*) printf '%s\\n' \"$p\" ;;");
+    assertStringIncludes(s, "*) echo \"no absolute path for $1");
+    for (const l of sudoLines(s)) {
+      assert(/^"\$BIN_[A-Z_]+" /.test(l), `a bare name reached sudo: ${l}`);
+    }
+  }
+  const upgrade = fleet.osUpgradeScript("safe");
+  for (
+    const [v, name] of [
+      ["BIN_ENV", "env"],
+      ["BIN_APT_GET", "apt-get"],
+      ["BIN_DNF", "dnf"],
+      ["BIN_APK", "apk"],
+      ["BIN_PACMAN", "pacman"],
+    ]
+  ) {
+    assertStringIncludes(upgrade, `${v}="$(abs_cmd ${name})" || exit 3`);
+  }
+  assertStringIncludes(
+    fleet.SSH_REBOOT_CMD,
+    'BIN_SYSTEMD_RUN="$(abs_cmd systemd-run)" || exit 3',
+  );
+});
+
+Deno.test("osUpgradeScript: the families are checked in apt, dnf, apk, pacman order, and an unknown host exits 3", () => {
+  const s = fleet.osUpgradeScript("safe");
+  const at = ["command -v apt-get", "command -v dnf", "command -v apk", "command -v pacman"]
+    .map((x) => s.indexOf(x));
+  assert(at.every((i) => i >= 0), "every family is checked");
+  assert(at[0] < at[1] && at[1] < at[2] && at[2] < at[3], "the family order");
+  assertStringIncludes(s, 'else echo "no known package manager" >&2; exit 3; fi');
+});
+
+Deno.test("reboot over ssh: the table's reboot entry, with its absolute path resolved on the host", () => {
+  assertStringIncludes(
+    fleet.SSH_REBOOT_CMD,
+    '$SUDO "$BIN_SYSTEMD_RUN" --on-active=3 --timer-property=AccuracySec=100ms systemctl reboot',
+  );
+  assert(!fleet.SSH_REBOOT_CMD.includes("sudo -n systemd-run"));
+});
+
+Deno.test("accessTargets: each machine's sudo flags follow its capabilities", () => {
+  const { targets } = fleet.accessTargets({
+    sshModel: "ssh",
+    access: ACCESS,
+    machines: [
+      { host: "managed" },
+      { host: "auto", osUpdatePolicy: "auto" },
+      { host: "scan", osUpdatePolicy: "scan-only" },
+      { host: "noos", os: false },
+    ],
+  } as never);
+  const sudo = Object.fromEntries(targets.map((t) => [t.host, t.input.sudo]));
+  assertEquals(sudo, {
+    managed: { osUpgrade: true, reboot: true, docker: false },
+    auto: { osUpgrade: false, reboot: true, docker: false },
+    scan: { osUpgrade: false, reboot: false, docker: false },
+    noos: { osUpgrade: false, reboot: true, docker: false },
+  });
+  const auto = targets.find((t) => t.host === "auto")!;
+  assertEquals(auto.input.autoUpdates, "security");
 });
 
 Deno.test("PKG_MANIFEST_CMD lists pacman packages as name<TAB>version, after the others", () => {
@@ -5302,6 +5780,7 @@ function resourceOut(attributes: Record<string, unknown>): string {
 
 Deno.test("scan: an osUpdater machine is scanned by its model's scanOs, not by the collector", async () => {
   await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
     FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout()),
     FAKE_SWAMP_OSSCAN_1: resourceOut({
       packageManager: "pacman",
@@ -5368,6 +5847,8 @@ Deno.test("safeOsUpdate: an osUpdater model scans, upgrades and lists packages; 
     assertEquals(
       all.map((c) => c.split(" ").slice(0, 2).join(" ")),
       [
+        // The guard asks the plug-in for its privileges before anything else.
+        "pacman-os privileges",
         "pacman-os scanOs",
         "pacman-os listPackages",
         "pacman-os upgradeOs",
@@ -5375,7 +5856,7 @@ Deno.test("safeOsUpdate: an osUpdater model scans, upgrades and lists packages; 
         "pacman-os listPackages",
       ],
     );
-    assertStringIncludes(all[2], "mode=full");
+    assertStringIncludes(all[3], "mode=full");
     assertStringIncludes(all[2], "host=arch1");
     const os = t.one("osUpdate");
     assertEquals(os.outcome, "updated");
@@ -5443,4 +5924,4665 @@ Deno.test("reboot: the confirming scan goes through the osUpdater model", async 
     assertEquals(t.one("reboot").confirmed, true);
     assertEquals(t.one("inventory").osUpdater, "pacman-os");
   });
+});
+
+Deno.test("globalArguments: unsafe, acceptedRisks and access parse; a boolean pctExec is rejected", () => {
+  const rec = {
+    reason: "Pinned by ops; reviewed quarterly",
+    acceptedBy: "dmc",
+    acceptedAt: "2026-10-01",
+    reviewBy: "2026-10-29",
+  };
+  const ga = model.globalArguments.parse({
+    sshModel: "ssh",
+    machines: [{
+      host: "h1",
+      unsafe: { pctExec: rec },
+      acceptedRisks: [{ ...rec, finding: "host-group-docker:dmc" }],
+    }],
+    access: {
+      publicKey:
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+      from: ["192.0.2.0/24"],
+      provisionSshModel: "pve-root",
+    },
+  });
+  assertEquals(ga.machines[0].host, "h1");
+  assert(!model.globalArguments.safeParse({
+    sshModel: "ssh",
+    machines: [{ host: "h1", unsafe: { pctExec: true } }],
+  }).success, "a boolean pctExec must be rejected");
+});
+
+Deno.test("collector: never uses root or sudo, and never refreshes the package cache", () => {
+  const s = fleet.COLLECTOR_SCRIPT;
+  assert(!s.includes("sudo"), "no sudo, not even in a comment");
+  assert(!s.includes("apt-get update"));
+  assert(!s.includes("apk update"));
+  assertStringIncludes(s, '"schemaVersion":5');
+  for (const key of ["cacheAgeHours", "dockerSource", "dockerFileB64"]) {
+    assertStringIncludes(s, key);
+  }
+});
+
+/**
+ * Run collect_dnf from the bundled collector with a fake `dnf` (a sh body) and a fake
+ * `rpm` first on PATH. Returns the echoed counts (stdout) and the log (stderr).
+ */
+async function runDnf(dnf: string): Promise<{ out: string; err: string }> {
+  const dir = await Deno.makeTempDir();
+  try {
+    await Deno.writeTextFile(`${dir}/dnf`, `#!/bin/sh\n${dnf}\n`);
+    await Deno.writeTextFile(`${dir}/rpm`, "#!/bin/sh\nexit 0\n");
+    await Deno.chmod(`${dir}/dnf`, 0o755);
+    await Deno.chmod(`${dir}/rpm`, 0o755);
+    const body = fleet.COLLECTOR_SCRIPT.split("\n")
+      .filter((l) => l !== "main </dev/null")
+      .join("\n");
+    const script = body +
+      "\ncollect_dnf\necho \"U=$updates S=$security C=${dnf_user_cache:-0} A=$cache_age\"\n";
+    const out = await new Deno.Command("bash", {
+      args: ["-c", script],
+      env: { PATH: `${dir}:${Deno.env.get("PATH") ?? ""}` },
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    return {
+      out: new TextDecoder().decode(out.stdout),
+      err: new TextDecoder().decode(out.stderr),
+    };
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+
+Deno.test("collector (dnf): a failing check-update is unknown (null), never 0", async () => {
+  const r = await runDnf("exit 1");
+  assertStringIncludes(r.out, "U=null S=null C=0");
+  assertStringIncludes(r.err, "dnf check-update failed (rc 1)");
+});
+
+Deno.test("collector (dnf): an error on the system cache falls back to the per-user cache", async () => {
+  const r = await runDnf([
+    'case " $* " in *" -C "*) exit 1 ;; esac',
+    "printf 'foo.x86_64  1.0-1  baseos\\nbar.noarch  2.0-1  appstream\\n'",
+    "exit 100",
+  ].join("\n"));
+  assertStringIncludes(r.out, "U=2 S=2 C=1 A=0");
+});
+
+Deno.test("collector (dnf): no updates (rc 0) is 0, not null", async () => {
+  const r = await runDnf("exit 0");
+  assertStringIncludes(r.out, "U=0 S=0 C=0");
+});
+
+/** A collector stdout that reports the root-written docker file, base64 as shipped. */
+function dockerFileStdout(file: unknown, over: Record<string, unknown> = {}): string {
+  return collectorStdout({
+    schemaVersion: 4,
+    dockerSource: "file",
+    dockerFileB64: btoa(JSON.stringify(file)),
+    ...over,
+  });
+}
+
+Deno.test("scan: a valid root-written docker file gives the images; its base64 is never stored", async () => {
+  const file = {
+    schemaVersion: 1,
+    generatedAt: new Date(Date.now() - 2 * 3600e3).toISOString(),
+    dockerEngine: "27.3.1",
+    dockerImages: [{
+      container: "web",
+      image: "nginx:1.27",
+      localDigest: "sha256:" + "a".repeat(64),
+      registryDigest: "sha256:" + "b".repeat(64),
+      updateAvailable: true,
+    }],
+  };
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", dockerFileStdout(file, { cacheAgeHours: 5 })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.dockerSource, "file");
+    assertEquals(inv.dockerEngine, "27.3.1");
+    assertEquals(inv.dockerImages, file.dockerImages);
+    assertEquals(inv.dockerFileAgeHours, 2);
+    assertEquals(inv.cacheAgeHours, 5);
+    assert(!("dockerFileB64" in inv), "the base64 is not a stored field");
+    assert(!JSON.stringify(inv).includes(btoa(JSON.stringify(file))));
+  });
+});
+
+Deno.test("scan: an invalid root-written docker file is file-invalid with no images", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({
+      schemaVersion: 4,
+      dockerSource: "file",
+      dockerFileB64: btoa("not json"),
+    })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.dockerSource, "file-invalid");
+    assertEquals(inv.dockerImages, null);
+    assertEquals(inv.dockerFileAgeHours, null);
+    assert(!("dockerFileB64" in inv), "the base64 is not a stored field");
+  });
+});
+
+/** One socket-sourced image item, as the collector writes it. */
+function socketItem(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    container: "web",
+    image: "nginx:1.27",
+    localDigest: "",
+    registryDigest: "",
+    updateAvailable: null,
+    ...over,
+  };
+}
+
+Deno.test("scan: a socket docker item with a bad container name is socket-invalid with no images", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({
+      schemaVersion: 4,
+      dockerSource: "socket",
+      dockerEngine: "27.3.1",
+      dockerImages: [socketItem({ container: "x|<script>" })],
+    })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.dockerSource, "socket-invalid");
+    assertEquals(inv.dockerImages, null);
+  });
+});
+
+Deno.test("scan: a good socket docker inventory is stored unchanged", async () => {
+  const images = [socketItem()];
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({
+      schemaVersion: 4,
+      dockerSource: "socket",
+      dockerEngine: "27.3.1",
+      dockerImages: images,
+    })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.dockerSource, "socket");
+    assertEquals(inv.dockerEngine, "27.3.1");
+    assertEquals(inv.dockerImages, images);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fail closed: pct needs an unsafe.pctExec record, a root ssh login needs an
+// unsafe.rootSsh record, and no machine falls back from one transport to the other.
+// ---------------------------------------------------------------------------
+
+const RECORD = {
+  reason: "Reviewed by ops for this one machine",
+  acceptedBy: "dmc",
+  acceptedAt: "2026-10-29",
+  reviewBy: "2027-04-29",
+};
+
+Deno.test("transportVia: a container without a record is ssh, with an unsafe.pctExec record pct, a VM ssh", () => {
+  const ct = { proxmoxNode: "pve", ctid: 200 };
+  assertEquals(fleet.transportVia({ host: "a", ct }), "ssh");
+  assertEquals(
+    fleet.transportVia({ host: "a", ct, unsafe: { pctExec: RECORD } }),
+    "pct",
+  );
+  assertEquals(
+    fleet.transportVia({ host: "a", vm: { proxmoxNode: "pve", vmid: 100 } }),
+    "ssh",
+  );
+});
+
+Deno.test("transportFor: a reach=pct machine without an unsafe.pctExec record throws the refusal, never falls back", async () => {
+  const deps = { sshModel: "ssh", swamp: stubSwamp([{ ok: true }]).api };
+  const m = {
+    host: "ct1",
+    reach: "pct" as const,
+    ct: { proxmoxNode: "pve", ctid: 200 },
+  };
+  await assertRejects(() => fleet.transportFor(m, deps), Error, "unsafe.pctExec");
+  assertStringIncludes(String(fleet.pctRefusal(m)), 'machine "ct1" asks for pct');
+  assertEquals(fleet.pctRefusal({ ...m, unsafe: { pctExec: RECORD } }), null);
+});
+
+Deno.test("scan: a CT without a record whose ssh fails is stored with an ssh error and is never contacted through pct", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "ct1" }]),
+    FAKE_SWAMP_SCRIPT_1: "not json",
+    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, collectorStdout({ hostname: "ct1" }))),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.error, "ssh: ssh script failed: not json");
+    assertEquals(inv.reachMethod, null);
+    // One ssh call for the CT itself; the node is never called.
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], 'hosts:json=["ct1"]');
+  });
+});
+
+Deno.test("scan: a CT with an unsafe.pctExec record is scanned through pct and records the accepted risk it used", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "pve" }]),
+    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, collectorStdout({ hostname: "ct1" }))),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "ct1",
+        ct: { proxmoxNode: "pve", ctid: 200 },
+        unsafe: PCT_OK,
+      }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.error, null);
+    assertEquals(inv.reachMethod, "pct");
+    assertEquals(inv.acceptedRisksUsed, ["unsafe.pctExec"]);
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], 'hosts:json=["pve"]');
+  });
+});
+
+Deno.test("scan: reach=pct without an unsafe.pctExec record gets an error record with the refusal, and is not contacted", async () => {
+  await withCallLog({
+    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, collectorStdout({ hostname: "ct1" }))),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("ct1", collectorStdout()),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "ct1",
+        reach: "pct",
+        ct: { proxmoxNode: "pve", ctid: 200 },
+      }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertStringIncludes(String(inv.error), 'machine "ct1" asks for pct');
+    assertStringIncludes(String(inv.error), "unsafe.pctExec");
+    assertEquals(inv.reachMethod, null);
+    assertEquals(await calls(), []);
+  });
+});
+
+/** The `globalArguments` of an @swamp/ssh definition: a default login and host entries. */
+function sshDefinition(
+  defaultUser: string,
+  hosts: Array<{ name: string; user?: string }>,
+): string {
+  return JSON.stringify({
+    globalArguments: {
+      transport: { user: defaultUser },
+      hosts: hosts.map((h) => ({
+        name: h.name,
+        ...(h.user === undefined ? {} : { transport: { user: h.user } }),
+      })),
+    },
+  });
+}
+
+const RT_FLEET = {
+  sshModel: "ssh",
+  machines: [
+    { host: "web1" },
+    { host: "rootbox", unsafe: { rootSsh: RECORD } },
+    { host: "old", reach: "pct", ct: { proxmoxNode: "pve", ctid: 201 } },
+    { host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 }, unsafe: PCT_OK },
+  ],
+};
+
+Deno.test("restricted-transport: an unprivileged ssh login passes", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+  }, async () => {
+    assertEquals(
+      await runCheck(
+        "restricted-transport",
+        checkCtx(RT_FLEET, "reboot", { host: "web1" }),
+      ),
+      { pass: true },
+    );
+  });
+});
+
+Deno.test("restricted-transport: a host-level root login fails and names the record to add", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1", user: "root" }]),
+  }, async () => {
+    const r = await runCheck(
+      "restricted-transport",
+      checkCtx(RT_FLEET, "reboot", { host: "web1" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(r.errors!.join(" "), 'logs in as root through ssh');
+    assertStringIncludes(r.errors!.join(" "), "unsafe.rootSsh");
+    assertStringIncludes(r.errors!.join(" "), "--skip-check restricted-transport");
+  });
+});
+
+Deno.test("restricted-transport: the default root login fails when the host has no override", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "web1" }]),
+  }, async () => {
+    const r = await runCheck(
+      "restricted-transport",
+      checkCtx(RT_FLEET, "safeOsUpdate", { host: "web1" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(r.errors!.join(" "), "logs in as root");
+  });
+});
+
+Deno.test("restricted-transport: a root login passes with an unsafe.rootSsh record", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "rootbox" }]),
+  }, async () => {
+    assertEquals(
+      await runCheck(
+        "restricted-transport",
+        checkCtx(RT_FLEET, "safeOsUpdate", { host: "rootbox" }),
+      ),
+      { pass: true },
+    );
+  });
+});
+
+Deno.test("restricted-transport: an unreadable ssh definition or host entry fails closed", async () => {
+  await withFake({ FAKE_SWAMP_GET_RC: "1" }, async () => {
+    const r = await runCheck(
+      "restricted-transport",
+      checkCtx(RT_FLEET, "reboot", { host: "web1" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(r.errors!.join(" "), "cannot be read");
+  });
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "other" }]),
+  }, async () => {
+    const r = await runCheck(
+      "restricted-transport",
+      checkCtx(RT_FLEET, "reboot", { host: "web1" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(r.errors!.join(" "), 'for "web1"');
+  });
+});
+
+Deno.test("restricted-transport: a reach=pct machine without an unsafe.pctExec record fails", async () => {
+  const r = await runCheck(
+    "restricted-transport",
+    checkCtx(RT_FLEET, "reboot", { host: "old" }),
+  );
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors!.join(" "), "unsafe.pctExec");
+});
+
+Deno.test("restricted-transport: safeUpdate always uses ssh, so only its login counts", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "old" }]),
+  }, async () => {
+    assertEquals(
+      await runCheck(
+        "restricted-transport",
+        checkCtx(RT_FLEET, "safeUpdate", { host: "old" }),
+      ),
+      { pass: true },
+    );
+  });
+});
+
+Deno.test("restricted-transport: a CT with a record reads the login of its node, which is what pct runs over", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "pve" }]),
+  }, async () => {
+    assertEquals(
+      await runCheck(
+        "restricted-transport",
+        checkCtx(RT_FLEET, "reboot", { host: "ct1" }),
+      ),
+      { pass: true },
+    );
+  });
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "pve", user: "root" }]),
+  }, async () => {
+    const r = await runCheck(
+      "restricted-transport",
+      checkCtx(RT_FLEET, "reboot", { host: "ct1" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(
+      r.errors!.join(" "),
+      'is reached through pct on node "pve", which logs in as root through ssh',
+    );
+    assertStringIncludes(r.errors!.join(" "), "unsafe.rootSsh");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The snapshot guard does not depend on the transport: every CT the snapshot
+// pre-flight treats as guarded is snapshotted (pct on its node) before the upgrade.
+// ---------------------------------------------------------------------------
+
+Deno.test("safeOsUpdate: a CT with an unsafe.pctExec record is snapshotted with pct on its node before the upgrade", async () => {
+  const cases = [
+    // With an unsafe.pctExec record: the container is reached through pct.
+    { label: "through pct", host: "ct1", unsafe: PCT_OK },
+  ];
+  for (const c of cases) {
+    const server = startServer(() => 200);
+    try {
+      await withCallLog({
+        FAKE_SWAMP_SCRIPT_1: scriptOut(c.unsafe ? "pve" : "ct1", collectorStdout()),
+        FAKE_SWAMP_SCRIPT_2: scriptOut(
+          c.unsafe ? "pve" : "ct1",
+          collectorStdout({ updatesCount: 0 }),
+        ),
+        FAKE_SWAMP_EXEC: execOut(""),
+      }, async (calls) => {
+        const t = mkCtx({
+          sshModel: "ssh",
+          machines: [{
+            host: c.host,
+            ct: { proxmoxNode: "pve", ctid: 200 },
+            health: [{ type: "http", label: "app", url: server.url }],
+            ...(c.unsafe ? { unsafe: c.unsafe } : {}),
+          }],
+        });
+        await model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({
+            host: c.host,
+            healthGraceSec: 0,
+          }),
+          t.ctx,
+        );
+        const all = await calls();
+        const snap = all.findIndex((line) =>
+          line.includes("pct snapshot 200 preupdate-")
+        );
+        assert(snap >= 0, `${c.label}: the CT is snapshotted with pct on its node`);
+        // The upgrade runs after the snapshot: plain over ssh, base64-shipped into
+        // `pct exec` through pct (so only the `pct exec 200` wrapper shows).
+        assert(
+          all.slice(snap + 1).some((line) =>
+            line.includes("update -qq") || line.includes("pct exec 200")
+          ),
+          `${c.label}: an upgrade runs after the snapshot`,
+        );
+        assertEquals(t.one("osUpdate").kind, "ct", c.label);
+        assertEquals(t.one("osUpdate").outcome, "updated", c.label);
+      });
+    } finally {
+      await server.stop();
+    }
+  }
+});
+
+Deno.test("safeOsUpdate: a CT reached over ssh with no snapshotter and no unsafe.pctExec record is refused before any call", async () => {
+  await withCallLog({
+    FAKE_SWAMP_SCRIPT_1: scriptOut("ct1", collectorStdout()),
+    FAKE_SWAMP_EXEC: execOut(""),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 } }],
+    });
+    const err = await assertRejects(() =>
+      model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({ host: "ct1" }),
+        t.ctx,
+      )
+    );
+    assertStringIncludes((err as Error).message, "safeOsUpdate of ct1 refused");
+    assertStringIncludes((err as Error).message, "unsafe.pctExec");
+    // No scan, no snapshot, no upgrade: not a single call.
+    assertEquals(await calls(), []);
+    assertEquals(t.written("osUpdate").length, 0);
+  });
+});
+
+Deno.test("safeOsUpdate: a CT whose location cannot be resolved fails before any upgrade, and is never run unguarded", async () => {
+  await withCallLog({
+    FAKE_SWAMP_SCRIPT_1: scriptOut("ct1", collectorStdout()),
+    FAKE_SWAMP_EXEC: execOut(""),
+    FAKE_SWAMP_GET_RC: "1",
+  }, async (calls) => {
+    // A legacy proxmox ref whose model cannot be read: the CT has no location.
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "ct1", proxmox: { model: "gone" } }],
+    });
+    await assertRejects(() =>
+      model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({ host: "ct1" }),
+        t.ctx,
+      )
+    );
+    // Nothing was contacted: no scan, no snapshot, no upgrade. Only the plug-in (the
+    // legacy proxmox ref is the app updater) was asked for its privileges.
+    assertEquals(
+      (await calls()).map((c) => c.split(" ").slice(0, 2).join(" ")),
+      ["gone privileges"],
+    );
+    assertEquals(t.written("osUpdate").length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// scan reads the login before any contact. A root login needs the machine's own
+// unsafe.rootSsh record, an unknown login is refused, and the uid the collector
+// reports is checked: uid 0 over ssh without the record is a security finding.
+// ---------------------------------------------------------------------------
+
+Deno.test("scan: a root login without an unsafe.rootSsh record is refused, and the host is not contacted", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout()),
+  }, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertStringIncludes(String(inv.error), 'refused: logs in as root through ssh (host "web1")');
+    assertStringIncludes(String(inv.error), "unsafe.rootSsh");
+    assertEquals(inv.reachMethod, null);
+    assertEquals(await calls(), []);
+  });
+});
+
+Deno.test("scan: an ssh login that cannot be read is refused, and so is every login when there is no definition repository", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "other" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout()),
+  }, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertStringIncludes(String(inv.error), 'refused: the ssh login for "web1" cannot be read from ssh');
+    assertEquals(inv.reachMethod, null);
+    assertEquals(await calls(), []);
+  });
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout()),
+  }, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute(
+      {},
+      { ...(t.ctx as object), definitionRepository: undefined } as never,
+    );
+    assertStringIncludes(String(t.one("inventory").error), 'refused: the ssh login for "web1"');
+    assertEquals(await calls(), []);
+  });
+});
+
+Deno.test("scan: a root login with an unsafe.rootSsh record is scanned, and that record is the accepted risk it used", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "rootbox" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("rootbox", collectorStdout({ hostname: "rootbox", uid: 0 })),
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "rootbox", unsafe: { rootSsh: RECORD } }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.error, null);
+    assertEquals(inv.reachMethod, "ssh");
+    assertEquals(inv.acceptedRisksUsed, ["unsafe.rootSsh"]);
+    assertEquals(inv.securityFindings, []);
+  });
+});
+
+Deno.test("scan: an unprivileged login is scanned with no accepted risk and no security finding", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({ uid: 1000 })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.error, null);
+    assertEquals(inv.acceptedRisksUsed, []);
+    assertEquals(inv.securityFindings, []);
+  });
+});
+
+Deno.test("scan: a pct CT whose node logs in as root is refused without an unsafe.rootSsh record on the CT, and its node is not called", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "pve" }]),
+    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, collectorStdout({ hostname: "ct1" }))),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "ct1",
+        ct: { proxmoxNode: "pve", ctid: 200 },
+        unsafe: PCT_OK,
+      }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertStringIncludes(String(inv.error), 'refused: logs in as root through ssh (host "pve")');
+    assertEquals(inv.reachMethod, null);
+    assertEquals(await calls(), []);
+  });
+});
+
+Deno.test("scan: on a root node, only the CTs with an unsafe.rootSsh record go into its pct batch", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "pve" }]),
+    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, collectorStdout({ hostname: "ct1" }))),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [
+        {
+          host: "ct1",
+          ct: { proxmoxNode: "pve", ctid: 200 },
+          unsafe: { ...PCT_OK, rootSsh: RECORD },
+        },
+        {
+          host: "ct2",
+          ct: { proxmoxNode: "pve", ctid: 201 },
+          unsafe: PCT_OK,
+        },
+      ],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = Object.fromEntries(
+      t.written("inventory").map((r) => [r.name, r.data]),
+    );
+    assertEquals(inv.ct1.reachMethod, "pct");
+    assertStringIncludes(String(inv.ct2.error), 'refused: logs in as root through ssh (host "pve")');
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], 'hosts:json=["pve"]');
+    const script = String(t.calls[0].arguments?.script);
+    assertStringIncludes(script, "@@PATCH-CT 200 BEGIN");
+    assert(!script.includes("@@PATCH-CT 201"), "ct2 is not in the batch");
+  });
+});
+
+Deno.test("scan: a pct CT whose node logs in as root is scanned through pct with both records", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "pve" }]),
+    FAKE_SWAMP_PCT: scriptOut("pve", ctSection(200, collectorStdout({ hostname: "ct1", uid: 0 }))),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "ct1",
+        ct: { proxmoxNode: "pve", ctid: 200 },
+        unsafe: { ...PCT_OK, rootSsh: RECORD },
+      }],
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.error, null);
+    assertEquals(inv.reachMethod, "pct");
+    assertEquals(inv.acceptedRisksUsed, ["unsafe.pctExec", "unsafe.rootSsh"]);
+    // uid 0 is expected through pct (root in the container): no security finding.
+    assertEquals(inv.securityFindings, []);
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], 'hosts:json=["pve"]');
+  });
+});
+
+Deno.test("scan: uid 0 over ssh without an unsafe.rootSsh record is a root-login-unaccepted finding; uid 1000 is not", async () => {
+  // The ssh config can override the definition's login, so the host reports its real uid.
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({ uid: 0 })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.error, null);
+    assertEquals(inv.uid, 0);
+    assertEquals(inv.securityFindings, ["root-login-unaccepted"]);
+    assertEquals(inv.acceptedRisksUsed, []);
+    assertStringIncludes(JSON.stringify(t.getLogsByLevel("warning")), "web1");
+  });
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({ uid: 1000 })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.uid, 1000);
+    assertEquals(inv.securityFindings, []);
+  });
+});
+
+Deno.test("collector: prints the uid it runs as (id -u) in the marker line", async () => {
+  const s = fleet.COLLECTOR_SCRIPT;
+  assertStringIncludes(s, "id -u");
+  assertStringIncludes(s, '"uid":');
+  const real = new TextDecoder().decode(
+    (await new Deno.Command("id", { args: ["-u"], stdout: "piped" }).output())
+      .stdout,
+  ).trim();
+  const inv = await runCollector({});
+  assertEquals(inv.uid, Number(real));
+});
+
+// ---------------------------------------------------------------------------
+// The swamp-patch access login: renderAccess, provisionAccess, revokeAccess
+// ---------------------------------------------------------------------------
+
+const ACCESS_KEY =
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBjngojWT4QUfy2bl78lWkaepNtOZYDlAzZbel8QNoWN swamp-serve";
+const ACCESS = {
+  user: "swamp-patch",
+  publicKey: ACCESS_KEY,
+  from: ["10.0.0.0/24"],
+  provisionSshModel: "prov",
+};
+const ACCESS_FLEET = {
+  sshModel: "ssh",
+  access: ACCESS,
+  machines: [
+    { host: "web1" },
+    {
+      host: "dock",
+      docker: { composePath: "/srv/app", service: "app" },
+      from: ["192.0.2.57"],
+    },
+  ],
+};
+
+const PROVISION_RESULT = {
+  _kind: "patch-access-provision",
+  user: "swamp-patch",
+  created: true,
+  groupsRemoved: [],
+  cacheRefresh: "apt",
+  docker: false,
+};
+const REVOKE_RESULT = {
+  _kind: "patch-access-revoke",
+  user: "swamp-patch",
+  removed: [],
+};
+
+/** The stdout of a provisioning run that applied: its steps, then the result line. */
+function provisionOk(): string {
+  return `== root\n== preflight\n== account\n== key\n${
+    JSON.stringify(PROVISION_RESULT)
+  }\n`;
+}
+
+/** The stdout of a revoke run that applied. */
+function revokeOk(): string {
+  return `== root\n${JSON.stringify(REVOKE_RESULT)}\n`;
+}
+
+/** What the fake prints for a `script` call over several hosts: one artifact per host run. */
+function scriptRunsOut(
+  runs: Array<{ host: string; stdout: string; exitCode?: number }>,
+): string {
+  return JSON.stringify({
+    dataArtifacts: runs.map((r) => ({
+      attributes: {
+        host: r.host,
+        stdout: r.stdout,
+        exitCode: r.exitCode ?? 0,
+      },
+    })),
+  });
+}
+
+type WrittenRecord = { name: string; data: Record<string, unknown> };
+
+/** The accessRun records written through a test context, keyed by host. */
+function accessRunsByHost(
+  t: ReturnType<typeof mkCtx>,
+): Map<string, Record<string, unknown>> {
+  return new Map(
+    (t.written("accessRun") as WrittenRecord[]).map((
+      r,
+    ): [string, Record<string, unknown>] => [String(r.data.host), r.data]),
+  );
+}
+
+Deno.test("access: renderAccess writes one accessPlan per machine, with the restricted key line, and contacts no host", async () => {
+  await withCallLog({}, async (calls) => {
+    const t = mkCtx(ACCESS_FLEET);
+    await model.methods.renderAccess.execute({}, t.ctx);
+    const plans = t.written("accessPlan");
+    // Never the bare host name, which inventory records use.
+    assertEquals(plans.map((p) => p.name), [
+      "access-plan-web1",
+      "access-plan-dock",
+    ]);
+
+    const web1 = plans[0].data as Record<string, unknown>;
+    assertEquals(web1.from, ["10.0.0.0/24"]);
+    assertEquals(web1.docker, false);
+    assertStringIncludes(
+      String(web1.keyLine),
+      'from="10.0.0.0/24",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,no-user-rc ',
+    );
+    assert(String(web1.keyLine).endsWith(` ${ACCESS_KEY}`));
+    assertMatch(String(web1.provisionScriptSha256), /^[0-9a-f]{64}$/);
+    assertMatch(String(web1.revokeScriptSha256), /^[0-9a-f]{64}$/);
+    assertStringIncludes(
+      String(web1.provisionScript),
+      "PATCH_USER='swamp-patch'",
+    );
+
+    // dock overrides the source addresses, and it is a docker host.
+    const dock = plans[1].data as Record<string, unknown>;
+    assertEquals(dock.from, ["192.0.2.57"]);
+    assertEquals(dock.docker, true);
+    assertStringIncludes(String(dock.keyLine), 'from="192.0.2.57",');
+    assertStringIncludes(String(dock.provisionScript), "WANT_DOCKER=1");
+
+    assertEquals(t.calls, []);
+    assertEquals(await calls(), []);
+  });
+});
+
+Deno.test("access: provisionAccess is a dry run by default and contacts no host", async () => {
+  const env = {
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "web1" }, {
+      name: "dock",
+    }]),
+  };
+  await withCallLog(env, async (calls) => {
+    const t = mkCtx(ACCESS_FLEET);
+    const args = model.methods.provisionAccess.arguments.parse({});
+    assertEquals(args.dryRun, true);
+    await model.methods.provisionAccess.execute(args, t.ctx);
+    const runs = accessRunsByHost(t);
+    assertEquals([...runs.keys()], ["web1", "dock"]);
+    for (const r of runs.values()) {
+      assertEquals(r.outcome, "dry-run");
+      assertEquals(r.ok, true);
+      assertEquals(r.dryRun, true);
+      assertEquals(r.exitCode, null);
+    }
+    assertEquals(t.written("accessPlan").length, 2);
+    assertEquals(t.calls, []);
+    assertEquals(await calls(), []);
+  });
+  // A call with no dryRun value is a dry run too.
+  await withCallLog(env, async (calls) => {
+    const t = mkCtx(ACCESS_FLEET);
+    await model.methods.provisionAccess.execute({} as never, t.ctx);
+    assertEquals(accessRunsByHost(t).get("web1")?.dryRun, true);
+    assertEquals(await calls(), []);
+  });
+});
+
+Deno.test("access: provisionAccess applies through provisionSshModel only, one script call per script and sudo, without sudo for root", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [
+      { name: "web1", user: "root" },
+      { name: "web2", user: "root" },
+      { name: "web3" },
+    ]),
+    FAKE_SWAMP_SCRIPT_1: scriptRunsOut([
+      { host: "web1", stdout: provisionOk() },
+      { host: "web2", stdout: provisionOk() },
+    ]),
+    FAKE_SWAMP_SCRIPT_2: scriptRunsOut([
+      { host: "web3", stdout: provisionOk() },
+    ]),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      machines: [{ host: "web1" }, { host: "web2" }, { host: "web3" }],
+    });
+    await model.methods.provisionAccess.execute({ dryRun: false }, t.ctx);
+
+    // Every call goes to the provisioning model, never to the patch login's model.
+    const lines = await calls();
+    assertEquals(lines.length, 2);
+    for (const l of lines) assert(l.startsWith("prov script "), l);
+    // web1 and web2 share one script and need no sudo; web3 is not root, so it uses sudo.
+    assertStringIncludes(lines[0], 'hosts:json=["web1","web2"]');
+    assert(!lines[0].includes("sudo:json"));
+    assertStringIncludes(lines[1], 'hosts:json=["web3"]');
+    assertStringIncludes(lines[1], "sudo:json=true");
+
+    const runs = accessRunsByHost(t);
+    for (const h of ["web1", "web2", "web3"]) {
+      assertEquals(runs.get(h)?.outcome, "applied");
+      assertEquals(runs.get(h)?.ok, true);
+      assertEquals(runs.get(h)?.dryRun, false);
+      assertMatch(String(runs.get(h)?.scriptSha256), /^[0-9a-f]{64}$/);
+    }
+    assertEquals(runs.get("web1")?.sudo, false);
+    assertEquals(runs.get("web3")?.sudo, true);
+    assertEquals(runs.get("web1")?.result, PROVISION_RESULT);
+  });
+});
+
+Deno.test("access: a host whose provisioning login cannot be read is skipped and never contacted", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptRunsOut([{
+      host: "web1",
+      stdout: provisionOk(),
+    }]),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      machines: [{ host: "web1" }, { host: "ghost" }],
+    });
+    // The other host still runs, but a skipped host fails the run: success must not hide
+    // a host that has no access.
+    await assertRejects(
+      () => model.methods.provisionAccess.execute({ dryRun: false }, t.ctx),
+      Error,
+      "ghost (skipped)",
+    );
+    const lines = await calls();
+    assertEquals(accessRunsByHost(t).get("web1")?.outcome, "applied");
+    assertEquals(lines.length, 1);
+    assertStringIncludes(lines[0], 'hosts:json=["web1"]');
+    const ghost = accessRunsByHost(t).get("ghost");
+    assertEquals(ghost?.outcome, "skipped");
+    assertEquals(ghost?.ok, false);
+    assertEquals(ghost?.exitCode, null);
+    assertEquals(ghost?.detail, "login cannot be read from prov");
+  });
+});
+
+Deno.test("access: refusals and failures are recorded per host, and the run throws after every host", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [
+      { name: "web1" },
+      { name: "web2" },
+      { name: "web3" },
+      { name: "web4" },
+      { name: "web5" },
+    ]),
+    FAKE_SWAMP_SCRIPT_1: scriptRunsOut([
+      { host: "web1", stdout: provisionOk() },
+      {
+        host: "web2",
+        stdout:
+          "== account\nrefusing to take over existing account swamp-patch\n",
+        exitCode: 3,
+      },
+      {
+        host: "web3",
+        stdout: "== preflight\nno bash on this host\n",
+        exitCode: 4,
+      },
+      { host: "web4", stdout: "== root\nboom\n", exitCode: 1 },
+      { host: "web5", stdout: "== key\n", exitCode: 0 },
+    ]),
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      machines: ["web1", "web2", "web3", "web4", "web5"].map((host) => ({
+        host,
+      })),
+    });
+    await assertRejects(
+      () => model.methods.provisionAccess.execute({ dryRun: false }, t.ctx),
+      Error,
+      "web2 (refused-takeover), web3 (refused-preflight), web4 (failed), web5 (failed)",
+    );
+    // Every host has its record, written before the throw.
+    const runs = accessRunsByHost(t);
+    assertEquals(t.written("accessRun").length, 5);
+    assertEquals(runs.get("web1")?.outcome, "applied");
+    assertEquals(runs.get("web2")?.outcome, "refused-takeover");
+    assertEquals(runs.get("web2")?.exitCode, 3);
+    assertEquals(runs.get("web2")?.result, null);
+    assertStringIncludes(
+      String(runs.get("web2")?.detail),
+      "refusing to take over",
+    );
+    assertEquals(runs.get("web3")?.outcome, "refused-preflight");
+    assertEquals(runs.get("web4")?.outcome, "failed");
+    assertEquals(runs.get("web5")?.outcome, "failed");
+    assertEquals(runs.get("web5")?.exitCode, 0);
+  });
+});
+
+Deno.test("access: exit 6 (the sudoers step rolled back) is failed, not refused", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptRunsOut([{
+      host: "web1",
+      stdout: "== sudo\nthe sudoers entries do not parse: nothing was installed\n",
+      exitCode: 6,
+    }]),
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      machines: [{ host: "web1" }],
+    });
+    await assertRejects(
+      () => model.methods.provisionAccess.execute({ dryRun: false }, t.ctx),
+      Error,
+      "web1 (failed)",
+    );
+    const run = accessRunsByHost(t).get("web1");
+    assertEquals(run?.outcome, "failed");
+    assertEquals(run?.exitCode, 6);
+  });
+});
+
+Deno.test("access: the access methods throw without access, when provisionSshModel is sshModel, and for an unknown host", async () => {
+  const noAccess = { sshModel: "ssh", machines: [{ host: "web1" }] };
+  const sameModel = {
+    ...ACCESS_FLEET,
+    access: { ...ACCESS, provisionSshModel: "ssh" },
+  };
+  const none = mkCtx(noAccess);
+  await assertRejects(
+    () => model.methods.renderAccess.execute({}, none.ctx),
+    Error,
+    "access is not configured",
+  );
+  await assertRejects(
+    () => model.methods.provisionAccess.execute({ dryRun: true }, none.ctx),
+    Error,
+    "access is not configured",
+  );
+  await assertRejects(
+    () => model.methods.revokeAccess.execute({ dryRun: true }, none.ctx),
+    Error,
+    "access is not configured",
+  );
+  const same = mkCtx(sameModel);
+  await assertRejects(
+    () => model.methods.renderAccess.execute({}, same.ctx),
+    Error,
+    "must differ from sshModel",
+  );
+  await assertRejects(
+    () => model.methods.provisionAccess.execute({ dryRun: false }, same.ctx),
+    Error,
+    "must differ from sshModel",
+  );
+  await assertRejects(
+    () => model.methods.revokeAccess.execute({ dryRun: false }, same.ctx),
+    Error,
+    "must differ from sshModel",
+  );
+  const ok = mkCtx(ACCESS_FLEET);
+  await assertRejects(
+    () => model.methods.renderAccess.execute({ hosts: ["nope"] }, ok.ctx),
+    Error,
+    'No machine "nope"',
+  );
+
+  const parsed = model.globalArguments.parse(ACCESS_FLEET);
+  assertEquals(
+    fleet.accessTargets(parsed).targets.map((t) => t.host),
+    ["web1", "dock"],
+  );
+  assertEquals(
+    fleet.accessTargets(parsed, ["dock"]).targets.map((t) => t.host),
+    ["dock"],
+  );
+  assertThrows(
+    () => fleet.accessTargets(model.globalArguments.parse(sameModel)),
+    Error,
+    "must differ from sshModel",
+  );
+  assertThrows(
+    () => fleet.accessTargets(parsed, ["nope"]),
+    Error,
+    'No machine "nope"',
+  );
+});
+
+Deno.test("checks: access-configured fails without access, when the patch login provisions, or for an unknown host, and passes otherwise", async () => {
+  const noAccess = { sshModel: "ssh", machines: [{ host: "web1" }] };
+  const sameModel = {
+    ...ACCESS_FLEET,
+    access: { ...ACCESS, provisionSshModel: "ssh" },
+  };
+  const missing = await runCheck(
+    "access-configured",
+    checkCtx(noAccess, "renderAccess"),
+  );
+  assertEquals(missing.pass, false);
+  assertStringIncludes(missing.errors!.join(" "), "access is not configured");
+
+  const same = await runCheck(
+    "access-configured",
+    checkCtx(sameModel, "provisionAccess", { dryRun: false }),
+  );
+  assertEquals(same.pass, false);
+  assertStringIncludes(same.errors!.join(" "), "must differ from sshModel");
+  assertStringIncludes(
+    same.errors!.join(" "),
+    "--skip-check access-configured",
+  );
+
+  const unknown = await runCheck(
+    "access-configured",
+    checkCtx(ACCESS_FLEET, "revokeAccess", { hosts: ["web1", "nope"] }),
+  );
+  assertEquals(unknown.pass, false);
+  assertStringIncludes(unknown.errors!.join(" "), 'No machine "nope"');
+
+  assertEquals(
+    await runCheck(
+      "access-configured",
+      checkCtx(ACCESS_FLEET, "provisionAccess", {
+        hosts: ["web1"],
+        dryRun: false,
+      }),
+    ),
+    { pass: true },
+  );
+  assertEquals(
+    await runCheck("access-configured", checkCtx(ACCESS_FLEET, "renderAccess")),
+    { pass: true },
+  );
+});
+
+Deno.test("access: revokeAccess is a dry run by default, and a good run is applied with its result", async () => {
+  const env = {
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptRunsOut([{ host: "web1", stdout: revokeOk() }]),
+  };
+  await withCallLog(env, async (calls) => {
+    const t = mkCtx(ACCESS_FLEET);
+    await model.methods.revokeAccess.execute(
+      model.methods.revokeAccess.arguments.parse({}),
+      t.ctx,
+    );
+    const runs = accessRunsByHost(t);
+    assertEquals([...runs.keys()], ["web1", "dock"]);
+    for (const r of runs.values()) {
+      assertEquals(r.outcome, "dry-run");
+      assertEquals(r.action, "revoke");
+    }
+    assertEquals(t.written("accessPlan"), []);
+    assertEquals(await calls(), []);
+  });
+
+  await withCallLog(env, async (calls) => {
+    const t = mkCtx({ ...ACCESS_FLEET, machines: [{ host: "web1" }] });
+    await model.methods.revokeAccess.execute(
+      { hosts: ["web1"], dryRun: false },
+      t.ctx,
+    );
+    const lines = await calls();
+    assertEquals(lines.length, 1);
+    assert(lines[0].startsWith("prov script "), lines[0]);
+    assert(!lines[0].includes("sudo:json"));
+    const rec = accessRunsByHost(t).get("web1");
+    assertEquals(rec?.action, "revoke");
+    assertEquals(rec?.outcome, "applied");
+    assertEquals(rec?.ok, true);
+    assertEquals(rec?.result, REVOKE_RESULT);
+    assertEquals(t.written("accessPlan"), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The access audit: auditAccess. The fake answers every `script` call with the same
+// output, so one stdout carries both probe lines and each call reads its own.
+// ---------------------------------------------------------------------------
+
+const AUDIT_FROM = ["10.0.0.0/24"];
+const AUDIT_LINE = authorizedKeysLine(ACCESS_KEY, AUDIT_FROM);
+const AUDIT_TOKEN = "0123456789abcdef0123456789abcdef";
+const NO_WRITE_PATHS = {
+  authorizedKeys: false,
+  sshDir: false,
+  marker: false,
+  stateDir: false,
+  libexec: false,
+  dockerProducer: false,
+  sudoersDir: false,
+  unitService: false,
+  unitTimer: false,
+  aptConf: false,
+  apkPeriodic: false,
+  aptAuto: false,
+  dnfAutoConf: false,
+  dnfAutoDropIn: false,
+  dockerHelper: false,
+  dockerProjects: false,
+};
+
+/** The user probe of a clean login: the patch login, no sudo, no docker, nothing writable. */
+const CLEAN_USER_PROBE = {
+  _kind: "patch-access-user-probe",
+  user: "swamp-patch",
+  uid: 1001,
+  groups: ["swamp-patch"],
+  sudoList: null,
+  sudoTrueRc: null,
+  dockerRc: null,
+  canWrite: NO_WRITE_PATHS,
+};
+
+/** The root probe of a clean host: the login with its one key line, and root-owned files. */
+function cleanRootProbe(
+  over: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const file = { owner: "root", group: "root", mode: "644" };
+  const dir = { owner: "root", group: "root", mode: "755" };
+  const absent = (path: string) => ({
+    path,
+    exists: false,
+    owner: null,
+    group: null,
+    mode: null,
+    sha256: null,
+    hasManagedHeader: false,
+  });
+  return {
+    _kind: "patch-access-root-probe",
+    account: {
+      exists: true,
+      markerOk: true,
+      shadowLocked: true,
+      shell: "/bin/bash",
+      gecos: `swamp-patch token=${AUDIT_TOKEN}`,
+    },
+    groupsOfUser: ["swamp-patch"],
+    authorizedKeys: {
+      lines: [AUDIT_LINE],
+      total: 1,
+      file,
+      dir,
+      home: dir,
+    },
+    rootHasKey: false,
+    managedFiles: [
+      {
+        path: PATHS.marker,
+        exists: true,
+        owner: "root",
+        group: "root",
+        mode: "644",
+        sha256: null,
+        hasManagedHeader: false,
+      },
+      absent(PATHS.dockerProducer),
+      absent(PATHS.unitService),
+      absent(PATHS.unitTimer),
+      absent(PATHS.aptConf),
+      absent(PATHS.apkPeriodic),
+      absent(PATHS.sudoers),
+    ],
+    dirs: {
+      stateDir: dir,
+      libexec: null,
+      sudoersDir: dir,
+      systemdDir: dir,
+      projectsDir: null,
+    },
+    sudoRules: [],
+    cache: {
+      family: "apt",
+      refreshOn: true,
+      ageHours: 1,
+      autoInstall: false,
+      autoScope: null,
+    },
+    hostGroups: {
+      docker: [],
+      wheel: [],
+      sudo: [],
+      admin: [],
+      adm: [],
+      lxd: [],
+      disk: [],
+    },
+    dockerSocket: null,
+    sudoersFile: { exists: false, lines: [], total: 0 },
+    sudoFamilies: ["apt", "systemd"],
+    compose: [],
+    ...over,
+  };
+}
+
+/** A host's stdout: the user probe line, then the root probe line, as the probes print them. */
+function probeStdout(userProbe: unknown, rootProbe: unknown): string {
+  const user = JSON.stringify(userProbe);
+  const root = JSON.stringify(rootProbe);
+  return `${user}\n== root\n${root}\n`;
+}
+
+/**
+ * The env of an audit run: one `script` answer for every host, carrying both probe lines
+ * (a host's override replaces its clean probe). `definition` is the login definition.
+ */
+function auditEnv(
+  definition: string,
+  runs: Array<{ host: string; rootProbe?: unknown }>,
+): Env {
+  return {
+    FAKE_SWAMP_MODEL_GET: definition,
+    FAKE_SWAMP_SCRIPT_1: scriptRunsOut(runs.map((r) => ({
+      host: r.host,
+      stdout: probeStdout(
+        CLEAN_USER_PROBE,
+        r.rootProbe ?? cleanRootProbe(),
+      ),
+    }))),
+  };
+}
+
+/** The accessAudit record of one host, written through a test context. */
+function auditOf(
+  t: ReturnType<typeof mkCtx>,
+  host: string,
+): Record<string, unknown> {
+  const found = (t.written("accessAudit") as WrittenRecord[]).find((r) =>
+    r.name === `access-audit-${host}`
+  );
+  assert(found !== undefined, `no accessAudit record for ${host}`);
+  return found.data;
+}
+
+/** The findings of an accessAudit record as "id severity", sorted. */
+function auditFindings(rec: Record<string, unknown>): string[] {
+  return (rec.findings as Array<{ id: string; severity: string }>)
+    .map((f) => `${f.id} ${f.severity}`)
+    .sort();
+}
+
+const AUDIT_ARGS = model.methods.auditAccess.arguments;
+
+/**
+ * The grant warnings of a managed machine whose sudoers file has no grants (cleanRootProbe
+ * leaves it empty): the three apt entries and reboot, sorted as auditFindings sorts them.
+ */
+const NO_GRANTS_WARNINGS = [
+  "privilege-missing:apt-full-upgrade warning",
+  "privilege-missing:apt-update warning",
+  "privilege-missing:apt-upgrade warning",
+  "privilege-missing:reboot warning",
+];
+
+Deno.test("auditAccess: the user probe goes to sshModel without sudo; the root probe goes to provisionSshModel, under sudo only for a non-root login, one call per group", async () => {
+  const env = auditEnv(
+    sshDefinition("root", [
+      { name: "web1" },
+      { name: "web2", user: "ops" },
+      { name: "web3", user: "ops" },
+    ]),
+    ["web1", "web2", "web3"].map((host) => ({ host })),
+  );
+  await withCallLog(env, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      machines: [{ host: "web1" }, { host: "web2" }, { host: "web3" }],
+    });
+    await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+
+    // One user probe through the ssh model, then one root probe per sudo group.
+    const lines = await calls();
+    assertEquals(lines.length, 3);
+    assert(lines[0].startsWith("ssh script "), lines[0]);
+    assert(!lines[0].includes("sudo:json"), lines[0]);
+    assertStringIncludes(lines[0], 'hosts:json=["web1","web2","web3"]');
+    const roots = lines.slice(1);
+    for (const l of roots) assert(l.startsWith("prov script "), l);
+    const plain = roots.find((l) => !l.includes("sudo:json"));
+    const sudo = roots.find((l) => l.includes("sudo:json=true"));
+    assert(plain !== undefined, "a root probe call without sudo");
+    assert(sudo !== undefined, "a root probe call with sudo");
+    assertStringIncludes(plain, 'hosts:json=["web1"]');
+    assertStringIncludes(sudo, 'hosts:json=["web2","web3"]');
+  });
+});
+
+Deno.test("auditAccess: a managed host whose sudoers file has no grants gives only the privilege-missing warnings, ok true, and no throw", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{ host: "web1" }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{ host: "web1" }],
+      });
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+      assertEquals(
+        t.written("accessAudit").map((r) => r.name),
+        ["access-audit-web1"],
+      );
+      const rec = auditOf(t, "web1");
+      assertEquals(rec.host, "web1");
+      assertEquals(rec.ok, true);
+      assertEquals(auditFindings(rec), NO_GRANTS_WARNINGS);
+      assertEquals(rec.acceptedRisks, []);
+      assertEquals(rec.summary, {
+        critical: 0,
+        high: 0,
+        warning: 4,
+        info: 0,
+        accepted: 0,
+        overdue: 0,
+      });
+      assertEquals(rec.userProbe, CLEAN_USER_PROBE);
+      assertEquals(rec.rootProbe, cleanRootProbe());
+      assertEquals(rec.userProbeError, null);
+      assertEquals(rec.rootProbeError, null);
+    },
+  );
+});
+
+Deno.test("auditAccess: a managed machine's OS policy requires the apt grants: with an empty sudoers file and only apt on the host, each apt entry is privilege-missing and reboot is not", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{
+      host: "web1",
+      rootProbe: cleanRootProbe({ sudoFamilies: ["apt"] }),
+    }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        osUpdatePolicy: "managed",
+        machines: [{ host: "web1" }],
+      });
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+      const rec = auditOf(t, "web1");
+      assertEquals(rec.ok, true);
+      assertEquals(auditFindings(rec), [
+        "privilege-missing:apt-full-upgrade warning",
+        "privilege-missing:apt-update warning",
+        "privilege-missing:apt-upgrade warning",
+      ]);
+    },
+  );
+});
+
+Deno.test("auditAccess: the patch login in the docker group is critical, the run throws naming the host and the id, and failOn none does not throw", async () => {
+  const docker = cleanRootProbe({ groupsOfUser: ["swamp-patch", "docker"] });
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{
+      host: "web1",
+      rootProbe: docker,
+    }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{ host: "web1" }],
+      });
+      await assertRejects(
+        () => model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx),
+        Error,
+        "web1: group-root-equivalent:docker",
+      );
+      const rec = auditOf(t, "web1");
+      assertEquals(rec.ok, false);
+      assertEquals(auditFindings(rec), [
+        "group-root-equivalent:docker critical",
+        ...NO_GRANTS_WARNINGS,
+      ]);
+
+      const quiet = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{ host: "web1" }],
+      });
+      await model.methods.auditAccess.execute(
+        AUDIT_ARGS.parse({ failOn: "none" }),
+        quiet.ctx,
+      );
+      const passed = auditOf(quiet, "web1");
+      assertEquals(passed.ok, true);
+      assertEquals(auditFindings(passed), [
+        "group-root-equivalent:docker critical",
+        ...NO_GRANTS_WARNINGS,
+      ]);
+    },
+  );
+});
+
+Deno.test("auditAccess: a provisioning login that cannot be read is not contacted and gives probe-failed:root", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [
+      { host: "web1" },
+      { host: "ghost" },
+    ]),
+    async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{ host: "web1" }, { host: "ghost" }],
+      });
+      // probe-failed is high and the default failOn is high: an unknown state fails the run.
+      await assertRejects(
+        () => model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx),
+        Error,
+        "ghost: probe-failed:root",
+      );
+
+      const roots = (await calls()).filter((l) => l.startsWith("prov script "));
+      assertEquals(roots.length, 1);
+      assertStringIncludes(roots[0], 'hosts:json=["web1"]');
+      assertEquals(roots.some((l) => l.includes("ghost")), false);
+
+      const ghost = auditOf(t, "ghost");
+      assertEquals(ghost.rootProbe, null);
+      assertEquals(
+        ghost.rootProbeError,
+        "login cannot be read from prov",
+      );
+      assertEquals(ghost.userProbeError, null);
+      assertEquals(auditFindings(ghost), ["probe-failed:root high"]);
+      assertEquals(auditOf(t, "web1").ok, true);
+
+      // Only an explicit, looser failOn lets it pass.
+      const loose = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{ host: "web1" }, { host: "ghost" }],
+      });
+      await model.methods.auditAccess.execute(
+        AUDIT_ARGS.parse({ failOn: "critical" }),
+        loose.ctx,
+      );
+      assertEquals(auditOf(loose, "ghost").ok, true);
+    },
+  );
+});
+
+Deno.test("auditAccess: a probe whose call fails records the error on every host", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [
+      { name: "web1" },
+      { name: "web2" },
+    ]),
+    FAKE_SWAMP_SCRIPT_RC: "1",
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      machines: [{ host: "web1" }, { host: "web2" }],
+    });
+    // Every host is written before the run fails on the unknown state.
+    await assertRejects(
+      () => model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx),
+      Error,
+      "web2: probe-failed:user, probe-failed:root",
+    );
+    for (const host of ["web1", "web2"]) {
+      const rec = auditOf(t, host);
+      assertEquals(rec.userProbe, null);
+      assertStringIncludes(String(rec.userProbeError), "ssh script failed");
+      assertStringIncludes(String(rec.rootProbeError), "prov script failed");
+      assertEquals(auditFindings(rec), [
+        "probe-failed:root high",
+        "probe-failed:user high",
+      ]);
+    }
+  });
+});
+
+Deno.test("auditAccess: an accepted risk moves the docker finding out, and the run passes at failOn critical", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{
+      host: "web1",
+      rootProbe: cleanRootProbe({ groupsOfUser: ["swamp-patch", "docker"] }),
+    }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{
+          host: "web1",
+          acceptedRisks: [{
+            reason: "Docker builds run as this login, reviewed quarterly",
+            acceptedBy: "dmc",
+            acceptedAt: "2026-10-01",
+            reviewBy: "2027-06-30",
+            finding: "group-root-equivalent:docker",
+          }],
+        }],
+      });
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+      const rec = auditOf(t, "web1");
+      assertEquals(rec.ok, true);
+      assertEquals(auditFindings(rec), NO_GRANTS_WARNINGS);
+      const accepted = rec.acceptedRisks as Array<
+        { id: string; severity: string }
+      >;
+      assertEquals(
+        accepted.map((a) => `${a.id} ${a.severity}`),
+        ["group-root-equivalent:docker critical"],
+      );
+      assertEquals(
+        (rec.summary as { critical: number; accepted: number }).critical,
+        0,
+      );
+      assertEquals(
+        (rec.summary as { critical: number; accepted: number }).accepted,
+        1,
+      );
+    },
+  );
+});
+
+Deno.test("auditAccess: throws without access, when provisionSshModel is sshModel, or for an unknown host; the access-configured check fails the same way", async () => {
+  const noAccess = { sshModel: "ssh", machines: [{ host: "web1" }] };
+  const sameModel = {
+    ...ACCESS_FLEET,
+    access: { ...ACCESS, provisionSshModel: "ssh" },
+  };
+  await assertRejects(
+    () =>
+      model.methods.auditAccess.execute(
+        AUDIT_ARGS.parse({}),
+        mkCtx(noAccess).ctx,
+      ),
+    Error,
+    "access is not configured",
+  );
+  await assertRejects(
+    () =>
+      model.methods.auditAccess.execute(
+        AUDIT_ARGS.parse({}),
+        mkCtx(sameModel).ctx,
+      ),
+    Error,
+    "must differ from sshModel",
+  );
+  await assertRejects(
+    () =>
+      model.methods.auditAccess.execute(
+        AUDIT_ARGS.parse({ hosts: ["nope"] }),
+        mkCtx(ACCESS_FLEET).ctx,
+      ),
+    Error,
+    'No machine "nope"',
+  );
+
+  const missing = await runCheck(
+    "access-configured",
+    checkCtx(noAccess, "auditAccess"),
+  );
+  assertEquals(missing.pass, false);
+  assertStringIncludes(missing.errors!.join(" "), "access is not configured");
+  const same = await runCheck(
+    "access-configured",
+    checkCtx(sameModel, "auditAccess", {}),
+  );
+  assertEquals(same.pass, false);
+  assertStringIncludes(same.errors!.join(" "), "must differ from sshModel");
+  const unknown = await runCheck(
+    "access-configured",
+    checkCtx(ACCESS_FLEET, "auditAccess", { hosts: ["nope"] }),
+  );
+  assertEquals(unknown.pass, false);
+  assertStringIncludes(unknown.errors!.join(" "), 'No machine "nope"');
+});
+
+Deno.test("auditAccess: an empty selection contacts nothing and does not fail", async () => {
+  await withCallLog({}, async (calls) => {
+    const t = mkCtx({ sshModel: "ssh", access: ACCESS, machines: [] });
+    await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+    assertEquals((await calls()).length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OS update policy: the schema, the runtime guards of safeOsUpdate and reboot, and the
+// audit's auto-install-off. A refused run makes no runModel call at all (the fake records
+// none) and writes no record, so a refusal can never have snapshotted, connected or upgraded.
+// ---------------------------------------------------------------------------
+
+Deno.test("os policy: the fleet defaults are managed and security, and a machine inherits them", () => {
+  const g = model.globalArguments.parse({
+    sshModel: "ssh",
+    machines: [{ host: "a" }],
+  });
+  assertEquals(g.osUpdatePolicy, "managed");
+  assertEquals(g.osAutoScope, "security");
+  assertEquals(g.machines[0].osUpdatePolicy, undefined);
+  assertEquals(g.machines[0].osAutoScope, undefined);
+});
+
+Deno.test("os policy: a machine may set auto with a scope, and an auto fleet default needs no machine field", () => {
+  const g = model.globalArguments.parse({
+    sshModel: "ssh",
+    osUpdatePolicy: "auto",
+    osAutoScope: "all",
+    machines: [{ host: "a" }, {
+      host: "b",
+      osUpdatePolicy: "auto",
+      osAutoScope: "security",
+    }],
+  });
+  assertEquals(g.osUpdatePolicy, "auto");
+  assertEquals(g.machines[1].osAutoScope, "security");
+});
+
+Deno.test("os policy: osAutoScope on a machine that sets managed or scan-only is rejected by the schema", () => {
+  for (const policy of ["managed", "scan-only"]) {
+    const r = model.globalArguments.safeParse({
+      sshModel: "ssh",
+      machines: [{ host: "a", osUpdatePolicy: policy, osAutoScope: "security" }],
+    });
+    assertEquals(r.success, false, policy);
+    assertStringIncludes(
+      r.success ? "" : r.error.message,
+      "osAutoScope applies only when osUpdatePolicy is auto",
+    );
+  }
+});
+
+Deno.test("os policy: unknown policy and scope values are rejected", () => {
+  assertEquals(
+    model.globalArguments.safeParse({
+      sshModel: "ssh",
+      machines: [{ host: "a", osUpdatePolicy: "yolo" }],
+    }).success,
+    false,
+  );
+  assertEquals(
+    model.globalArguments.safeParse({ sshModel: "ssh", osAutoScope: "some" })
+      .success,
+    false,
+  );
+});
+
+Deno.test("safeOsUpdate: refused on an auto VM with no snapshot, no connection and no upgrade", async () => {
+  await withFake(osUpdateEnv(), async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "web1",
+        vm: { proxmoxNode: "pve", vmid: 100 },
+        osUpdatePolicy: "auto",
+      }],
+    });
+    await assertRejects(
+      () =>
+        model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+          t.ctx,
+        ),
+      Error,
+      "safeOsUpdate refused for web1: osUpdatePolicy is auto (the host installs its own OS updates); use reboot for pending reboots",
+    );
+    assertEquals(t.calls.length, 0);
+    assertEquals(t.written("snapshot"), []);
+    assertEquals(t.written("osUpdate"), []);
+    assertEquals(t.written("run"), []);
+  });
+});
+
+Deno.test("safeOsUpdate: refused on a scan-only fleet and on a machine with os false, before any call", async () => {
+  await withFake(osUpdateEnv(), async () => {
+    const scan = mkCtx({
+      sshModel: "ssh",
+      osUpdatePolicy: "scan-only",
+      machines: [{ host: "web1" }],
+    });
+    await assertRejects(
+      () =>
+        model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+          scan.ctx,
+        ),
+      Error,
+      "safeOsUpdate refused for web1: osUpdatePolicy is scan-only",
+    );
+    assertEquals(scan.calls.length, 0);
+    assertEquals(scan.written("osUpdate"), []);
+
+    const off = mkCtx({ sshModel: "ssh", machines: [{ host: "web1", os: false }] });
+    await assertRejects(
+      () =>
+        model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+          off.ctx,
+        ),
+      Error,
+      "safeOsUpdate refused for web1: os is false",
+    );
+    assertEquals(off.calls.length, 0);
+  });
+});
+
+Deno.test("safeOsUpdate: a machine's managed policy overrides an auto fleet default, and it upgrades", async () => {
+  await withFake(osUpdateEnv(), async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      osUpdatePolicy: "auto",
+      machines: [{ host: "web1", osUpdatePolicy: "managed" }],
+    });
+    await model.methods.safeOsUpdate.execute(
+      model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+      t.ctx,
+    );
+    assertEquals(t.one("osUpdate").outcome, "updated");
+  });
+});
+
+Deno.test("reboot: refused on a scan-only machine even with force, before any call or record", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      {
+        sshModel: "ssh",
+        machines: [{ host: "web1", osUpdatePolicy: "scan-only" }],
+      },
+      { stored: { web1: { needsReboot: true } } },
+    );
+    await assertRejects(
+      () =>
+        model.methods.reboot.execute(
+          model.methods.reboot.arguments.parse({
+            host: "web1",
+            force: true,
+            wait: false,
+          }),
+          t.ctx,
+        ),
+      Error,
+      "reboot refused for web1: osUpdatePolicy is scan-only (the host is only scanned; reboots are refused, even with force)",
+    );
+    assertEquals(t.calls.length, 0);
+    assertEquals(t.written("reboot"), []);
+    assertEquals(t.written("run"), []);
+  });
+});
+
+Deno.test("reboot: allowed on an auto machine, which installs its own updates but can still need a reboot", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      { sshModel: "ssh", machines: [{ host: "web1", osUpdatePolicy: "auto" }] },
+      { stored: { web1: { needsReboot: true } } },
+    );
+    await model.methods.reboot.execute(
+      model.methods.reboot.arguments.parse({ host: "web1", wait: false }),
+      t.ctx,
+    );
+    assertEquals(t.one("reboot").outcome, "rebooted");
+  });
+});
+
+Deno.test("reboot: os false does not refuse a reboot; the policy alone decides", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1", os: false }] });
+    let err = "";
+    try {
+      await model.methods.reboot.execute(
+        model.methods.reboot.arguments.parse({
+          host: "web1",
+          force: true,
+          wait: false,
+        }),
+        t.ctx,
+      );
+    } catch (e) {
+      err = String(e);
+    }
+    assert(!err.includes("refused"), err);
+    assert(t.calls.length > 0, "the reboot reached the transport");
+  });
+});
+
+Deno.test("globalArguments: a machine that inherits a non-auto policy may not set osAutoScope", () => {
+  const bad = model.globalArguments.safeParse({
+    sshModel: "ssh",
+    machines: [{ host: "web1", osAutoScope: "all" }],
+  });
+  assert(!bad.success);
+  assertStringIncludes(
+    JSON.stringify(bad.error.issues),
+    "web1 inherits osUpdatePolicy: managed from the fleet",
+  );
+  assert(
+    model.globalArguments.safeParse({
+      sshModel: "ssh",
+      osUpdatePolicy: "auto",
+      machines: [{ host: "web1", osAutoScope: "all" }],
+    }).success,
+  );
+});
+
+Deno.test("auditAccess: an auto machine whose host does not install updates gets auto-install-off, and the run still passes", async () => {
+  const off = cleanRootProbe({
+    cache: {
+      family: "apt",
+      refreshOn: true,
+      ageHours: 1,
+      autoInstall: false,
+      autoScope: null,
+    },
+  });
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{
+      host: "web1",
+      rootProbe: off,
+    }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{ host: "web1", osUpdatePolicy: "auto" }],
+      });
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+      const rec = auditOf(t, "web1");
+      // An auto machine's OS upgrades are off, so only reboot is required of its grants.
+      assertEquals(auditFindings(rec), [
+        "auto-install-off warning",
+        "privilege-missing:reboot warning",
+      ]);
+      assertEquals(rec.ok, true);
+    },
+  );
+});
+
+Deno.test("auditAccess: the fleet's auto default is audited per machine: no install or scope finding when the host installs its own updates", async () => {
+  const on = cleanRootProbe({
+    cache: {
+      family: "apt",
+      refreshOn: true,
+      ageHours: 1,
+      autoInstall: true,
+      autoScope: "security",
+    },
+  });
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{
+      host: "web1",
+      rootProbe: on,
+    }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        osUpdatePolicy: "auto",
+        machines: [{ host: "web1" }],
+      });
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+      // Reboot is the one grant an auto machine needs; the empty sudoers file lacks it.
+      assertEquals(auditFindings(auditOf(t, "web1")), [
+        "privilege-missing:reboot warning",
+      ]);
+    },
+  );
+});
+
+Deno.test("access: the auto scope comes from the OS policy: the fleet default, a machine's own scope, and os false or managed give none", async () => {
+  await withCallLog({}, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      osUpdatePolicy: "auto",
+      machines: [
+        { host: "web1" },
+        { host: "web2", osAutoScope: "all" },
+        { host: "web3", os: false },
+        { host: "web4", osUpdatePolicy: "managed" },
+      ],
+    });
+    await model.methods.renderAccess.execute({}, t.ctx);
+    const scripts = new Map(
+      t.written("accessPlan").map((p) => [
+        p.name,
+        String((p.data as Record<string, unknown>).provisionScript),
+      ]),
+    );
+    const of = (host: string) => scripts.get(`access-plan-${host}`) ?? "";
+
+    // The fleet default is security; web2 overrides it to all.
+    assertStringIncludes(of("web1"), `auto_json='"security"'`);
+    assertStringIncludes(of("web1"), "upgrade_type = security");
+    assertStringIncludes(of("web2"), `auto_json='"all"'`);
+    assertStringIncludes(of("web2"), "upgrade_type = default");
+    assertStringIncludes(of("web2"), '-updates";');
+    // os false turns OS actions off, so the host gets no auto files, and no pre-flight either.
+    for (const host of ["web3", "web4"]) {
+      assertStringIncludes(of(host), "auto_json=null");
+      assert(!of(host).includes("auto OS updates are refused"), host);
+      assert(!of(host).includes("upgrade_type ="), host);
+    }
+    // The scripts of the auto machines carry the pre-flight, before the account is made.
+    assert(
+      of("web1").indexOf("auto OS updates are refused") <
+        of("web1").indexOf("== account"),
+    );
+
+    // provisionAccess takes the same targets, so its dry run carries the same scope. It
+    // contacts no host.
+    const p = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      osUpdatePolicy: "auto",
+      machines: [{ host: "web1" }, { host: "web2", osAutoScope: "all" }],
+    });
+    await model.methods.provisionAccess.execute({ dryRun: true }, p.ctx);
+    const planned = new Map(
+      p.written("accessPlan").map((r) => [
+        r.name,
+        String((r.data as Record<string, unknown>).provisionScript),
+      ]),
+    );
+    assertStringIncludes(
+      planned.get("access-plan-web1") ?? "",
+      `auto_json='"security"'`,
+    );
+    assertStringIncludes(
+      planned.get("access-plan-web2") ?? "",
+      `auto_json='"all"'`,
+    );
+  });
+});
+
+Deno.test("access: a pre-flight refusal (exit 5) is refused-preflight, the run throws, and nothing else is recorded as applied", async () => {
+  await withCallLog({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptRunsOut([{
+      host: "web1",
+      stdout:
+        "== preflight\nauto OS updates are refused on a Proxmox node (it needs full-upgrade under @dmc/patch)\n",
+      exitCode: 5,
+    }]),
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      osUpdatePolicy: "auto",
+      machines: [{ host: "web1" }],
+    });
+    await assertRejects(
+      () => model.methods.provisionAccess.execute({ dryRun: false }, t.ctx),
+      Error,
+      "web1 (refused-preflight)",
+    );
+    const rec = accessRunsByHost(t).get("web1");
+    assertEquals(rec?.outcome, "refused-preflight");
+    assertEquals(rec?.exitCode, 5);
+    assertEquals(rec?.ok, false);
+  });
+});
+
+Deno.test("auditAccess: an auto file whose scope differs from the machine's scope gives auto-scope-mismatch, a warning that does not fail the run", async () => {
+  const all = cleanRootProbe({
+    cache: {
+      family: "apt",
+      refreshOn: true,
+      ageHours: 1,
+      autoInstall: true,
+      autoScope: "all",
+    },
+  });
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{
+      host: "web1",
+      rootProbe: all,
+    }]),
+    async () => {
+      // The fleet default scope is security, so an all file is a mismatch.
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        osUpdatePolicy: "auto",
+        machines: [{ host: "web1" }],
+      });
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+      const rec = auditOf(t, "web1");
+      assertEquals(auditFindings(rec), [
+        "auto-scope-mismatch warning",
+        "privilege-missing:reboot warning",
+      ]);
+      assertEquals(rec.ok, true);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Package-set verdict: a change made outside @dmc/patch, read from the packages hash
+// ---------------------------------------------------------------------------
+
+const HASH_A = "a".repeat(64);
+const HASH_B = "b".repeat(64);
+const HASH_G = "9".repeat(64);
+const EARLIER = "2026-10-01T00:00:00.000Z";
+const NOW = "2026-10-30T12:00:00.000Z";
+
+Deno.test("packagesHashOf: only 64 lowercase hex characters are a hash", () => {
+  assertEquals(fleet.packagesHashOf(HASH_A), HASH_A);
+  assertEquals(fleet.packagesHashOf("A".repeat(64)), null);
+  assertEquals(fleet.packagesHashOf("a".repeat(63)), null);
+  assertEquals(fleet.packagesHashOf(`${HASH_A}0`), null);
+  assertEquals(fleet.packagesHashOf(null), null);
+  assertEquals(fleet.packagesHashOf(undefined), null);
+  assertEquals(fleet.packagesHashOf(42), null);
+});
+
+Deno.test("outsidePackageChange: no previous record is an unknown verdict, and this read is the baseline", () => {
+  assertEquals(fleet.outsidePackageChange(null, HASH_A, NOW), {
+    packagesHash: HASH_A,
+    packagesBaseline: HASH_A,
+    packagesChangedOutsidePatch: null,
+    lastOutsideChangeAt: null,
+  });
+});
+
+Deno.test("outsidePackageChange: a previous record without a baseline is compared with its hash", () => {
+  assertEquals(
+    fleet.outsidePackageChange({ packagesHash: HASH_G }, HASH_A, NOW),
+    {
+      packagesHash: HASH_A,
+      packagesBaseline: HASH_A,
+      packagesChangedOutsidePatch: true,
+      lastOutsideChangeAt: NOW,
+    },
+  );
+  assertEquals(
+    fleet.outsidePackageChange(
+      { packagesHash: HASH_G, packagesBaseline: null },
+      HASH_G,
+      NOW,
+    ).packagesChangedOutsidePatch,
+    false,
+  );
+});
+
+Deno.test("outsidePackageChange: an equal hash is false, and the carried lastOutsideChangeAt stays", () => {
+  const prev = {
+    packagesHash: HASH_A,
+    packagesBaseline: HASH_A,
+    lastOutsideChangeAt: EARLIER,
+  };
+  assertEquals(fleet.outsidePackageChange(prev, HASH_A, NOW), {
+    packagesHash: HASH_A,
+    packagesBaseline: HASH_A,
+    packagesChangedOutsidePatch: false,
+    lastOutsideChangeAt: EARLIER,
+  });
+});
+
+Deno.test("outsidePackageChange: a different hash is true, and lastOutsideChangeAt becomes this scan", () => {
+  const prev = {
+    packagesHash: HASH_G,
+    packagesBaseline: HASH_G,
+    lastOutsideChangeAt: EARLIER,
+  };
+  assertEquals(fleet.outsidePackageChange(prev, HASH_B, NOW), {
+    packagesHash: HASH_B,
+    packagesBaseline: HASH_B,
+    packagesChangedOutsidePatch: true,
+    lastOutsideChangeAt: NOW,
+  });
+});
+
+Deno.test("outsidePackageChange: an unknown read gives a null verdict and carries the baseline and the time", () => {
+  const prev = {
+    packagesHash: HASH_B,
+    packagesBaseline: HASH_G,
+    lastOutsideChangeAt: EARLIER,
+  };
+  assertEquals(fleet.outsidePackageChange(prev, null, NOW), {
+    packagesHash: null,
+    packagesBaseline: HASH_G,
+    packagesChangedOutsidePatch: null,
+    lastOutsideChangeAt: EARLIER,
+  });
+  // A value that is not a hash is an unknown read too.
+  assertEquals(
+    fleet.outsidePackageChange(prev, "not-a-hash", NOW).packagesChangedOutsidePatch,
+    null,
+  );
+  // Nothing known on either side: all unknown.
+  assertEquals(fleet.outsidePackageChange(null, null, NOW), {
+    packagesHash: null,
+    packagesBaseline: null,
+    packagesChangedOutsidePatch: null,
+    lastOutsideChangeAt: null,
+  });
+});
+
+Deno.test("updatedPackageState: the verdict reads the before hash; the record holds the hash the update left", () => {
+  // An outside change before the update (G -> B) is flagged; the update leaves A.
+  const flagged = fleet.updatedPackageState(
+    { packagesHash: HASH_G, packagesBaseline: HASH_G },
+    HASH_B,
+    HASH_A,
+    NOW,
+  );
+  assertEquals(flagged, {
+    packagesHash: HASH_A,
+    packagesBaseline: HASH_A,
+    packagesChangedOutsidePatch: true,
+    lastOutsideChangeAt: NOW,
+  });
+  // The next scan of the state left behind does not flag.
+  assertEquals(
+    fleet.outsidePackageChange(
+      flagged,
+      HASH_A,
+      "2026-10-31T00:00:00.000Z",
+    ).packagesChangedOutsidePatch,
+    false,
+  );
+});
+
+Deno.test("updatedPackageState: an unknown final state carries the baseline (the before read's, else the previous)", () => {
+  assertEquals(
+    fleet.updatedPackageState(
+      { packagesHash: HASH_G, packagesBaseline: HASH_G },
+      HASH_B,
+      null,
+      NOW,
+    ),
+    {
+      packagesHash: null,
+      packagesBaseline: HASH_B,
+      packagesChangedOutsidePatch: true,
+      lastOutsideChangeAt: NOW,
+    },
+  );
+  assertEquals(
+    fleet.updatedPackageState(
+      { packagesHash: HASH_G, packagesBaseline: HASH_G, lastOutsideChangeAt: EARLIER },
+      null,
+      null,
+      NOW,
+    ),
+    {
+      packagesHash: null,
+      packagesBaseline: HASH_G,
+      packagesChangedOutsidePatch: null,
+      lastOutsideChangeAt: EARLIER,
+    },
+  );
+});
+
+Deno.test("inventory schema: a record without the package fields parses with them null; a malformed hash is rejected", () => {
+  const schema = model.resources.inventory.schema;
+  const v4 = {
+    ...INVENTORY,
+    schemaVersion: 4,
+    reachMethod: null,
+    health: null,
+    error: null,
+  };
+  const parsed = schema.parse(v4);
+  assertEquals(parsed.packagesHash, null);
+  assertEquals(parsed.packagesBaseline, null);
+  assertEquals(parsed.packagesChangedOutsidePatch, null);
+  assertEquals(parsed.lastOutsideChangeAt, null);
+  assertThrows(() => schema.parse({ ...v4, packagesHash: "XYZ" }));
+  assertThrows(() => schema.parse({ ...v4, packagesBaseline: "a".repeat(63) }));
+  assertEquals(
+    schema.parse({ ...v4, packagesHash: HASH_A, packagesBaseline: HASH_A })
+      .packagesHash,
+    HASH_A,
+  );
+});
+
+Deno.test("scan: a collector hash is compared with the previous record, and a change sets lastOutsideChangeAt", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut(
+      "web1",
+      collectorStdout({ schemaVersion: 5, packagesHash: HASH_B }),
+    ),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, {
+      stored: {
+        web1: {
+          packagesHash: HASH_G,
+          packagesBaseline: HASH_G,
+          packagesChangedOutsidePatch: false,
+          lastOutsideChangeAt: null,
+        },
+      },
+    });
+    const before = Date.now();
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.packagesHash, HASH_B);
+    assertEquals(inv.packagesBaseline, HASH_B);
+    assertEquals(inv.packagesChangedOutsidePatch, true);
+    assert(typeof inv.lastOutsideChangeAt === "string");
+    assert(Date.parse(inv.lastOutsideChangeAt) >= before);
+  });
+});
+
+Deno.test("scan: an unchanged collector hash is false and keeps the earlier lastOutsideChangeAt", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut(
+      "web1",
+      collectorStdout({ schemaVersion: 5, packagesHash: HASH_B }),
+    ),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, {
+      stored: {
+        web1: {
+          packagesHash: HASH_B,
+          packagesBaseline: HASH_B,
+          packagesChangedOutsidePatch: true,
+          lastOutsideChangeAt: EARLIER,
+        },
+      },
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.packagesChangedOutsidePatch, false);
+    assertEquals(inv.lastOutsideChangeAt, EARLIER);
+  });
+});
+
+Deno.test("scan: a schemaVersion 4 line stores the package fields as unknown, and the baseline is carried", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({ schemaVersion: 4 })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, {
+      stored: {
+        web1: {
+          packagesHash: HASH_B,
+          packagesBaseline: HASH_G,
+          lastOutsideChangeAt: EARLIER,
+        },
+      },
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.updatesCount, 3);
+    assertEquals(inv.packagesHash, null);
+    assertEquals(inv.packagesChangedOutsidePatch, null);
+    assertEquals(inv.packagesBaseline, HASH_G);
+    assertEquals(inv.lastOutsideChangeAt, EARLIER);
+  });
+});
+
+Deno.test("scan: an error record carries the baseline, so an unreachable host does not reset it", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", "no json here\n", 1),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] }, {
+      stored: {
+        web1: {
+          packagesHash: HASH_B,
+          packagesBaseline: HASH_G,
+          lastOutsideChangeAt: EARLIER,
+        },
+      },
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.error, "no inventory (exit 1)");
+    assertEquals(inv.packagesHash, null);
+    assertEquals(inv.packagesBaseline, HASH_G);
+    assertEquals(inv.packagesChangedOutsidePatch, null);
+    assertEquals(inv.lastOutsideChangeAt, EARLIER);
+  });
+});
+
+Deno.test("scan: an osUpdater model's record has no hash, so its verdict is unknown and the baseline is carried", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout()),
+    FAKE_SWAMP_OSSCAN_1: resourceOut({
+      packageManager: "pacman",
+      updatesCount: 7,
+      needsReboot: false,
+    }),
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "web1" }, {
+        host: "arch1",
+        osUpdater: { model: "pacman-os" },
+      }],
+    }, {
+      stored: {
+        arch1: {
+          packagesHash: HASH_B,
+          packagesBaseline: HASH_G,
+          lastOutsideChangeAt: EARLIER,
+        },
+      },
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const arch = t.written("inventory").find((r) => r.name === "arch1")!.data;
+    assertEquals(arch.updatesCount, 7);
+    assertEquals(arch.packagesHash, null);
+    assertEquals(arch.packagesChangedOutsidePatch, null);
+    assertEquals(arch.packagesBaseline, HASH_G);
+    assertEquals(arch.lastOutsideChangeAt, EARLIER);
+  });
+});
+
+Deno.test("safeOsUpdate: a change made outside @dmc/patch before the update is flagged; the next scan does not flag the update's own change", async () => {
+  const machines = [{ host: "web1" }];
+  let inv: Record<string, unknown>;
+  await withFake({
+    ...osUpdateEnv(),
+    FAKE_SWAMP_SCRIPT_1: scriptOut(
+      "web1",
+      collectorStdout({ schemaVersion: 5, packagesHash: HASH_B }),
+    ),
+    FAKE_SWAMP_SCRIPT_2: scriptOut(
+      "web1",
+      collectorStdout({
+        schemaVersion: 5,
+        updatesCount: 0,
+        needsReboot: true,
+        packagesHash: HASH_A,
+      }),
+    ),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines }, {
+      stored: {
+        web1: {
+          packagesHash: HASH_G,
+          packagesBaseline: HASH_G,
+          packagesChangedOutsidePatch: false,
+          lastOutsideChangeAt: null,
+        },
+      },
+    });
+    await model.methods.safeOsUpdate.execute(
+      model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+      t.ctx,
+    );
+    inv = t.one("inventory");
+    assertEquals(inv.packagesChangedOutsidePatch, true);
+    assertEquals(inv.packagesHash, HASH_A);
+    assertEquals(inv.packagesBaseline, HASH_A);
+    assert(typeof inv.lastOutsideChangeAt === "string");
+  });
+  // The next scan reads the state the update left behind (A): no flag, and the time stays.
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut(
+      "web1",
+      collectorStdout({ schemaVersion: 5, packagesHash: HASH_A }),
+    ),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines }, {
+      stored: { web1: inv },
+    });
+    await model.methods.scan.execute({}, t.ctx);
+    const next = t.one("inventory");
+    assertEquals(next.packagesChangedOutsidePatch, false);
+    assertEquals(next.lastOutsideChangeAt, inv.lastOutsideChangeAt);
+  });
+});
+
+Deno.test("safeOsUpdate: a rolled-back VM records the restored machine's hash, so the rollback does not flag", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withFake({
+      ...osUpdateEnv(),
+      // Run order: before scan (1), after scan (2), restored scan (1 again, the fake
+      // cycles its two answers): the restored machine is in the before state.
+      FAKE_SWAMP_SCRIPT_1: scriptOut(
+        "web1",
+        collectorStdout({ schemaVersion: 5, packagesHash: HASH_B }),
+      ),
+      FAKE_SWAMP_SCRIPT_2: scriptOut(
+        "web1",
+        collectorStdout({
+          schemaVersion: 5,
+          updatesCount: 0,
+          needsReboot: true,
+          packagesHash: HASH_A,
+        }),
+      ),
+    }, async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          vm: { proxmoxNode: "pve", vmid: 100 },
+          health: [{ type: "http", url: server.url }],
+        }],
+      }, {
+        stored: {
+          web1: {
+            packagesHash: HASH_B,
+            packagesBaseline: HASH_B,
+            packagesChangedOutsidePatch: false,
+            lastOutsideChangeAt: null,
+          },
+        },
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "web1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      assertEquals(t.one("osUpdate").outcome, "rolled-back");
+      const inv = t.one("inventory");
+      assertEquals(inv.packagesHash, HASH_B);
+      assertEquals(inv.packagesBaseline, HASH_B);
+      assertEquals(inv.packagesChangedOutsidePatch, false);
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+/** sha256 of a text as lowercase hex (the digest sha256sum prints). */
+async function sha256Of(text: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Run collect_packages_hash from the bundled collector with a fake `dpkg-query` (a sh
+ * body) first on PATH, and echo the hash the function set.
+ */
+async function runPackagesHash(dpkgQuery: string): Promise<string> {
+  const dir = await Deno.makeTempDir();
+  try {
+    await Deno.writeTextFile(`${dir}/dpkg-query`, `#!/bin/sh\n${dpkgQuery}\n`);
+    await Deno.chmod(`${dir}/dpkg-query`, 0o755);
+    const body = fleet.COLLECTOR_SCRIPT.split("\n")
+      .filter((l) => l !== "main </dev/null")
+      .join("\n");
+    const script = body + "\ncollect_packages_hash\necho \"H=$packages_hash\"\n";
+    const out = await new Deno.Command("bash", {
+      args: ["-c", script],
+      env: { PATH: `${dir}:${Deno.env.get("PATH") ?? ""}` },
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    return new TextDecoder().decode(out.stdout).trim();
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+
+Deno.test("collector: the packages hash is the sha256 of the manifest sorted in the C locale", async () => {
+  // C-locale order puts "Apt" before "apt", and "apt" before "zlib".
+  const h = await sha256Of("Apt\t9\napt\t2.0\nzlib\t1.2\n");
+  assertEquals(
+    await runPackagesHash(
+      "printf 'zlib\\t1.2\\napt\\t2.0\\nApt\\t9\\n'",
+    ),
+    `H="${h}"`,
+  );
+});
+
+Deno.test("collector: the packages hash is null when the manifest command fails, prints nothing, or fails part-way", async () => {
+  assertEquals(await runPackagesHash("exit 1"), "H=null");
+  assertEquals(await runPackagesHash("exit 0"), "H=null");
+  assertEquals(
+    await runPackagesHash("printf 'zlib\\t1.2\\n'; exit 1"),
+    "H=null",
+  );
+});
+
+Deno.test("collector: the manifest command is embedded verbatim, one source of truth with the model", () => {
+  assertStringIncludes(fleet.COLLECTOR_SCRIPT, fleet.PKG_MANIFEST_CMD);
+  assertStringIncludes(fleet.COLLECTOR_SCRIPT, '"packagesHash":%s');
+});
+
+// --- swamp-patch-docker: the runtime route (safeUpdate, pruneImages) ----------
+
+const HELPER = "sudo -n '/usr/local/libexec/swamp-patch/swamp-patch-docker'";
+const OLD_ID = `sha256:${"a".repeat(64)}`;
+const NEW_ID = `sha256:${"b".repeat(64)}`;
+
+/** The env that makes the ssh model log in to dock1 as `user`. */
+function loginEnv(user: string): Env {
+  return {
+    FAKE_SWAMP_MODEL_GET: JSON.stringify({
+      globalArguments: { hosts: [{ name: "dock1", transport: { user } }] },
+    }),
+  };
+}
+
+Deno.test("safeUpdate: a non-root login runs docker only through swamp-patch-docker, for the project named by composePath", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog({
+      ...loginEnv("swamp-patch"),
+      FAKE_SWAMP_INSPECT_1: execOut(`abc123def456|nginx:1|${OLD_ID}|running|none\n`),
+      FAKE_SWAMP_INSPECT_2: execOut(`abc123def456|nginx:1|${NEW_ID}|running|none\n`),
+      FAKE_SWAMP_EXEC: execOut(""),
+    }, async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [dockerMachine(server.url)],
+      });
+      await model.methods.safeUpdate.execute(
+        model.methods.safeUpdate.arguments.parse({
+          host: "dock1",
+          retentionHours: 24,
+        }),
+        t.ctx,
+      );
+      const lines = await calls();
+      assertEquals(t.one("update").outcome, "updated");
+      assert(
+        lines.some((l) => l.includes(`${HELPER} 'inspect' 'app'`)),
+        "the snapshot goes through inspect",
+      );
+      assert(
+        lines.some((l) => l.includes(`${HELPER} 'update' 'app'`)),
+        "the pull and up go through update",
+      );
+      assert(
+        !lines.some((l) => /docker (compose|inspect|tag|rmi) /.test(l)),
+        "no direct docker call",
+      );
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeUpdate: a rollback through the helper restores each old image by its ref and id", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withCallLog({
+      ...loginEnv("swamp-patch"),
+      FAKE_SWAMP_INSPECT_1: execOut(`abc123def456|nginx:1|${OLD_ID}|running|none\n`),
+      FAKE_SWAMP_INSPECT_2: execOut(`abc123def456|nginx:1|${NEW_ID}|running|none\n`),
+      FAKE_SWAMP_EXEC: execOut(""),
+    }, async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [dockerMachine(server.url)],
+      });
+      await model.methods.safeUpdate.execute(
+        model.methods.safeUpdate.arguments.parse({
+          host: "dock1",
+          healthTimeoutSec: 0,
+        }),
+        t.ctx,
+      );
+      assertEquals(t.one("update").outcome, "rolled-back");
+      const lines = await calls();
+      assert(
+        lines.some((l) =>
+          l.includes(`${HELPER} 'restore' 'app' 'nginx:1' '${OLD_ID}'`)
+        ),
+        "the rollback names the old image id",
+      );
+      assert(!lines.some((l) => l.includes("docker tag ")), "no direct tag");
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeUpdate: a root login keeps the direct docker commands and never calls the helper", async () => {
+  const server = startServer(() => 200);
+  try {
+    await withCallLog({
+      ...loginEnv("root"),
+      FAKE_SWAMP_PS: execOut("abc123def456\n"),
+      FAKE_SWAMP_INSPECT_1: execOut(`nginx:1|${OLD_ID}|running|none\n`),
+      FAKE_SWAMP_INSPECT_2: execOut(`nginx:1|${NEW_ID}|running|none\n`),
+      FAKE_SWAMP_EXEC: execOut(""),
+    }, async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [dockerMachine(server.url)],
+      });
+      await model.methods.safeUpdate.execute(
+        model.methods.safeUpdate.arguments.parse({ host: "dock1" }),
+        t.ctx,
+      );
+      assertEquals(t.one("update").outcome, "updated");
+      const lines = await calls();
+      assert(lines.some((l) => l.includes("docker compose ps -q web")));
+      assert(
+        !lines.some((l) => l.includes("swamp-patch-docker")),
+        "a root login does not use the helper",
+      );
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("safeUpdate: a non-root login needs a composePath, and a service override is refused, before any docker call", async () => {
+  await withCallLog(loginEnv("swamp-patch"), async (calls) => {
+    const noPath = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "dock1", docker: { service: "web" } }],
+    });
+    await assertRejects(
+      () =>
+        model.methods.safeUpdate.execute(
+          model.methods.safeUpdate.arguments.parse({ host: "dock1" }),
+          noPath.ctx,
+        ),
+      Error,
+      "has no docker composePath",
+    );
+    const override = mkCtx({
+      sshModel: "ssh",
+      machines: [dockerMachine("http://127.0.0.1:1/")],
+    });
+    await assertRejects(
+      () =>
+        model.methods.safeUpdate.execute(
+          model.methods.safeUpdate.arguments.parse({
+            host: "dock1",
+            service: "worker",
+          }),
+          override.ctx,
+        ),
+      Error,
+      "service override (worker)",
+    );
+    assertEquals(await calls(), []);
+  });
+});
+
+Deno.test("pruneImages: a non-root login checks the host with ps and removes the image with prune", async () => {
+  await withCallLog({ ...loginEnv("swamp-patch"), FAKE_SWAMP_EXEC: execOut("") }, async (calls) => {
+    const t = mkCtx(PRUNE_FLEET, { data: { image: [imageDatum("i-1")] } });
+    await model.methods.pruneImages.execute(
+      model.methods.pruneImages.arguments.parse({}),
+      t.ctx,
+    );
+    assertEquals((t.one("prune").pruned as unknown[]).length, 1);
+    const lines = await calls();
+    assert(lines.some((l) => l.includes(`${HELPER} 'ps' 'app'`)));
+    assert(lines.some((l) => l.includes(`${HELPER} 'prune' '${IMAGE.imageId}'`)));
+    assert(!lines.some((l) => l.includes("docker rmi")), "no direct rmi");
+  });
+});
+
+Deno.test("pruneImages: a root login keeps docker rmi, and an image id the helper would refuse is kept", async () => {
+  await withCallLog({ ...loginEnv("root"), FAKE_SWAMP_EXEC: execOut("") }, async (calls) => {
+    const root = mkCtx(PRUNE_FLEET, { data: { image: [imageDatum("i-1")] } });
+    await model.methods.pruneImages.execute(
+      model.methods.pruneImages.arguments.parse({}),
+      root.ctx,
+    );
+    assert((await calls()).some((l) => l.includes(`docker rmi ${IMAGE.imageId}`)));
+  });
+  await withCallLog({ ...loginEnv("swamp-patch"), FAKE_SWAMP_EXEC: execOut("") }, async () => {
+    const bad = mkCtx(PRUNE_FLEET, {
+      data: { image: [imageDatum("i-2", { imageId: "sha256:short" })] },
+    });
+    await model.methods.pruneImages.execute(
+      model.methods.pruneImages.arguments.parse({}),
+      bad.ctx,
+    );
+    assertEquals(t_kept(bad.one("prune")), [{
+      host: "dock1",
+      name: "nginx:1",
+      reason: "the image id is not one swamp-patch-docker accepts",
+    }]);
+  });
+});
+
+/** The kept list of a prune record, as the assertions above compare it. */
+function t_kept(prune: Record<string, unknown>) {
+  return prune.kept;
+}
+
+Deno.test("helperLine: sudo -n, the helper's path, then each word shell-quoted; a refused value throws", () => {
+  assertEquals(
+    fleet.helperLine("ps", "app"),
+    "sudo -n '/usr/local/libexec/swamp-patch/swamp-patch-docker' 'ps' 'app'",
+  );
+  assertEquals(
+    fleet.helperLine("prune", IMAGE.imageId),
+    `sudo -n '/usr/local/libexec/swamp-patch/swamp-patch-docker' 'prune' '${IMAGE.imageId}'`,
+  );
+  assertThrows(() => fleet.helperLine("ps", "a;id"), Error, "project name");
+  assertThrows(() => fleet.helperLine("prune", "sha256:short"), Error, "sha256:");
+});
+
+Deno.test("parseInspectRows: keeps the container rows, and skips docker's own lines", () => {
+  const out = [
+    "docker warning: the attribute version is obsolete",
+    "abc123def456|nginx:1|sha256:x|running|healthy",
+    "",
+    "not a row",
+  ].join("\n");
+  assertEquals(fleet.parseInspectRows(out), [{
+    ref: "nginx:1",
+    imageId: "sha256:x",
+    status: "running",
+    health: "healthy",
+  }]);
+});
+
+Deno.test("accessTargets: a docker machine gets its compose project and the helper grant, whatever its OS policy", () => {
+  const { targets } = fleet.accessTargets({
+    sshModel: "ssh",
+    access: ACCESS,
+    machines: [
+      {
+        host: "dock",
+        docker: { composePath: "/srv/app", service: "web" },
+        osUpdatePolicy: "scan-only",
+      },
+      { host: "bare", docker: { service: "web" } },
+      { host: "plain" },
+    ],
+  } as never);
+  const by = Object.fromEntries(targets.map((t) => [t.host, t.input]));
+  assertEquals(by.dock.sudo, { osUpgrade: false, reboot: false, docker: true });
+  assertEquals(by.dock.dockerProjects, [{
+    name: "app",
+    composeDir: "/srv/app",
+    service: "web",
+  }]);
+  // A docker block without a composePath has no project to run.
+  assertEquals(by.bare.dockerProjects, []);
+  assertEquals(by.bare.sudo.docker, true);
+  assertEquals(by.plain.docker, false);
+  assertEquals(by.plain.sudo.docker, false);
+  assertEquals(by.plain.dockerProjects, []);
+});
+
+// ---------------------------------------------------------------------------
+// Plug-in privileges: pluginPrivilegesFor, the access methods, the check, the guard
+// ---------------------------------------------------------------------------
+
+/** A privileges declaration as a plug-in's resource attributes. */
+function privs(
+  commands: unknown[] = [],
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { commands, helpers: [], remoteCode: false, ...extra };
+}
+
+/**
+ * A SwampApi that answers privileges per model: an object is the declaration, null a run
+ * that fails. It records every call.
+ */
+function privilegesSwamp(answers: Record<string, unknown>) {
+  const calls: string[] = [];
+  const api: SwampApi = {
+    run: (m, method, args) => {
+      calls.push(`${m} ${method} ${JSON.stringify(args ?? {})}`);
+      const a = answers[m];
+      return Promise.resolve(
+        a === null || a === undefined
+          ? { ok: false, artifacts: [], error: "Unknown method: privileges" }
+          : { ok: true, artifacts: [a as Record<string, unknown>], error: "" },
+      );
+    },
+    globalArguments: () => Promise.resolve(null),
+  };
+  return { api, calls };
+}
+
+const REMOTE = "acme/updater@v1.2.3";
+
+Deno.test("pluggedModels: the updater that runs (source, else the legacy proxmox), the osUpdater, the snapshotter; one entry per model", () => {
+  assertEquals(fleet.pluggedModels({ host: "a" }), []);
+  assertEquals(
+    fleet.pluggedModels({
+      host: "a",
+      source: { model: "app" },
+      proxmox: { model: "legacy" },
+      osUpdater: { model: "os" },
+      snapshotter: { model: "snap" },
+    }),
+    [
+      { model: "app", roles: ["updater"] },
+      { model: "os", roles: ["osUpdater"] },
+      { model: "snap", roles: ["snapshotter"] },
+    ],
+  );
+  assertEquals(
+    fleet.pluggedModels({
+      host: "a",
+      proxmox: { model: "legacy" },
+      osUpdater: { model: "legacy" },
+    }),
+    [{ model: "legacy", roles: ["updater", "osUpdater"] }],
+  );
+});
+
+Deno.test("pluginPrivilegesFor: asks each distinct model once with the host, and numbers the ids across models", async () => {
+  const { api, calls } = privilegesSwamp({
+    app: privs([{ argv: ["myapp-update", "-y"] }]),
+    snap: privs([{ argv: ["/opt/snap/bin/take"] }, {
+      argv: ["snapctl", "ls"],
+    }]),
+  });
+  const p = await fleet.pluginPrivilegesFor({
+    host: "web1",
+    source: { model: "app" },
+    osUpdater: { model: "app" },
+    snapshotter: { model: "snap" },
+  }, api);
+  assertEquals(calls, [
+    'app privileges {"host":"web1"}',
+    'snap privileges {"host":"web1"}',
+  ]);
+  assertEquals(p.errors, []);
+  assertEquals(p.acceptedRisksUsed, []);
+  assertEquals(p.commands.map((c) => c.id), [
+    "plugin-1-app",
+    "plugin-2-snap",
+    "plugin-3-snap",
+  ]);
+  assertEquals(p.commands[1].args, []);
+});
+
+Deno.test("pluginPrivilegesFor: an updater or osUpdater must declare, unless unsafe.privilegedUpdater; a snapshotter always", async () => {
+  const none = privilegesSwamp({});
+  // No declaration, no record: refused, for each role.
+  for (
+    const m of [
+      { host: "a", source: { model: "app" } },
+      { host: "a", proxmox: { model: "app" } },
+      { host: "a", osUpdater: { model: "app" } },
+      { host: "a", snapshotter: { model: "app" } },
+    ]
+  ) {
+    const p = await fleet.pluginPrivilegesFor(m, none.api);
+    assertEquals(p.errors.length, 1, JSON.stringify(m));
+    assertStringIncludes(p.errors[0], 'privileges of "app" did not run');
+  }
+  // With the record, an updater and an osUpdater are excused: nothing granted, risk used.
+  for (
+    const m of [
+      { host: "a", source: { model: "app" } },
+      { host: "a", osUpdater: { model: "app" } },
+    ]
+  ) {
+    const p = await fleet.pluginPrivilegesFor(
+      { ...m, unsafe: { privilegedUpdater: RECORD } },
+      none.api,
+    );
+    assertEquals(p.errors, []);
+    assertEquals(p.commands, []);
+    assertEquals(p.acceptedRisksUsed, ["unsafe.privilegedUpdater"]);
+  }
+  // A malformed declaration is excused the same way.
+  const bad = privilegesSwamp({ app: privs([{ argv: ["bash"] }]) });
+  assertEquals(
+    (await fleet.pluginPrivilegesFor({
+      host: "a",
+      source: { model: "app" },
+      unsafe: { privilegedUpdater: RECORD },
+    }, bad.api)).acceptedRisksUsed,
+    ["unsafe.privilegedUpdater"],
+  );
+  // The record never excuses a snapshotter, nor a model that is also the snapshotter.
+  for (
+    const m of [
+      { host: "a", snapshotter: { model: "app" } },
+      { host: "a", source: { model: "app" }, snapshotter: { model: "app" } },
+    ]
+  ) {
+    const p = await fleet.pluginPrivilegesFor(
+      { ...m, unsafe: { privilegedUpdater: RECORD } },
+      none.api,
+    );
+    assertEquals(p.errors.length, 1, JSON.stringify(m));
+  }
+  // A declaration that works does not use the record.
+  const ok = privilegesSwamp({ app: privs() });
+  assertEquals(
+    (await fleet.pluginPrivilegesFor({
+      host: "a",
+      source: { model: "app" },
+      unsafe: { privilegedUpdater: RECORD },
+    }, ok.api)).acceptedRisksUsed,
+    [],
+  );
+  // An API snapshotter declares no commands and passes.
+  const api = await fleet.pluginPrivilegesFor(
+    { host: "a", snapshotter: { model: "app" } },
+    ok.api,
+  );
+  assertEquals(api.errors, []);
+  assertEquals(api.commands, []);
+});
+
+Deno.test("pluginPrivilegesFor: remote code needs a trustRemote record with the same source, with or without the unsafe record", async () => {
+  const remote = privilegesSwamp({
+    app: privs([], { remoteCode: true, remoteSources: [REMOTE] }),
+  });
+  const base = { host: "a", source: { model: "app" } };
+  const trusted = await fleet.pluginPrivilegesFor(
+    { ...base, trustRemote: [{ ...RECORD, source: REMOTE }] },
+    remote.api,
+  );
+  assertEquals(trusted.errors, []);
+  assertEquals(trusted.acceptedRisksUsed, [`trustRemote:${REMOTE}`]);
+  assertEquals(trusted.remote, [{ model: "app", source: REMOTE }]);
+  for (
+    const m of [
+      base,
+      { ...base, trustRemote: [{ ...RECORD, source: "acme/updater@main" }] },
+      { ...base, unsafe: { privilegedUpdater: RECORD } },
+    ]
+  ) {
+    const p = await fleet.pluginPrivilegesFor(m, remote.api);
+    assertEquals(p.errors.length, 1, JSON.stringify(m));
+    assertStringIncludes(p.errors[0], `runs remote code from ${REMOTE}`);
+    assertEquals(p.acceptedRisksUsed, []);
+  }
+  // An answer that does not parse but claims remote code is not excused by the unsafe record.
+  const claim = privilegesSwamp({
+    app: { remoteCode: true, remoteSource: REMOTE, commands: "x" },
+  });
+  const p = await fleet.pluginPrivilegesFor(
+    { ...base, unsafe: { privilegedUpdater: RECORD } },
+    claim.api,
+  );
+  assertEquals(p.errors.length, 1);
+  assertStringIncludes(p.errors[0], "runs remote code");
+});
+
+Deno.test("pluginPrivilegesFor: each remote source needs its own trustRemote record", async () => {
+  const CORE = "acme/core@main";
+  const remote = privilegesSwamp({
+    app: privs([], { remoteCode: true, remoteSources: [REMOTE, CORE] }),
+  });
+  const base = { host: "a", source: { model: "app" } };
+  const both = await fleet.pluginPrivilegesFor({
+    ...base,
+    trustRemote: [{ ...RECORD, source: REMOTE }, { ...RECORD, source: CORE }],
+  }, remote.api);
+  assertEquals(both.errors, []);
+  assertEquals(both.acceptedRisksUsed, [
+    `trustRemote:${REMOTE}`,
+    `trustRemote:${CORE}`,
+  ]);
+  assertEquals(both.remote, [
+    { model: "app", source: REMOTE },
+    { model: "app", source: CORE },
+  ]);
+  // One record is not enough: the error names the source with no record, and nothing is used.
+  const one = await fleet.pluginPrivilegesFor(
+    { ...base, trustRemote: [{ ...RECORD, source: REMOTE }] },
+    remote.api,
+  );
+  assertEquals(one.errors, [
+    `"app" runs remote code from ${CORE}, but the machine has no trustRemote record with that source`,
+  ]);
+  assertEquals(one.acceptedRisksUsed, []);
+  assertEquals(one.remote, []);
+  const none = await fleet.pluginPrivilegesFor(base, remote.api);
+  assertStringIncludes(none.errors[0], `${REMOTE}, ${CORE}`);
+  assertStringIncludes(none.errors[0], "those sources");
+});
+
+Deno.test("remoteClaim: an answer that does not parse still claims every source it names", () => {
+  assertEquals(fleet.remoteClaim(null), []);
+  assertEquals(
+    fleet.remoteClaim({ remoteCode: false, remoteSources: ["a/b@1"] }),
+    [],
+  );
+  assertEquals(
+    fleet.remoteClaim({ remoteCode: true, remoteSources: ["a/b@1", "a/c@1"] }),
+    ["a/b@1", "a/c@1"],
+  );
+  assertEquals(
+    fleet.remoteClaim({ remoteCode: true, remoteSources: ["a/b@1", 7] }),
+    ["a/b@1", "(unnamed)"],
+  );
+  assertEquals(
+    fleet.remoteClaim({ remoteCode: true, remoteSources: "a/b@1" }),
+    ["(unnamed)"],
+  );
+  assertEquals(fleet.remoteClaim({ remoteCode: true, remoteSource: "a/b@1" }), [
+    "a/b@1",
+  ]);
+  assertEquals(fleet.remoteClaim({ remoteCode: true }), ["(unnamed)"]);
+  assertEquals(fleet.remoteClaim({ remoteCode: true, remoteSources: [] }), [
+    "(unnamed)",
+  ]);
+});
+
+Deno.test("privilegesForRoles: keeps only the models of the roles a method uses", async () => {
+  const { api } = privilegesSwamp({ snap: privs() });
+  const p = await fleet.pluginPrivilegesFor({
+    host: "a",
+    source: { model: "app" },
+    snapshotter: { model: "snap" },
+  }, api);
+  assertEquals(p.errors.length, 1);
+  assertEquals(fleet.privilegesForRoles(p, ["snapshotter"]).errors, []);
+  assertEquals(fleet.privilegesForRoles(p, ["updater"]).errors.length, 1);
+});
+
+const PLUGIN_FLEET = {
+  sshModel: "ssh",
+  access: ACCESS,
+  machines: [
+    { host: "web1", source: { model: "good-app" } },
+    { host: "web2", source: { model: "bad-app" } },
+  ],
+};
+const PLUGIN_ENV: Env = {
+  FAKE_SWAMP_MODEL_GET: sshDefinition("root", [{ name: "web1" }, {
+    name: "web2",
+  }]),
+  FAKE_SWAMP_PRIVS__good_app: resourceOut(
+    privs([
+      { argv: ["/opt/app/bin/reload"] },
+      { argv: ["appctl", "sync"], env: { APP_MODE: "batch" } },
+    ]),
+  ),
+  FAKE_SWAMP_PRIVS_RC__bad_app: "1",
+};
+
+Deno.test("access: provisionAccess refuses a machine whose plug-in does not declare, and still provisions the clean one with its plug-in grants", async () => {
+  await withCallLog({
+    ...PLUGIN_ENV,
+    FAKE_SWAMP_SCRIPT_1: scriptRunsOut([{
+      host: "web1",
+      stdout: provisionOk(),
+    }]),
+  }, async (calls) => {
+    const t = mkCtx(PLUGIN_FLEET);
+    await assertRejects(
+      () => model.methods.provisionAccess.execute({ dryRun: false }, t.ctx),
+      Error,
+      "web2 (refused-preflight)",
+    );
+    const runs = accessRunsByHost(t);
+    assertEquals(runs.get("web1")?.outcome, "applied");
+    assertEquals(runs.get("web2")?.outcome, "refused-preflight");
+    assertEquals(runs.get("web2")?.ok, false);
+    assertStringIncludes(
+      String(runs.get("web2")?.detail),
+      'plug-in privileges: privileges of "bad-app" did not run',
+    );
+    // Only web1 got a plan and a script call; web2 was never contacted.
+    assertEquals(t.written("accessPlan").map((p) => p.name), [
+      "access-plan-web1",
+    ]);
+    const scriptCalls = (await calls()).filter((c) => c.startsWith("prov "));
+    assertEquals(scriptCalls.length, 1);
+    assert(!scriptCalls[0].includes("web2"));
+    const script = String(
+      (t.written("accessPlan")[0].data as Record<string, unknown>)
+        .provisionScript,
+    );
+    assertStringIncludes(
+      script,
+      `plugin_grant plugin-1-good-app '@/opt/app/bin/reload@ ""'`,
+    );
+    assertStringIncludes(
+      script,
+      `plugin_grant plugin-2-good-app '@env@ APP_MODE\\=batch @appctl@ sync'`,
+    );
+  });
+});
+
+Deno.test("access: a provisionAccess dry run also refuses the machine whose plug-in does not declare", async () => {
+  await withCallLog(PLUGIN_ENV, async () => {
+    const t = mkCtx(PLUGIN_FLEET);
+    await assertRejects(
+      () => model.methods.provisionAccess.execute({ dryRun: true }, t.ctx),
+      Error,
+      "web2 (refused-preflight)",
+    );
+    const runs = accessRunsByHost(t);
+    assertEquals(runs.get("web1")?.outcome, "dry-run");
+    assertEquals(runs.get("web2")?.outcome, "refused-preflight");
+  });
+});
+
+Deno.test("access: renderAccess writes the clean plans, then fails naming the refused machine", async () => {
+  await withCallLog(PLUGIN_ENV, async () => {
+    const t = mkCtx(PLUGIN_FLEET);
+    await assertRejects(
+      () => model.methods.renderAccess.execute({}, t.ctx),
+      Error,
+      'plug-in privileges refused on web2 (privileges of "bad-app" did not run',
+    );
+    assertEquals(t.written("accessPlan").map((p) => p.name), [
+      "access-plan-web1",
+    ]);
+  });
+});
+
+Deno.test("auditAccess: the accessAudit record carries the plug-in grants the host is expected to have", async () => {
+  await withCallLog({
+    ...auditEnv(sshDefinition("root", [{ name: "web1" }]), [{ host: "web1" }]),
+    FAKE_SWAMP_PRIVS__good_app: PLUGIN_ENV.FAKE_SWAMP_PRIVS__good_app,
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      machines: [{ host: "web1", source: { model: "good-app" } }],
+    });
+    await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+    assertEquals(auditOf(t, "web1").pluginGrants, [
+      '@/opt/app/bin/reload@ ""',
+      "@env@ APP_MODE\\=batch @appctl@ sync",
+    ]);
+  });
+});
+
+Deno.test("privileges-declared: passes without plugged models and for a declaring plug-in; fails naming the host, with the skip flags", async () => {
+  await withFake(PLUGIN_ENV, async () => {
+    assertEquals(
+      await runCheck(
+        "privileges-declared",
+        checkCtx(PLUGIN_FLEET, "safeOsUpdate", { host: "web1" }),
+      ),
+      { pass: true },
+    );
+    assertEquals(
+      await runCheck(
+        "privileges-declared",
+        checkCtx(
+          { sshModel: "ssh", machines: [{ host: "bare" }] },
+          "safeOsUpdate",
+          { host: "bare" },
+        ),
+      ),
+      { pass: true },
+    );
+    const r = await runCheck(
+      "privileges-declared",
+      checkCtx(PLUGIN_FLEET, "safeOsUpdate", { host: "web2" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(String(r.errors), 'web2: privileges of "bad-app"');
+    assertStringIncludes(String(r.errors), "--skip-check privileges-declared");
+    // rollback uses only the snapshotter: web2's updater does not matter there.
+    assertEquals(
+      await runCheck(
+        "privileges-declared",
+        checkCtx(PLUGIN_FLEET, "rollback", { host: "web2" }),
+      ),
+      { pass: true },
+    );
+    // The access methods check every selected machine; a hosts filter narrows them.
+    const all = await runCheck(
+      "privileges-declared",
+      checkCtx(PLUGIN_FLEET, "provisionAccess"),
+    );
+    assertEquals(all.pass, false);
+    assertStringIncludes(String(all.errors), "web2:");
+    assertEquals(
+      await runCheck(
+        "privileges-declared",
+        checkCtx(PLUGIN_FLEET, "provisionAccess", { hosts: ["web1"] }),
+      ),
+      { pass: true },
+    );
+  });
+});
+
+Deno.test("safeOsUpdate: a remote-code updater without trustRemote is refused before any contact", async () => {
+  await withCallLog({
+    ...osModelEnv(),
+    FAKE_SWAMP_PRIVS__app: resourceOut(
+      privs([], { remoteCode: true, remoteSources: [REMOTE] }),
+    ),
+  }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "arch1",
+        source: { model: "app" },
+        osUpdater: { model: "pacman-os" },
+      }],
+    });
+    await assertRejects(
+      () =>
+        model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({ host: "arch1" }),
+          t.ctx,
+        ),
+      Error,
+      `refused: plug-in privileges: "app" runs remote code from ${REMOTE}`,
+    );
+    assertEquals(
+      (await calls()).map((c) => c.split(" ").slice(0, 2).join(" ")),
+      ["app privileges", "pacman-os privileges"],
+    );
+    assertEquals(t.written("osUpdate").length, 0);
+  });
+});
+
+Deno.test("safeOsUpdate: the run record and the inventory list the accepted risks the plug-ins used", async () => {
+  await withCallLog({
+    ...osModelEnv(),
+    FAKE_SWAMP_PRIVS__app: resourceOut(
+      privs([], { remoteCode: true, remoteSources: [REMOTE] }),
+    ),
+    FAKE_SWAMP_PRIVS_RC__pacman_os: "1",
+  }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "arch1",
+        source: { model: "app" },
+        osUpdater: { model: "pacman-os" },
+        unsafe: { privilegedUpdater: RECORD },
+        trustRemote: [{ ...RECORD, source: REMOTE }],
+      }],
+    });
+    await model.methods.safeOsUpdate.execute(
+      model.methods.safeOsUpdate.arguments.parse({ host: "arch1" }),
+      t.ctx,
+    );
+    const run = t.written("run")[0].data as Record<string, unknown>;
+    assertEquals(run.acceptedRisksUsed, [
+      `trustRemote:${REMOTE}`,
+      "unsafe.privilegedUpdater",
+    ]);
+    const inv = t.one("inventory");
+    assertEquals(inv.acceptedRisksUsed, [
+      `trustRemote:${REMOTE}`,
+      "unsafe.privilegedUpdater",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Privileged health checks: the schema, healthPrivilegesFor, the privileges-declared check,
+// evalHealth, and the reboot and safeOsUpdate refusals
+// ---------------------------------------------------------------------------
+
+/** The schema's issue messages for one health check, joined; empty when it parses. */
+function healthIssues(check: unknown): string {
+  const r = model.globalArguments.safeParse({
+    sshModel: "ssh",
+    machines: [{ host: "h", health: [check] }],
+  });
+  return r.success ? "" : r.error.issues.map((i) => i.message).join("; ");
+}
+
+Deno.test("schema: a privileged health check takes argv and no run", () => {
+  const m = parseMachine({
+    host: "h",
+    health: [{
+      type: "command",
+      privileged: true,
+      argv: ["myhealth", "--quiet"],
+    }],
+  });
+  assertEquals(m.health[0], {
+    type: "command",
+    privileged: true,
+    argv: ["myhealth", "--quiet"],
+    timeoutSec: 30,
+  });
+});
+
+Deno.test("schema: a privileged check needs argv, and runs argv rather than a run command", () => {
+  assertStringIncludes(
+    healthIssues({ type: "command", privileged: true }),
+    "a privileged check needs argv",
+  );
+  assertStringIncludes(
+    healthIssues({
+      type: "command",
+      privileged: true,
+      argv: ["myhealth"],
+      run: "true",
+    }),
+    "a privileged check runs argv, not a shell command",
+  );
+});
+
+Deno.test("schema: argv is only for a privileged check, and a plain run check still parses", () => {
+  assertStringIncludes(
+    healthIssues({ type: "command", run: "true", argv: ["myhealth"] }),
+    "argv is only for a privileged check",
+  );
+  assertEquals(healthIssues({ type: "command", run: "true" }), "");
+});
+
+Deno.test("healthPrivilegesFor: null without privileged checks", () => {
+  assertEquals(fleet.healthPrivilegesFor(parseMachine({ host: "h" })), null);
+  assertEquals(
+    fleet.healthPrivilegesFor(parseMachine({
+      host: "h",
+      health: [
+        { type: "command", run: "true" },
+        { type: "http", url: "http://h.example/health" },
+      ],
+    })),
+    null,
+  );
+});
+
+Deno.test("healthPrivilegesFor: no record is one error naming the checks, with no commands and no accepted risk", () => {
+  const m = parseMachine({
+    host: "h",
+    health: [
+      { type: "command", run: "true" },
+      { type: "command", privileged: true, argv: ["myhealth"] },
+      {
+        type: "command",
+        label: "second",
+        privileged: true,
+        argv: ["/usr/sbin/other"],
+      },
+    ],
+  });
+  assertEquals(fleet.healthPrivilegesFor(m), {
+    model: "health checks",
+    roles: ["health"],
+    commands: [],
+    errors: [
+      'health checks: health[1], "second" are privileged, but the machine has no unsafe.privilegedHealth acceptance record',
+    ],
+    acceptedRisksUsed: [],
+    remote: [],
+  });
+});
+
+Deno.test("healthPrivilegesFor: with the record, each privileged check is a plug-in command numbered from first", () => {
+  const m = parseMachine({
+    host: "h",
+    unsafe: PRIV_HEALTH_OK,
+    health: [
+      { type: "command", run: "true" },
+      { type: "command", privileged: true, argv: ["myhealth", "--quiet"] },
+      { type: "command", privileged: true, argv: ["/usr/sbin/other"] },
+    ],
+  });
+  const e = fleet.healthPrivilegesFor(m);
+  assertEquals(e?.errors, []);
+  assertEquals(e?.commands, [
+    {
+      id: "plugin-1-health",
+      capability: "plugin",
+      family: "plugin",
+      bin: "myhealth",
+      args: ["--quiet"],
+    },
+    {
+      id: "plugin-2-health",
+      capability: "plugin",
+      family: "plugin",
+      bin: "/usr/sbin/other",
+      args: [],
+    },
+  ]);
+  assertEquals(e?.acceptedRisksUsed, ["unsafe.privilegedHealth"]);
+  assertEquals(
+    fleet.healthPrivilegesFor(m, 5)?.commands.map((c) => c.id),
+    ["plugin-5-health", "plugin-6-health"],
+  );
+});
+
+Deno.test("healthPrivilegesFor: one bad argv refuses every privileged check, and names the bad one", () => {
+  const m = parseMachine({
+    host: "h",
+    unsafe: PRIV_HEALTH_OK,
+    health: [
+      { type: "command", privileged: true, argv: ["myhealth"] },
+      { type: "command", privileged: true, argv: ["bash", "-c", "true"] },
+    ],
+  });
+  const e = fleet.healthPrivilegesFor(m);
+  assertEquals(e?.errors.length, 1);
+  assertStringIncludes(
+    e?.errors[0] ?? "",
+    "health checks: health[1]: argv[0]: bash may not run as root",
+  );
+  assertEquals(e?.commands, []);
+  assertEquals(e?.acceptedRisksUsed, []);
+});
+
+Deno.test("healthPrivilegesFor: at most 16 privileged checks; a 17th is one error, with no commands", () => {
+  const health = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      type: "command",
+      privileged: true,
+      argv: [`check${i}`],
+    }));
+  assertEquals(
+    fleet.healthPrivilegesFor(
+      parseMachine({ host: "h", unsafe: PRIV_HEALTH_OK, health: health(16) }),
+    )?.errors,
+    [],
+  );
+  const e = fleet.healthPrivilegesFor(
+    parseMachine({ host: "h", unsafe: PRIV_HEALTH_OK, health: health(17) }),
+  );
+  assertEquals(e?.errors, [
+    "health checks: at most 16 privileged checks per machine",
+  ]);
+  assertEquals(e?.commands, []);
+  assertEquals(e?.acceptedRisksUsed, []);
+});
+
+Deno.test("pluginPrivilegesFor: a machine with only privileged checks has one model entry, and asks no plug-in", async () => {
+  const { api, calls } = privilegesSwamp({});
+  const p = await fleet.pluginPrivilegesFor({
+    host: "h",
+    unsafe: PRIV_HEALTH_OK,
+    health: [{ type: "command", privileged: true, argv: ["myhealth"] }],
+  }, api);
+  assertEquals(calls, []);
+  assertEquals(p.errors, []);
+  assertEquals(p.models.map((x) => x.model), ["health checks"]);
+  assertEquals(p.commands.map((c) => c.id), ["plugin-1-health"]);
+  assertEquals(p.acceptedRisksUsed, ["unsafe.privilegedHealth"]);
+});
+
+Deno.test("pluginPrivilegesFor: the health ids continue after a plugged model's commands", async () => {
+  const { api, calls } = privilegesSwamp({
+    app: privs([
+      { argv: ["myapp-update", "-y"] },
+      { argv: ["myapp-ctl", "sync"] },
+    ]),
+  });
+  const p = await fleet.pluginPrivilegesFor({
+    host: "web1",
+    source: { model: "app" },
+    unsafe: PRIV_HEALTH_OK,
+    health: [{ type: "command", privileged: true, argv: ["myhealth"] }],
+  }, api);
+  assertEquals(calls, ['app privileges {"host":"web1"}']);
+  assertEquals(p.errors, []);
+  assertEquals(p.commands.map((c) => c.id), [
+    "plugin-1-app",
+    "plugin-2-app",
+    "plugin-3-health",
+  ]);
+  assertEquals(p.models.map((x) => x.model), ["app", "health checks"]);
+  assertEquals(p.acceptedRisksUsed, ["unsafe.privilegedHealth"]);
+});
+
+Deno.test("privileges-declared: a privileged check without its record fails for safeOsUpdate and provisionAccess, and passes with it", async () => {
+  const check = {
+    type: "command",
+    label: "myhealth",
+    privileged: true,
+    argv: ["myhealth"],
+  };
+  const bare = {
+    sshModel: "ssh",
+    machines: [{ host: "hc1", health: [check] }],
+  };
+  const recorded = {
+    sshModel: "ssh",
+    machines: [{ host: "hc1", unsafe: PRIV_HEALTH_OK, health: [check] }],
+  };
+  for (const method of ["safeOsUpdate", "provisionAccess"]) {
+    const r = await runCheck(
+      "privileges-declared",
+      checkCtx(bare, method, { host: "hc1" }),
+    );
+    assertEquals(r.pass, false, method);
+    assertStringIncludes(
+      String(r.errors),
+      'hc1: health checks: "myhealth" is privileged, but the machine has no unsafe.privilegedHealth acceptance record',
+    );
+    assertEquals(
+      await runCheck(
+        "privileges-declared",
+        checkCtx(recorded, method, { host: "hc1" }),
+      ),
+      { pass: true },
+    );
+  }
+});
+
+Deno.test("evalHealth: a privileged check without its record is refused, and no script runs", async () => {
+  await withCallLog({}, async (calls) => {
+    const m = parseMachine({
+      host: "a",
+      health: [{
+        type: "command",
+        label: "myhealth",
+        privileged: true,
+        argv: ["myhealth"],
+      }],
+    });
+    const res = await fleet.evalHealth(m, m.health, "ssh", CLI);
+    assertEquals(res.healthy, false);
+    assertEquals(res.results, [{
+      label: "myhealth",
+      ok: false,
+      detail:
+        "refused: a privileged check needs an unsafe.privilegedHealth acceptance record",
+    }]);
+    assertEquals(await calls(), []);
+  });
+});
+
+Deno.test("evalHealth: a refused privileged check is left out of the batch that runs the other checks", async () => {
+  await withCallLog({ FAKE_SWAMP_HC: hcOut("a", 0) }, async (calls) => {
+    const m = parseMachine({
+      host: "a",
+      health: [
+        { type: "command", label: "plain", run: "true" },
+        {
+          type: "command",
+          label: "myhealth",
+          privileged: true,
+          argv: ["myhealth"],
+        },
+      ],
+    });
+    const res = await fleet.evalHealth(m, m.health, "ssh", CLI);
+    assertEquals(res.results, [
+      { label: "plain", ok: true, detail: "rc 0" },
+      {
+        label: "myhealth",
+        ok: false,
+        detail:
+          "refused: a privileged check needs an unsafe.privilegedHealth acceptance record",
+      },
+    ]);
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], "true");
+    assert(!all[0].includes("myhealth"), all[0]);
+  });
+});
+
+Deno.test("evalHealth: with the record, a privileged check runs its argv through sudo -n, and each check keeps its own rc", async () => {
+  await withCallLog({ FAKE_SWAMP_HC: hcOut("a", 0, 3) }, async (calls) => {
+    const m = parseMachine({
+      host: "a",
+      unsafe: PRIV_HEALTH_OK,
+      health: [
+        {
+          type: "command",
+          privileged: true,
+          argv: ["myhealth", "--quiet", "--max-age=60"],
+        },
+        { type: "command", label: "plain", run: "exit 3" },
+      ],
+    });
+    const res = await fleet.evalHealth(m, m.health, "ssh", CLI);
+    assertEquals(res.healthy, false);
+    assertEquals(res.results, [
+      {
+        label: "privileged: myhealth --quiet --max-age=60",
+        ok: true,
+        detail: "rc 0",
+      },
+      { label: "plain", ok: false, detail: "rc 3" },
+    ]);
+    const all = await calls();
+    assertEquals(all.length, 1);
+    assertStringIncludes(all[0], 'SUDO="sudo -n"');
+    assertStringIncludes(all[0], "abs_cmd() {");
+    assertStringIncludes(
+      all[0],
+      'BIN_MYHEALTH="$(abs_cmd myhealth)" || exit 3',
+    );
+    assertStringIncludes(all[0], '$SUDO "$BIN_MYHEALTH" --quiet --max-age=60');
+    assertStringIncludes(all[0], "exit 3");
+  });
+});
+
+Deno.test("reboot: a privileged check without its record refuses the reboot before any call or record", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      {
+        sshModel: "ssh",
+        machines: [{
+          host: "web1",
+          health: [{
+            type: "command",
+            label: "myhealth",
+            privileged: true,
+            argv: ["myhealth"],
+          }],
+        }],
+      },
+      { stored: { web1: { needsReboot: true } } },
+    );
+    await assertRejects(
+      () =>
+        model.methods.reboot.execute(
+          model.methods.reboot.arguments.parse({
+            host: "web1",
+            force: true,
+            wait: false,
+          }),
+          t.ctx,
+        ),
+      Error,
+      'reboot of web1 refused: health checks: "myhealth" is privileged, but the machine has no unsafe.privilegedHealth acceptance record',
+    );
+    assertEquals(t.calls.length, 0);
+    assertEquals(t.written("reboot"), []);
+    assertEquals(t.written("run"), []);
+  });
+});
+
+Deno.test("safeOsUpdate: a privileged check without its record refuses the update before any call or record", async () => {
+  await withFake(osUpdateEnv(), async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "web1",
+        health: [{
+          type: "command",
+          label: "myhealth",
+          privileged: true,
+          argv: ["myhealth"],
+        }],
+      }],
+    });
+    await assertRejects(
+      () =>
+        model.methods.safeOsUpdate.execute(
+          model.methods.safeOsUpdate.arguments.parse({ host: "web1" }),
+          t.ctx,
+        ),
+      Error,
+      'safeOsUpdate of web1 refused: plug-in privileges: health checks: "myhealth" is privileged, but the machine has no unsafe.privilegedHealth acceptance record',
+    );
+    assertEquals(t.calls.length, 0);
+    assertEquals(t.written("osUpdate"), []);
+    assertEquals(t.written("run"), []);
+  });
+});
+
+Deno.test("safeOsUpdate: with the record, an update that passes its privileged health check lists unsafe.privilegedHealth in the run record", async () => {
+  const env = { ...osModelEnv(), FAKE_SWAMP_HC: hcOut("arch1", 0) };
+  await withFake(env, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "arch1",
+        osUpdater: { model: "pacman-os" },
+        unsafe: PRIV_HEALTH_OK,
+        health: [{
+          type: "command",
+          label: "myhealth",
+          privileged: true,
+          argv: ["myhealth"],
+        }],
+      }],
+    });
+    await model.methods.safeOsUpdate.execute(
+      model.methods.safeOsUpdate.arguments.parse({ host: "arch1" }),
+      t.ctx,
+    );
+    assertEquals(t.one("osUpdate").outcome, "updated");
+    assertEquals(t.one("run").acceptedRisksUsed, ["unsafe.privilegedHealth"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A CT through a Proxmox node model (ct.nodeModel): the node model's API token takes the
+// snapshots, so there is no pct, no unsafe.pctExec record and no root on the node. The
+// snapshotter is proxmox-ct-api, and the token is audited through the node model.
+// ---------------------------------------------------------------------------
+
+Deno.test("schema: a ct needs a proxmoxNode (pct) or a nodeModel (API snapshots), and may have both", () => {
+  assertThrows(() => parseMachine({ host: "c", ct: { ctid: 101 } }));
+  assertEquals(
+    parseMachine({ host: "c", ct: { ctid: 101, nodeModel: "patch-pve" } }).ct,
+    { ctid: 101, nodeModel: "patch-pve" },
+  );
+  assertEquals(
+    parseMachine({
+      host: "c",
+      ct: { proxmoxNode: "pve", ctid: 101, nodeModel: "patch-pve" },
+    }).ct,
+    { proxmoxNode: "pve", ctid: 101, nodeModel: "patch-pve" },
+  );
+});
+
+Deno.test("snapshotterRefFor: a ct nodeModel is proxmox-ct-api and beats a pct location; an explicit snapshotter model still wins", () => {
+  const ct = { ctid: 101, nodeModel: "patch-pve" };
+  assertEquals(fleet.snapshotterRefFor({ host: "a", ct }), {
+    kind: "proxmox-ct-api",
+    node: "patch-pve",
+    ctid: 101,
+  });
+  assertEquals(
+    fleet.snapshotterRefFor({ host: "a", ct }, { node: "pve", ctid: 101 }),
+    { kind: "proxmox-ct-api", node: "patch-pve", ctid: 101 },
+  );
+  assertEquals(
+    fleet.snapshotterRefFor({ host: "a", ct, snapshotter: { model: "zfs" } }),
+    { kind: "model", model: "zfs" },
+  );
+});
+
+Deno.test("usesPctSnapshots: only a CT with no snapshotter model and no ct.nodeModel snapshots with pct", () => {
+  assertEquals(
+    fleet.usesPctSnapshots({ host: "a", ct: { proxmoxNode: "pve", ctid: 101 } }),
+    true,
+  );
+  assertEquals(
+    fleet.usesPctSnapshots({
+      host: "a",
+      ct: { ctid: 101, nodeModel: "patch-pve" },
+    }),
+    false,
+  );
+  assertEquals(
+    fleet.usesPctSnapshots({
+      host: "a",
+      ct: { proxmoxNode: "pve", ctid: 101 },
+      snapshotter: { model: "zfs" },
+    }),
+    false,
+  );
+  // A VM is never snapshotted with pct, even with a ct decoration beside it.
+  assertEquals(
+    fleet.usesPctSnapshots({
+      host: "a",
+      vm: { proxmoxNode: "pve", vmid: 100 },
+      ct: { proxmoxNode: "pve", ctid: 101 },
+    }),
+    false,
+  );
+  assertEquals(fleet.usesPctSnapshots({ host: "a" }), false);
+});
+
+Deno.test("snapshotTokenTarget: a VM or a CT with a nodeModel names its node model and guest; pct, a snapshotter model and bare metal name none", () => {
+  assertEquals(
+    fleet.snapshotTokenTarget({
+      host: "a",
+      vm: { proxmoxNode: "pve", vmid: 100 },
+    }),
+    { model: "pve", guest: { type: "vm", vmid: 100 } },
+  );
+  assertEquals(
+    fleet.snapshotTokenTarget({
+      host: "a",
+      ct: { ctid: 101, nodeModel: "patch-pve" },
+    }),
+    { model: "patch-pve", guest: { type: "ct", vmid: 101 } },
+  );
+  assertEquals(
+    fleet.snapshotTokenTarget({
+      host: "a",
+      ct: { proxmoxNode: "pve", ctid: 101 },
+    }),
+    null,
+  );
+  assertEquals(
+    fleet.snapshotTokenTarget({
+      host: "a",
+      ct: { ctid: 101, nodeModel: "patch-pve" },
+      snapshotter: { model: "zfs" },
+    }),
+    null,
+  );
+  assertEquals(fleet.snapshotTokenTarget({ host: "a" }), null);
+});
+
+Deno.test("ctLocation: a ct with only a nodeModel has no node for pct, and the error says so", async () => {
+  await assertRejects(
+    () =>
+      fleet.ctLocation(
+        { host: "a", ct: { ctid: 101, nodeModel: "patch-pve" } },
+        CLI,
+      ),
+    Error,
+    "ct.proxmoxNode",
+  );
+});
+
+Deno.test("snapshotterFor(proxmox-ct-api): snapshotCt, rollbackCt (start), deleteCtSnapshot and listCtSnapshots on the node model; list drops current", async () => {
+  const s = stubSwamp([
+    { ok: true },
+    { ok: true },
+    { ok: true },
+    {
+      ok: true,
+      artifacts: [{
+        snapshots: [{ name: "preupdate-1" }, { name: "current" }],
+      }],
+    },
+  ]);
+  const snapper = fleet.snapshotterFor(
+    { kind: "proxmox-ct-api", node: "patch-pve", ctid: 101 },
+    { sshModel: "ssh", swamp: s.api, host: "ct1" },
+  );
+  assertEquals(await snapper.snapshot("preupdate-1"), true);
+  assertEquals(await snapper.rollback("preupdate-1"), true);
+  assertEquals(await snapper.delete("preupdate-1"), true);
+  assertEquals(await snapper.list(), ["preupdate-1"]);
+  assertEquals(s.calls, [
+    {
+      model: "patch-pve",
+      method: "snapshotCt",
+      args: { vmid: 101, name: "preupdate-1" },
+    },
+    {
+      model: "patch-pve",
+      method: "rollbackCt",
+      args: { vmid: 101, name: "preupdate-1", start: true },
+    },
+    {
+      model: "patch-pve",
+      method: "deleteCtSnapshot",
+      args: { vmid: 101, name: "preupdate-1" },
+    },
+    { model: "patch-pve", method: "listCtSnapshots", args: { vmid: 101 } },
+  ]);
+  assertStringIncludes(snapper.where, 'node model "patch-pve"');
+});
+
+Deno.test("readTokenPermissions: asks each distinct model once; a failed run or a record without paths is kept as its error", async () => {
+  const asked: string[] = [];
+  const swamp: SwampApi = {
+    run: (model) => {
+      asked.push(model);
+      if (model === "bad") {
+        return Promise.resolve({ ok: false, artifacts: [], error: "no route" });
+      }
+      if (model === "empty") {
+        return Promise.resolve({ ok: true, artifacts: [{}], error: "" });
+      }
+      return Promise.resolve({
+        ok: true,
+        artifacts: [{ paths: [] }],
+        error: "",
+      });
+    },
+    globalArguments: () => Promise.resolve(null),
+  };
+  const out = await fleet.readTokenPermissions(
+    ["good", "bad", "good", "empty"],
+    swamp,
+  );
+  assertEquals(asked, ["good", "bad", "empty"]);
+  assertEquals(out.get("good"), { paths: [], error: null });
+  assertEquals(out.get("bad"), { paths: null, error: "no route" });
+  assertEquals(out.get("empty"), {
+    paths: null,
+    error: "no permissions record",
+  });
+});
+
+/** osUpdateEnv under a CT's name: the scans of ct1 run over ssh, with no pct answers. */
+function ctNodeEnv(): Env {
+  return {
+    ...osUpdateEnv(),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("ct1", collectorStdout()),
+    FAKE_SWAMP_SCRIPT_2: scriptOut(
+      "ct1",
+      collectorStdout({ updatesCount: 0, needsReboot: true }),
+    ),
+  };
+}
+
+Deno.test("safeOsUpdate CT nodeModel: a CT over ssh is snapshotted through its node model, with no pct and no unsafe.pctExec record", async () => {
+  await withCallLog(ctNodeEnv(), async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "ct1", ct: { ctid: 101, nodeModel: "patch-pve" } }],
+    });
+    await model.methods.safeOsUpdate.execute(
+      model.methods.safeOsUpdate.arguments.parse({
+        host: "ct1",
+        healthGraceSec: 0,
+      }),
+      t.ctx,
+    );
+    const all = await calls();
+    const taken = all.filter((c) => c.startsWith("patch-pve snapshotCt "));
+    assertEquals(taken.length, 1);
+    assertStringIncludes(taken[0], "--input vmid:json=101");
+    assertStringIncludes(taken[0], "--input name=preupdate-");
+    assertEquals(
+      all.some((c) => /pct (snapshot|rollback|delsnapshot|listsnapshot)/.test(c)),
+      false,
+    );
+    assertEquals(t.one("osUpdate").kind, "ct");
+    assertEquals(t.one("osUpdate").outcome, "updated");
+    const rec = t.one("snapshot");
+    assertEquals(rec.kind, "ct");
+    assertEquals(rec.vmid, 101);
+    assertEquals(rec.proxmoxNode, "patch-pve");
+    assertEquals(rec.snapshotter, {
+      kind: "proxmox-ct-api",
+      node: "patch-pve",
+      ctid: 101,
+    });
+  });
+});
+
+Deno.test("safeOsUpdate CT nodeModel: unhealthy after the update → rolled back by rollbackCt, started again", async () => {
+  const server = startServer(() => 503);
+  try {
+    await withCallLog(ctNodeEnv(), async (calls) => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        machines: [{
+          host: "ct1",
+          ct: { ctid: 101, nodeModel: "patch-pve" },
+          health: [{ type: "http", url: server.url }],
+        }],
+      });
+      await model.methods.safeOsUpdate.execute(
+        model.methods.safeOsUpdate.arguments.parse({
+          host: "ct1",
+          healthGraceSec: 0,
+        }),
+        t.ctx,
+      );
+      const rb = (await calls()).filter((c) =>
+        c.startsWith("patch-pve rollbackCt ")
+      );
+      assertEquals(rb.length, 1);
+      assertStringIncludes(rb[0], "--input vmid:json=101");
+      assertStringIncludes(
+        rb[0],
+        `--input name=${String(t.one("snapshot").name)}`,
+      );
+      assertStringIncludes(rb[0], "--input start:json=true");
+      assertEquals(t.one("osUpdate").outcome, "rolled-back");
+      assertEquals(t.one("osUpdate").rolledBack, true);
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("rollback CT nodeModel: a snapshot taken through a node model is rolled back by rollbackCt, with no unsafe.pctExec record", async () => {
+  const data = {
+    snapshot: [snapDatum("snap-ct1-1", {
+      host: "ct1",
+      name: "ct-snap",
+      kind: "ct",
+      vmid: 101,
+      proxmoxNode: "patch-pve",
+      snapshotter: { kind: "proxmox-ct-api", node: "patch-pve", ctid: 101 },
+    })],
+  };
+  await withCallLog({ FAKE_SWAMP_EXEC: execOut("", 0) }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "ct1", ct: { ctid: 101, nodeModel: "patch-pve" } }],
+    }, { data });
+    await model.methods.rollback.execute(
+      model.methods.rollback.arguments.parse({ host: "ct1" }),
+      t.ctx,
+    );
+    const rb = (await calls()).filter((c) =>
+      c.startsWith("patch-pve rollbackCt ")
+    );
+    assertEquals(rb.length, 1);
+    assertStringIncludes(rb[0], "--input vmid:json=101");
+    assertStringIncludes(rb[0], "--input name=ct-snap");
+    assertStringIncludes(rb[0], "--input start:json=true");
+    assertEquals(t.one("run").snapshot, "ct-snap");
+    assertEquals(t.one("run").outcome, "rolled-back");
+  });
+});
+
+Deno.test("pruneSnapshots CT nodeModel: an expired snapshot taken through a node model is deleted by deleteCtSnapshot", async () => {
+  await withCallLog({ FAKE_SWAMP_SCRIPT_1: HEALTHY_NOW }, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{ host: "web1", ct: { ctid: 101, nodeModel: "patch-pve" } }],
+    }, {
+      data: {
+        snapshot: [snapDatum("s-ct", {
+          kind: "ct",
+          vmid: 101,
+          proxmoxNode: "patch-pve",
+          snapshotter: { kind: "proxmox-ct-api", node: "patch-pve", ctid: 101 },
+        })],
+      },
+    });
+    await model.methods.pruneSnapshots.execute(
+      model.methods.pruneSnapshots.arguments.parse({}),
+      t.ctx,
+    );
+    const del = (await calls()).filter((c) =>
+      c.startsWith("patch-pve deleteCtSnapshot ")
+    );
+    assertEquals(del.length, 1);
+    assertStringIncludes(del[0], "--input vmid:json=101");
+    assertStringIncludes(del[0], "--input name=preupdate-1");
+    const pruned = t.one("prune").pruned as Array<Record<string, unknown>>;
+    assertEquals(pruned.map((p) => [p.host, p.name]), [
+      ["web1", "preupdate-1"],
+    ]);
+    assertEquals(t.one("snapshot").status, "pruned");
+  });
+});
+
+Deno.test("snapshot-target-resolves CT nodeModel: a CT with a nodeModel and no pctExec record is listed through its node model", async () => {
+  const fleet = {
+    sshModel: "ssh",
+    machines: [{ host: "ct4", ct: { ctid: 101, nodeModel: "patch-pve" } }],
+  };
+  await withCallLog({}, async (calls) => {
+    for (const method of ["safeOsUpdate", "pruneSnapshots", "rollback"]) {
+      assertEquals(
+        await runCheck(
+          "snapshot-target-resolves",
+          checkCtx(fleet, method, { host: "ct4" }),
+        ),
+        { pass: true },
+        method,
+      );
+    }
+    const listed = (await calls()).filter((c) =>
+      c.startsWith("patch-pve listCtSnapshots ")
+    );
+    assertEquals(listed.length, 3);
+    assertStringIncludes(listed[0], "--input vmid:json=101");
+  });
+  await withFake({ FAKE_SWAMP_METHOD_RC: "1" }, async () => {
+    const r = await runCheck(
+      "snapshot-target-resolves",
+      checkCtx(fleet, "safeOsUpdate", { host: "ct4" }),
+    );
+    assertEquals(r.pass, false);
+    assertStringIncludes(
+      r.errors!.join(" "),
+      'CT 101 via node model "patch-pve" did not resolve',
+    );
+  });
+});
+
+// --- auditAccess: the snapshot token of a VM or CT with a node model --------------
+
+const TOKEN_PRIVS = [
+  "VM.Audit",
+  "VM.PowerMgmt",
+  "VM.Snapshot",
+  "VM.Snapshot.Rollback",
+];
+
+/** The `paths` of a permissions record: each path with the given privileges, propagated. */
+function tokenPaths(...entries: Array<[string, string[]]>) {
+  return entries.map(([path, names]) => ({
+    path,
+    privileges: names.map((name) => ({ name, propagate: true })),
+  }));
+}
+
+/** A token that holds exactly the snapshot privileges on its pool and on guests 100 and 101. */
+const CLEAN_TOKEN_PATHS = tokenPaths(
+  ["/pool/patch", TOKEN_PRIVS],
+  ["/vms/100", TOKEN_PRIVS],
+  ["/vms/101", TOKEN_PRIVS],
+);
+
+/**
+ * Answers the `permissions` method of the node models in an audit run: `answer(model)`
+ * gives a record's `paths`, or `{ error }` for a run that fails. Other methods go to the
+ * fake as usual. Returns the models asked, in order.
+ */
+function tokenPermissions(
+  t: ReturnType<typeof mkCtx>,
+  answer: (model: string) => { paths: unknown } | { error: string },
+): string[] {
+  const ctx = t.ctx as unknown as {
+    runModel: (opts: RunModelCall) => Promise<unknown>;
+  };
+  const base = ctx.runModel;
+  const asked: string[] = [];
+  ctx.runModel = (opts: RunModelCall) => {
+    if (opts.method !== "permissions") return base(opts);
+    asked.push(opts.definition);
+    const a = answer(opts.definition);
+    return Promise.resolve(
+      "error" in a
+        ? { ok: false, error: { message: a.error } }
+        : {
+          ok: true,
+          resources: [{
+            name: "permissions-0",
+            specName: "result",
+            attributes: { paths: a.paths },
+          }],
+        },
+    );
+  };
+  return asked;
+}
+
+Deno.test("auditAccess token: a VM whose node token holds exactly the snapshot privileges adds no api-token finding", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{ host: "web1" }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{
+          host: "web1",
+          vm: { proxmoxNode: "patch-pve", vmid: 100 },
+        }],
+      });
+      const asked = tokenPermissions(t, () => ({ paths: CLEAN_TOKEN_PATHS }));
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+      assertEquals(asked, ["patch-pve"]);
+      assertEquals(auditFindings(auditOf(t, "web1")), NO_GRANTS_WARNINGS);
+    },
+  );
+});
+
+Deno.test("auditAccess token: a privilege on / is an api-token-extra critical, and the run fails at the default failOn", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{ host: "web1" }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{
+          host: "web1",
+          vm: { proxmoxNode: "patch-pve", vmid: 100 },
+        }],
+      });
+      tokenPermissions(t, () => ({
+        paths: [...CLEAN_TOKEN_PATHS, ...tokenPaths(["/", ["Sys.Audit"]])],
+      }));
+      await assertRejects(
+        () => model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx),
+        Error,
+        "web1: api-token-extra:/",
+      );
+      const rec = auditOf(t, "web1");
+      assertEquals(rec.ok, false);
+      assertEquals(auditFindings(rec), [
+        "api-token-extra:/ critical",
+        ...NO_GRANTS_WARNINGS,
+      ]);
+    },
+  );
+});
+
+Deno.test("auditAccess token: a failed permissions run is api-token-unread:<model>, high, and fails the run", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }]), [{ host: "web1" }]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [{
+          host: "web1",
+          vm: { proxmoxNode: "patch-pve", vmid: 100 },
+        }],
+      });
+      tokenPermissions(t, () => ({ error: "permissions exploded" }));
+      await assertRejects(
+        () => model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx),
+        Error,
+        "web1: api-token-unread:patch-pve",
+      );
+      const rec = auditOf(t, "web1");
+      assertEquals(rec.ok, false);
+      assertEquals(auditFindings(rec), [
+        "api-token-unread:patch-pve high",
+        ...NO_GRANTS_WARNINGS,
+      ]);
+      assertStringIncludes(JSON.stringify(rec.findings), "permissions exploded");
+    },
+  );
+});
+
+Deno.test("auditAccess token: two machines on one node model read its permissions once", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }, { name: "web2" }]), [
+      { host: "web1" },
+      { host: "web2" },
+    ]),
+    async () => {
+      const t = mkCtx({
+        sshModel: "ssh",
+        access: ACCESS,
+        machines: [
+          { host: "web1", vm: { proxmoxNode: "patch-pve", vmid: 100 } },
+          { host: "web2", ct: { ctid: 101, nodeModel: "patch-pve" } },
+        ],
+      });
+      const asked = tokenPermissions(t, () => ({ paths: CLEAN_TOKEN_PATHS }));
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), t.ctx);
+      assertEquals(asked, ["patch-pve"]);
+      assertEquals(auditFindings(auditOf(t, "web2")), NO_GRANTS_WARNINGS);
+    },
+  );
+});
+// --- proxmox-cluster health checks and the token's Sys.Audit on / ----------------
+
+/** Sys.Audit on / without propagation: what ensureSnapshotAccess clusterAudit grants. */
+const ROOT_AUDIT_PATHS = [{
+  path: "/",
+  privileges: [{ name: "Sys.Audit", propagate: false }],
+}];
+
+Deno.test("auditAccess token: a node's proxmox-cluster check needs Sys.Audit on /, and allows it for the fleet's other machines", async () => {
+  await withCallLog(
+    auditEnv(sshDefinition("root", [{ name: "web1" }, { name: "pve1" }]), [
+      { host: "web1" },
+      { host: "pve1" },
+    ]),
+    async () => {
+      const machines = [
+        { host: "web1", vm: { proxmoxNode: "patch-pve", vmid: 100 } },
+        {
+          host: "pve1",
+          health: [{ type: "proxmox-cluster", nodeModel: "patch-pve" }],
+        },
+      ];
+      // With Sys.Audit on /: no token finding on either machine.
+      const ok = mkCtx({ sshModel: "ssh", access: ACCESS, machines });
+      const asked = tokenPermissions(ok, () => ({
+        paths: [...CLEAN_TOKEN_PATHS, ...ROOT_AUDIT_PATHS],
+      }));
+      await model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), ok.ctx);
+      assertEquals(asked, ["patch-pve"]);
+      assertEquals(auditFindings(auditOf(ok, "web1")), NO_GRANTS_WARNINGS);
+      assertEquals(auditFindings(auditOf(ok, "pve1")), NO_GRANTS_WARNINGS);
+
+      // Without it: the node's check would fail, so the node has api-token-missing.
+      const missing = mkCtx({ sshModel: "ssh", access: ACCESS, machines });
+      tokenPermissions(missing, () => ({ paths: CLEAN_TOKEN_PATHS }));
+      await assertRejects(
+        () =>
+          model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), missing.ctx),
+        Error,
+        "pve1: api-token-missing:patch-pve",
+      );
+      assertEquals(auditFindings(auditOf(missing, "web1")), NO_GRANTS_WARNINGS);
+      assertEquals(auditFindings(auditOf(missing, "pve1")), [
+        "api-token-missing:patch-pve high",
+        ...NO_GRANTS_WARNINGS,
+      ]);
+
+      // Propagated: critical on both machines.
+      const prop = mkCtx({ sshModel: "ssh", access: ACCESS, machines });
+      tokenPermissions(prop, () => ({
+        paths: [
+          ...CLEAN_TOKEN_PATHS,
+          ...tokenPaths(["/", ["Sys.Audit"]]),
+        ],
+      }));
+      await assertRejects(
+        () => model.methods.auditAccess.execute(AUDIT_ARGS.parse({}), prop.ctx),
+        Error,
+        "api-token-extra:/",
+      );
+      for (const host of ["web1", "pve1"]) {
+        assertEquals(auditFindings(auditOf(prop, host)), [
+          "api-token-extra:/ critical",
+          ...NO_GRANTS_WARNINGS,
+        ]);
+      }
+    },
+  );
+});
+
+Deno.test("apiTokenUses: one entry per model, with the guest and how Sys.Audit on / is judged", () => {
+  const parse = (m: unknown) =>
+    model.globalArguments.parse({ sshModel: "ssh", machines: [m] })
+      .machines[0];
+  const ct = parse({
+    host: "valkey",
+    ct: { ctid: 701, nodeModel: "patch-pve" },
+  });
+  const node = parse({
+    host: "node1",
+    health: [
+      { type: "proxmox-cluster", nodeModel: "patch-pve" },
+      { type: "proxmox-cluster", nodeModel: "patch-pve", node: "pve" },
+      { type: "proxmox-cluster", nodeModel: "audit-only" },
+    ],
+  });
+  const both = parse({
+    host: "web1",
+    vm: { proxmoxNode: "patch-pve", vmid: 100 },
+    health: [{ type: "proxmox-cluster", nodeModel: "patch-pve" }],
+  });
+  assertEquals(fleet.apiTokenUses(ct, [ct]), [
+    {
+      model: "patch-pve",
+      guest: { type: "ct", vmid: 701 },
+      clusterAudit: "extra",
+    },
+  ]);
+  assertEquals(fleet.apiTokenUses(ct, [ct, node]), [
+    {
+      model: "patch-pve",
+      guest: { type: "ct", vmid: 701 },
+      clusterAudit: "allowed",
+    },
+  ]);
+  assertEquals(fleet.apiTokenUses(node, [ct, node]), [
+    { model: "patch-pve", guest: null, clusterAudit: "required" },
+    { model: "audit-only", guest: null, clusterAudit: "required" },
+  ]);
+  assertEquals(fleet.apiTokenUses(both, [both]), [
+    {
+      model: "patch-pve",
+      guest: { type: "vm", vmid: 100 },
+      clusterAudit: "required",
+    },
+  ]);
+  assertEquals(fleet.apiTokenUses(parse({ host: "bare" }), [node]), []);
+});
+
+Deno.test("proxmox-cluster health check: schema needs a nodeModel and accepts only a safe node name", () => {
+  const parse = (c: unknown) =>
+    model.globalArguments.safeParse({
+      sshModel: "ssh",
+      machines: [{ host: "node1", health: [c] }],
+    }).success;
+  assert(parse({ type: "proxmox-cluster", nodeModel: "patch-pve" }));
+  assert(
+    parse({ type: "proxmox-cluster", nodeModel: "patch-pve", node: "pve2" }),
+  );
+  assertEquals(parse({ type: "proxmox-cluster" }), false);
+  assertEquals(parse({ type: "proxmox-cluster", nodeModel: "" }), false);
+  for (const node of ["../x", "pve/2", "", "-pve"]) {
+    assertEquals(
+      parse({ type: "proxmox-cluster", nodeModel: "patch-pve", node }),
+      false,
+      node,
+    );
+  }
+});
+
+/** A clusterHealth record for `node`, healthy and quorate unless overridden. */
+function clusterRecord(node: string, over: Record<string, unknown> = {}) {
+  return {
+    node,
+    answeredBy: "node1",
+    clustered: true,
+    cluster: "bridges",
+    quorate: true,
+    nodeListed: true,
+    nodeOnline: true,
+    nodesOnline: 2,
+    nodesTotal: 2,
+    healthy: true,
+    problems: [],
+    checkedAt: "2026-11-07T00:00:00Z",
+    ...over,
+  };
+}
+
+Deno.test("proxmoxClusterVerdict: runs clusterHealth for the node and passes a healthy, quorate record", async () => {
+  const s = stubSwamp([{ ok: true, artifacts: [clusterRecord("pve")] }]);
+  assertEquals(await fleet.proxmoxClusterVerdict("patch-pve", "pve", s.api), {
+    ok: true,
+    detail: "online, quorate (2/2 nodes online)",
+  });
+  assertEquals(s.calls, [
+    { model: "patch-pve", method: "clusterHealth", args: { node: "pve" } },
+  ]);
+  const solo = stubSwamp([{
+    ok: true,
+    artifacts: [clusterRecord("solo", {
+      clustered: false,
+      cluster: null,
+      quorate: null,
+      nodesOnline: 1,
+      nodesTotal: 1,
+    })],
+  }]);
+  assertEquals(
+    (await fleet.proxmoxClusterVerdict("m", "solo", solo.api)).detail,
+    "online, standalone (1/1 nodes online)",
+  );
+});
+
+Deno.test("proxmoxClusterVerdict: fails closed on a failed run, a missing, duplicate or malformed record, or an inconsistent verdict", async () => {
+  const cases: Array<
+    [
+      string,
+      {
+        ok: boolean;
+        artifacts?: Array<Record<string, unknown>>;
+        error?: string;
+      },
+      string,
+    ]
+  > = [
+    [
+      "the run fails",
+      { ok: false, error: "HTTP 403: Permission check failed" },
+      "clusterHealth failed: HTTP 403",
+    ],
+    ["no record", { ok: true, artifacts: [] }, "no readable record for pve"],
+    ["a record for another node", {
+      ok: true,
+      artifacts: [clusterRecord("node1")],
+    }, "no readable record for pve"],
+    ["two records", {
+      ok: true,
+      artifacts: [clusterRecord("pve"), clusterRecord("pve")],
+    }, "2 records for pve"],
+    ["a malformed record", {
+      ok: true,
+      artifacts: [clusterRecord("pve", { quorate: "yes" })],
+    }, "no readable record"],
+    ["offline", {
+      ok: true,
+      artifacts: [
+        clusterRecord("pve", {
+          nodeOnline: false,
+          healthy: false,
+          problems: ["node pve is offline"],
+        }),
+      ],
+    }, "node pve is offline"],
+    ["no quorum", {
+      ok: true,
+      artifacts: [
+        clusterRecord("pve", {
+          quorate: false,
+          healthy: false,
+          problems: ["cluster bridges is not quorate"],
+        }),
+      ],
+    }, "not quorate"],
+    ["healthy but offline", {
+      ok: true,
+      artifacts: [clusterRecord("pve", { nodeOnline: false })],
+    }, "online false"],
+    ["healthy but unlisted", {
+      ok: true,
+      artifacts: [clusterRecord("pve", { nodeListed: false })],
+    }, "listed false"],
+    ["clustered with no quorum value", {
+      ok: true,
+      artifacts: [clusterRecord("pve", { quorate: null })],
+    }, "quorate null"],
+    ["standalone with a quorum value", {
+      ok: true,
+      artifacts: [clusterRecord("pve", { clustered: false, quorate: true })],
+    }, "quorate true"],
+    ["healthy with a problem", {
+      ok: true,
+      artifacts: [clusterRecord("pve", { problems: ["odd"] })],
+    }, "odd"],
+  ];
+  for (const [name, answer, fragment] of cases) {
+    const s = stubSwamp([answer]);
+    const v = await fleet.proxmoxClusterVerdict("patch-pve", "pve", s.api);
+    assertEquals(v.ok, false, name);
+    assertStringIncludes(v.detail, fragment, name);
+  }
+  const throwing: SwampApi = {
+    run: () => Promise.reject(new Error("host API broke")),
+    globalArguments: () => Promise.resolve(null),
+  };
+  const t = await fleet.proxmoxClusterVerdict("patch-pve", "pve", throwing);
+  assertEquals(t.ok, false);
+  assertStringIncludes(t.detail, "host API broke");
+});
+
+Deno.test("evalHealth: a proxmox-cluster check runs from the swamp host for the machine's host, or its node", async () => {
+  const m = model.globalArguments.parse({
+    sshModel: "ssh",
+    machines: [{
+      host: "node1",
+      health: [
+        { type: "proxmox-cluster", nodeModel: "patch-pve" },
+        {
+          type: "proxmox-cluster",
+          nodeModel: "patch-pve",
+          node: "pve",
+          label: "pve seen",
+        },
+      ],
+    }],
+  }).machines[0];
+  const s: SwampApi = {
+    run: (_model, _method, args) =>
+      Promise.resolve({
+        ok: true,
+        artifacts: [clusterRecord(
+          String(args?.node),
+          args?.node === "pve"
+            ? {
+              nodeOnline: false,
+              healthy: false,
+              problems: ["node pve is offline"],
+            }
+            : {},
+        )],
+        error: "",
+      }),
+    globalArguments: () => Promise.resolve(null),
+  };
+  const h = await fleet.evalHealth(m, m.health!, "ssh", s);
+  assertEquals(h.healthy, false);
+  assertEquals(h.results, [
+    {
+      label: "proxmox cluster: node1 online and quorate",
+      ok: true,
+      detail: "online, quorate (2/2 nodes online)",
+    },
+    { label: "pve seen", ok: false, detail: "node pve is offline" },
+  ]);
 });

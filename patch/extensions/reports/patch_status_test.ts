@@ -1,6 +1,6 @@
-import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
+import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import { createReportTestContext } from "jsr:@systeminit/swamp-testing@0.20260604.20";
-import { report } from "./patch_status.ts";
+import { report, versionNewer } from "./patch_status.ts";
 
 const MODEL_TYPE = "@dmc/patch/fleet";
 const MODEL_ID = "fleet-id";
@@ -489,4 +489,99 @@ Deno.test("status report: Via names the osUpdater model when one scanned the nod
   assertEquals(row(res.markdown, "arch1")[col("Via")], "osUpdater pacman-os");
   assertEquals(row(res.markdown, "arch1")[col("Mgr")], "pacman");
   assertEquals(row(res.markdown, "web1")[col("Via")], "ssh");
+});
+
+/** The lines of the "Packages changed outside @dmc/patch" section (empty when absent). */
+function outsideSection(markdown: string): string[] {
+  const head = "## Packages changed outside @dmc/patch";
+  const at = markdown.indexOf(head);
+  if (at < 0) return [];
+  return markdown.slice(at + head.length).split("\n").slice(1)
+    .filter((l) => l.startsWith("- ")).map((l) => l.trim());
+}
+
+Deno.test("status report: a host whose packages changed outside @dmc/patch is listed with its scan time", async () => {
+  const res = await run([
+    inventory("web1", {
+      packagesChangedOutsidePatch: true,
+      lastOutsideChangeAt: "2026-10-30T12:00:00.000Z",
+    }),
+    inventory("web2", { packagesChangedOutsidePatch: false }),
+    inventory("web3", { packagesChangedOutsidePatch: null }),
+    inventory("web4"),
+  ]);
+  assertEquals(outsideSection(res.markdown), [
+    "- **web1** — packages changed outside @dmc/patch (scan at 2026-10-30T12:00:00.000Z)",
+  ]);
+  assertEquals(res.json.nodesWithOutsidePackageChanges, ["web1"]);
+});
+
+Deno.test("status report: no host with a true verdict means no section; false and unknown say nothing", async () => {
+  const res = await run([
+    inventory("web1", { packagesChangedOutsidePatch: false }),
+    inventory("web2", { packagesChangedOutsidePatch: null }),
+  ]);
+  assertEquals(outsideSection(res.markdown), []);
+  assertEquals(res.json.nodesWithOutsidePackageChanges, []);
+  assert(!res.markdown.includes("outside @dmc/patch"));
+});
+
+Deno.test("status report: a host name and a scan time are escaped before they reach Markdown", async () => {
+  const res = await run([
+    inventory("we*b", {
+      packagesChangedOutsidePatch: true,
+      lastOutsideChangeAt: "2026-10-30 <x>",
+    }),
+  ]);
+  assertEquals(outsideSection(res.markdown), [
+    "- **we\\*b** — packages changed outside @dmc/patch (scan at 2026-10-30 &lt;x&gt;)",
+  ]);
+});
+
+Deno.test("status report: versionNewer compares dotted numbers, null when one has none", () => {
+  assertEquals(versionNewer("9.1.3", "9.0.4"), true);
+  assertEquals(versionNewer("9.0.4", "9.1.3"), false);
+  assertEquals(versionNewer("9.0.4", "9.0.4"), false);
+  assertEquals(versionNewer("10.0", "9.9.9"), true);
+  assertEquals(versionNewer("9.1", "9.1.0"), false);
+  assertEquals(versionNewer("v9.1.3", "9.0.4-r0"), true);
+  assertEquals(versionNewer("latest", "9.0.4"), null);
+});
+
+Deno.test("status report: an OS-managed app whose upstream is newer than the repository is listed as behind upstream", async () => {
+  const res = await run([
+    inventory("valkey"),
+    updateCheck("cs-valkey", { upstreamVersion: "9.1.3", osManaged: true }),
+  ]);
+  assertStringIncludes(res.markdown, "## Apps behind upstream");
+  assertStringIncludes(
+    res.markdown,
+    "- **Valkey** 9.0.4 — upstream 9.1.3, but the OS repository has 9.0.4.",
+  );
+  assertEquals(res.json.lxcAppsBehindUpstream, ["Valkey"]);
+  // Nothing an update run can do, so the fleet still counts as current.
+  assertEquals(res.json.allCurrent, true);
+});
+
+Deno.test("status report: no behind-upstream entry when the app is not OS-managed, has an update, or upstream is not newer", async () => {
+  for (
+    const over of [
+      { upstreamVersion: "9.1.3" },
+      { upstreamVersion: "9.1.3", osManaged: true, updateAvailable: true },
+      { upstreamVersion: "9.0.4", osManaged: true },
+      { upstreamVersion: "8.1.0", osManaged: true },
+      { upstreamVersion: null, osManaged: true },
+    ]
+  ) {
+    const res = await run([
+      inventory("valkey"),
+      updateCheck("cs-valkey", over),
+    ]);
+    assertEquals(
+      res.markdown.includes("## Apps behind upstream"),
+      false,
+      JSON.stringify(over),
+    );
+    assertEquals(res.json.lxcAppsBehindUpstream, [], JSON.stringify(over));
+  }
 });

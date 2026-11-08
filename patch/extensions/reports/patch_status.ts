@@ -11,6 +11,8 @@
  * @module
  */
 
+import { mdCell } from "./patch_access.ts";
+
 interface Inventory {
   hostname: string;
   error?: string | null;
@@ -32,6 +34,9 @@ interface Inventory {
     healthy: boolean;
     checks: Array<{ label: string; ok: boolean; detail: string }>;
   } | null;
+  /** The installed packages changed outside @dmc/patch since it last saw them (null = unknown). */
+  packagesChangedOutsidePatch?: boolean | null;
+  lastOutsideChangeAt?: string | null;
   scannedAt: string;
 }
 
@@ -92,6 +97,21 @@ interface ModelCtx {
 const num = (
   v: number | null | undefined,
 ): number => (typeof v === "number" ? v : 0);
+
+/** True when version `a` is newer than `b`, by the first dotted number in each (9.1.3 >
+ *  9.0.4); null when either has no number. */
+export function versionNewer(a: string, b: string): boolean | null {
+  const parts = (v: string) =>
+    v.match(/\d+(?:\.\d+)*/)?.[0].split(".").map(Number) ?? null;
+  const pa = parts(a);
+  const pb = parts(b);
+  if (!pa || !pb) return null;
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return false;
+}
 
 export const report = {
   name: "@dmc/patch-status",
@@ -260,6 +280,13 @@ export const report = {
       } catch { /* skip */ }
     }
     const lxcUpdatable = lxc.filter((a) => a.updateAvailable === true);
+    // An OS-managed app with no update pending whose upstream release is newer: the OS
+    // repository does not have that release yet, so no update run can get it.
+    const lxcBehindUpstream = lxc.filter((a) =>
+      a.osManaged === true && a.updateAvailable !== true &&
+      !!a.upstreamVersion && !!a.installedVersion &&
+      versionNewer(a.upstreamVersion, a.installedVersion) === true
+    ).sort((a, b) => a.name.localeCompare(b.name));
     const lxcSorted = [...lxc].sort((a, b) =>
       (Number(b.updateAvailable === true) -
         Number(a.updateAvailable === true)) || a.name.localeCompare(b.name)
@@ -289,6 +316,10 @@ export const report = {
     const hasSecurity = inv.filter((h) => num(h.securityUpdatesCount) > 0);
     const needsDist = inv.filter((h) => h.distUpgradeRequired === true);
     const unhealthy = inv.filter((h) => h.health && !h.health.healthy);
+    // Only a true verdict shows: null (unknown) and false (unchanged) say nothing.
+    const outsideChange = inv.filter((h) =>
+      h.packagesChangedOutsidePatch === true
+    );
 
     // Container image drift: flatten each host's dockerImages, tagged with host.
     type DockerRow = DockerImage & { host: string };
@@ -432,6 +463,36 @@ export const report = {
       lines.push("");
     }
 
+    if (outsideChange.length > 0) {
+      lines.push("## Packages changed outside @dmc/patch", "");
+      for (const h of outsideChange) {
+        lines.push(
+          `- **${
+            mdCell(h.hostname)
+          }** — packages changed outside @dmc/patch (scan at ${
+            mdCell(h.lastOutsideChangeAt ?? "unknown time")
+          })`,
+        );
+      }
+      lines.push("");
+    }
+
+    if (lxcBehindUpstream.length > 0) {
+      lines.push("## Apps behind upstream", "");
+      for (const a of lxcBehindUpstream) {
+        lines.push(
+          `- **${mdCell(a.name)}** ${
+            mdCell(a.installedVersion ?? "?")
+          } — upstream ${
+            mdCell(a.upstreamVersion ?? "?")
+          }, but the OS repository has ${
+            mdCell(a.latestVersion ?? "no version")
+          }. An update run cannot get it; a newer OS release or another repository can.`,
+        );
+      }
+      lines.push("");
+    }
+
     lines.push(...retiredSection());
 
     return {
@@ -441,9 +502,11 @@ export const report = {
         totalPendingUpdates: totalUpdates,
         nodesNeedingReboot: needsReboot.map((h) => h.hostname),
         nodesWithSecurityUpdates: hasSecurity.map((h) => h.hostname),
+        nodesWithOutsidePackageChanges: outsideChange.map((h) => h.hostname),
         nodesRequiringDistUpgrade: needsDist.map((h) => h.hostname),
         unhealthyNodes: unhealthy.map((h) => h.hostname),
         lxcAppsWithUpdates: lxcUpdatable.map((a) => a.name),
+        lxcAppsBehindUpstream: lxcBehindUpstream.map((a) => a.name),
         containerImagesWithUpdates: dockerUpdatable.map((d) =>
           `${d.host}/${d.container}`
         ),

@@ -33,6 +33,11 @@
 #       with "snapshot:json=false" and FAKE_SWAMP_APP_REJECT_SNAPSHOT set: prints swamp's
 #           "Unknown method input(s): snapshot" error on stderr, exit 1
 #       else exit FAKE_SWAMP_APP_RC (0), with FAKE_SWAMP_APP_ERR on stderr when it is not 0
+#   model method run M privileges ...   (any plugged model) prints FAKE_SWAMP_PRIVS__<M>, else
+#                                           FAKE_SWAMP_PRIVS, else an empty declaration (an API
+#                                           plug-in); exit FAKE_SWAMP_PRIVS_RC__<M>, else
+#                                           FAKE_SWAMP_PRIVS_RC (0). <M> is the model name with every
+#                                           character outside A-Z a-z 0-9 as _.
 #   model method run M <other> ...    prints nothing, exit FAKE_SWAMP_METHOD_RC (0)
 #
 # FAKE_SWAMP_MODEL_GET / FAKE_SWAMP_GET_RC are not read here: the model reads
@@ -124,6 +129,12 @@ if [ "$1" = "model" ] && [ "$2" = "method" ] && [ "$3" = "run" ]; then
         case "$a" in command=*) cmd="$a" ;; esac
       done
       case "$cmd" in
+        # The docker helper (sudo -n swamp-patch-docker <sub> <project>): inspect gives the rows.
+        *"swamp-patch-docker'"*"'inspect'"*) seq_out INSPECT ;;
+        # ps: the container ids, or the exec output (with its rc sentinel) when no ids are set.
+        *"swamp-patch-docker'"*"'ps'"*)
+          if [ -n "${FAKE_SWAMP_PS-}" ]; then printf '%s\n' "$FAKE_SWAMP_PS"; else printf '%s\n' "${FAKE_SWAMP_EXEC-}"; fi
+          ;;
         *"compose ps -q"*) printf '%s\n' "${FAKE_SWAMP_PS-}" ;;
         *"Config.Image"*) seq_out INSPECT ;;
         *"dpkg-query"*) seq_out PKGS ;;
@@ -159,6 +170,18 @@ if [ "$1" = "model" ] && [ "$2" = "method" ] && [ "$3" = "run" ]; then
     listPackages)
       seq_out OSPKGS
       exit "${FAKE_SWAMP_OSPKGS_RC:-0}"
+      ;;
+    privileges)
+      # The model name is sanitized before eval, so it cannot inject anything.
+      key="$(printf '%s' "$4" | tr -c 'A-Za-z0-9' '_')"
+      eval "out=\${FAKE_SWAMP_PRIVS__$key-\${FAKE_SWAMP_PRIVS-__empty__}}"
+      eval "rc=\${FAKE_SWAMP_PRIVS_RC__$key-\${FAKE_SWAMP_PRIVS_RC:-0}}"
+      if [ "$out" = "__empty__" ]; then
+        out='{"dataArtifacts":[{"attributes":{"commands":[],"helpers":[],"remoteCode":false}}]}'
+      fi
+      printf '%s\n' "$out"
+      [ "$rc" -eq 0 ] || printf '%s\n' "privileges failed" >&2
+      exit "$rc"
       ;;
     *)
       exit "${FAKE_SWAMP_METHOD_RC:-0}"

@@ -10,10 +10,70 @@
  * @module
  */
 import { z } from "npm:zod@4";
+import {
+  AcceptedRisk,
+  AccessProfile,
+  SourceAddr,
+  TrustRemote,
+  Unsafe,
+  unsafeRecord,
+} from "./lib/access_policy.ts";
+import type { AccessProfileT, UnsafeT } from "./lib/access_policy.ts";
+import {
+  authorizedKeysLine,
+  provisionScript,
+  revokeScript,
+  shQuote,
+} from "./lib/access_artifacts.ts";
+import type { ProvisionInput } from "./lib/access_artifacts.ts";
+import { dockerProjectName, helperArgv } from "./lib/docker_helper.ts";
+import type { DockerProject, HelperSub } from "./lib/docker_helper.ts";
+import {
+  MAX_PLUGIN_COMMANDS,
+  parsePluginPrivileges,
+  parseRootArgv,
+} from "./lib/plugin_privileges.ts";
+import {
+  FAMILY_PROBES,
+  privCommand,
+  RUNTIME_ABS_FN,
+  runtimeLine,
+  runtimeResolveLines,
+  sudoersTemplate,
+} from "./lib/access_sudoers.ts";
+import type { PrivCommand } from "./lib/access_sudoers.ts";
+import {
+  evaluateAudit,
+  rootProbeScript,
+  userProbeScript,
+} from "./lib/access_audit.ts";
+import type { Finding, Severity } from "./lib/access_audit.ts";
+import {
+  capabilitiesFor,
+  effectivePolicy,
+  OS_AUTO_SCOPES,
+  OS_UPDATE_POLICIES,
+  osRefusal,
+} from "./lib/os_policy.ts";
+import {
+  parseDockerFile,
+  validateDockerImages,
+} from "./lib/docker_inventory.ts";
 
 // The swamp CLI, used only by `checkSwamp` (pre-flight checks get no runModel).
 const SWAMP_BIN = Deno.env.get("SWAMP_BIN") ?? "swamp";
 const RC_SENTINEL = "__SWAMP_RC__";
+
+/** Lists the installed packages, one `name<TAB>version` line each (rpm / dpkg / apk /
+ *  pacman). pacman comes last: Debian ships an unrelated `pacman` game. The collector
+ *  embeds this exact command (as `pkg_manifest`), so the packages hash it reports and
+ *  the model's package diff read the same list. */
+export const PKG_MANIFEST_CMD =
+  `if command -v rpm >/dev/null 2>&1; then rpm -qa --qf '%{NAME}\\t%{VERSION}-%{RELEASE}\\n'; ` +
+  `elif command -v dpkg-query >/dev/null 2>&1; then dpkg-query -W -f='\${Package}\\t\${Version}\\n'; ` +
+  `elif command -v apk >/dev/null 2>&1; then apk info -v | sed 's/-\\([^-]*-r[0-9][0-9]*\\)$/\\t\\1/'; ` +
+  `elif command -v pacman >/dev/null 2>&1; then pacman -Q | tr ' ' '\\t'; fi`;
+
 /**
  * Bundled agentless collector (bash). Shipped to each host as base64 over ssh/pct.
  * Generated verbatim from the collector script so the package is self-contained.
@@ -33,19 +93,16 @@ export const COLLECTOR_SCRIPT: string = [
   "# that reads stdin (e.g. an interactive dnf prompt) would otherwise swallow the",
   "# rest of the script, so all work runs inside main() with stdin < /dev/null.",
   "#",
-  "# Root is not required: counts come from simulate/read-only paths. Package-cache",
-  "# refresh uses passwordless sudo when available, otherwise the existing cache.",
+  "# Root is never used. Counts come from read-only or simulate paths and from the",
+  "# existing package cache. Each host refreshes its own cache with its local timers",
+  "# (pve-daily-update, apt-daily, dnf-makecache, an apk timer). This collector never",
+  "# refreshes the cache: it reports the cache age instead, so a stale cache shows.",
   "set -u",
   "",
   "log() { printf '%s\\n' \"$*\" >&2; }",
   "",
   "# Minimal JSON string escaper (backslash, double-quote, strip control chars).",
   "jesc() { printf '%s' \"${1-}\" | sed -e 's/\\\\/\\\\\\\\/g' -e 's/\"/\\\\\"/g' | tr -d '\\000-\\037'; }",
-  "",
-  'SUDO=""',
-  'if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then',
-  '  SUDO="sudo -n"',
-  "fi",
   "",
   "# Outputs set by the collectors.",
   'pkg_mgr="unknown"',
@@ -58,8 +115,25 @@ export const COLLECTOR_SCRIPT: string = [
   "# docker (only on hosts running the engine): engine version + per-container image drift.",
   'docker_engine="null"   # docker engine version string, or null if no engine',
   'docker_json="null"     # JSON array of running containers vs registry, or null',
+  'docker_source="none"   # where docker_json came from: socket, file or none',
+  'docker_file_b64=""     # base64 of the root-written docker inventory (file source only)',
+  'cache_age="null"       # hours since the package cache was refreshed, or null if unknown',
+  "dnf_user_cache=0       # 1 when dnf answered from its per-user cache (dnf4 fallback)",
+  'packages_hash="null"   # sha256 of the sorted package manifest (a JSON string), or null',
   "",
   'set_reason() { reason_json="\\"$(jesc "$1")\\""; }',
+  "",
+  "# Newest mtime (epoch seconds) of the given paths; empty when none exist.",
+  'newest_mtime() { stat -c %Y "$@" 2>/dev/null | sort -n | tail -1; }',
+  "",
+  "# Cache age in whole hours from an epoch mtime. An empty or non-integer argument",
+  "# leaves cache_age alone; a future mtime counts as 0.",
+  "set_cache_age() {",
+  '  case "${1-}" in ""|*[!0-9]*) return 0 ;; esac',
+  "  cache_age=$(( ($(date +%s) - $1) / 3600 ))",
+  '  [ "$cache_age" -lt 0 ] && cache_age=0',
+  "  return 0",
+  "}",
   "",
   "# Reboot needed if the running kernel differs from the newest installed kernel",
   "# image in /boot (matches PatchMon; catches Proxmox/apt kernels that don't drop",
@@ -76,8 +150,8 @@ export const COLLECTOR_SCRIPT: string = [
   "",
   "collect_apt() {",
   '  pkg_mgr="apt"',
-  '  $SUDO apt-get update -qq >/dev/null 2>&1 || log "apt-get update skipped/failed (using existing cache)"',
   "  local plain dist plain_inst dist_inst dist_remv",
+  '  set_cache_age "$(newest_mtime /var/lib/apt/lists/*Release)"',
   "  # Plain `upgrade` never installs/removes; `dist-upgrade` does. Comparing the two",
   "  # tells us whether the pending updates need a dist-upgrade (held-back / removals).",
   '  plain="$(apt-get -s -o Debug::NoLocking=true upgrade 2>/dev/null || true)"',
@@ -108,21 +182,49 @@ export const COLLECTOR_SCRIPT: string = [
   "  kernel_compare",
   "}",
   "",
+  "# dnf check-update, read-only. First on the system cache (-C); when that fails, on",
+  "# dnf4's per-user cache, which needs no root. Sets dnf_out (the list) and returns",
+  "# dnf's exit code (0 = none, 100 = updates). dnf_user_cache=1 when the retry answered.",
+  "# It runs in the current shell, never in $(...), so the flag survives the call.",
+  "dnf_check() {",
+  "  local rc",
+  '  dnf_out="$(dnf -q -C check-update "$@" 2>/dev/null)"',
+  "  rc=$?",
+  '  if [ "$rc" -ne 0 ] && [ "$rc" -ne 100 ]; then',
+  '    dnf_out="$(dnf -q check-update "$@" 2>/dev/null)"',
+  "    rc=$?",
+  '    if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then dnf_user_cache=1; fi',
+  "  fi",
+  '  return "$rc"',
+  "}",
+  "",
   "collect_dnf() {",
   '  pkg_mgr="dnf"',
-  "  local co",
-  '  co="$($SUDO dnf -q check-update 2>/dev/null || true)"',
-  "  updates=\"$(printf '%s\\n' \"$co\" | grep -cE '^[A-Za-z0-9._+-]+\\.[A-Za-z0-9_]+[[:space:]]' || true)\"",
+  "  local rc",
+  "  dnf_check; rc=$?",
+  '  if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then',
+  "    updates=\"$(printf '%s\\n' \"$dnf_out\" | grep -cE '^[A-Za-z0-9._+-]+\\.[A-Za-z0-9_]+[[:space:]]' || true)\"",
+  "  else",
+  '    updates="null"; log "dnf check-update failed (rc $rc)"',
+  "  fi",
   "  # --security filters check-update to packages with a security update (a clean",
   "  # subset of updates), unlike `updateinfo list` which repeats a package per advisory.",
-  "  security=\"$($SUDO dnf -q check-update --security 2>/dev/null | grep -cE '^[A-Za-z0-9._+-]+\\.[A-Za-z0-9_]+[[:space:]]' || true)\"",
+  "  dnf_check --security; rc=$?",
+  '  if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then',
+  "    security=\"$(printf '%s\\n' \"$dnf_out\" | grep -cE '^[A-Za-z0-9._+-]+\\.[A-Za-z0-9_]+[[:space:]]' || true)\"",
+  "  else",
+  '    security="null"; log "dnf check-update --security failed (rc $rc)"',
+  "  fi",
+  '  if [ "$dnf_user_cache" = "1" ]; then cache_age=0; else',
+  '    set_cache_age "$(newest_mtime /var/cache/dnf/*/repodata/repomd.xml /var/cache/libdnf5/*/repodata/repomd.xml)"',
+  "  fi",
   "  total=\"$(rpm -qa 2>/dev/null | wc -l | tr -d ' ')\"",
   '  [ -z "$updates" ] && updates=0',
   '  [ -z "$security" ] && security=0',
   '  [ -z "$total" ] && total=0',
   "  # Prefer needs-restarting (dnf-utils) for the reboot flag; fall back to kernels.",
   "  if command -v needs-restarting >/dev/null 2>&1; then",
-  "    if ! $SUDO needs-restarting -r >/dev/null 2>&1; then",
+  "    if ! needs-restarting -r >/dev/null 2>&1; then",
   '      needs_reboot="true"; set_reason "needs-restarting: reboot required"',
   "    fi",
   "  fi",
@@ -131,7 +233,7 @@ export const COLLECTOR_SCRIPT: string = [
   "",
   "collect_apk() {",
   '  pkg_mgr="apk"',
-  '  $SUDO apk update -q >/dev/null 2>&1 || log "apk update skipped/failed (using existing cache)"',
+  '  set_cache_age "$(newest_mtime /var/cache/apk/APKINDEX.*.tar.gz)"',
   "  updates=\"$(apk version -l '<' 2>/dev/null | grep -c '<' || true)\"",
   '  security="null"   # Alpine has no distinct security channel',
   "  total=\"$(apk info 2>/dev/null | wc -l | tr -d ' ')\"",
@@ -148,6 +250,7 @@ export const COLLECTOR_SCRIPT: string = [
   "# (exit 2 = nothing to update); without it, fall back to the existing sync db.",
   "collect_pacman() {",
   '  pkg_mgr="pacman"',
+  '  set_cache_age "$(newest_mtime /var/lib/pacman/sync/*.db)"',
   "  local list rc running",
   "  if command -v checkupdates >/dev/null 2>&1; then",
   '    list="$(checkupdates 2>/dev/null)"; rc=$?',
@@ -178,24 +281,41 @@ export const COLLECTOR_SCRIPT: string = [
   "  fi",
   "}",
   "",
+  "# Docker inventory written by a root timer on the host (see lib/docker_inventory.ts).",
+  "# This user only reads that file. Its base64 goes out on one line, never the raw text.",
+  "read_docker_file() {",
+  "  local f=/var/lib/swamp-patch/docker-inventory.json",
+  '  if [ -r "$f" ]; then',
+  '    docker_source="file"',
+  '    docker_file_b64="$(base64 -w0 < "$f" 2>/dev/null || base64 < "$f" | tr -d \'\\n\')"',
+  "  else",
+  '    docker_source="none"',
+  "  fi",
+  "}",
+  "",
   "# Container image drift: for each running container, compare the local image digest",
   "# (RepoDigests, i.e. the digest it was pulled at) against the registry digest for its",
   "# tag (buildx imagetools inspect). updateAvailable=true when they differ, null when it",
   "# can't be determined (locally-built image, private/unreachable registry). Independent",
-  "# of the OS package sections; sets docker_engine + docker_json only.",
+  "# of the OS package sections; sets docker_engine + docker_json only. When the socket",
+  "# is not usable, read_docker_file takes the root-written inventory instead.",
   "collect_docker() {",
-  "  command -v docker >/dev/null 2>&1 || return 0",
-  "  $SUDO docker info >/dev/null 2>&1 || return 0",
+  "  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then",
+  '    docker_source="socket"',
+  "  else",
+  "    read_docker_file",
+  "    return 0",
+  "  fi",
   "  local ver; ver=\"$(docker --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)\"",
   '  [ -n "$ver" ] && docker_engine="\\"$ver\\""',
   '  local items="" c ref local_dig local_sha reg_sha upd item',
   "  while IFS= read -r c; do",
   '    [ -z "$c" ] && continue',
-  '    ref="$($SUDO docker inspect "$c" --format \'{{.Config.Image}}\' 2>/dev/null)"',
+  '    ref="$(docker inspect "$c" --format \'{{.Config.Image}}\' 2>/dev/null)"',
   '    [ -z "$ref" ] && continue',
-  '    local_dig="$($SUDO docker image inspect "$ref" --format \'{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}\' 2>/dev/null)"',
+  '    local_dig="$(docker image inspect "$ref" --format \'{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}\' 2>/dev/null)"',
   '    local_sha="${local_dig##*@}"; case "$local_sha" in sha256:*) ;; *) local_sha="" ;; esac',
-  "    reg_sha=\"$($SUDO docker buildx imagetools inspect \"$ref\" --format '{{.Manifest.Digest}}' 2>/dev/null | grep -oE 'sha256:[0-9a-f]+' | head -1)\"",
+  "    reg_sha=\"$(docker buildx imagetools inspect \"$ref\" --format '{{.Manifest.Digest}}' 2>/dev/null | grep -oE 'sha256:[0-9a-f]+' | head -1)\"",
   '    upd="null"',
   '    if [ -n "$local_sha" ] && [ -n "$reg_sha" ]; then',
   '      [ "$local_sha" = "$reg_sha" ] && upd="false" || upd="true"',
@@ -203,9 +323,25 @@ export const COLLECTOR_SCRIPT: string = [
   '    item="{\\"container\\":\\"$(jesc "$c")\\",\\"image\\":\\"$(jesc "$ref")\\",\\"localDigest\\":\\"$(jesc "$local_sha")\\",\\"registryDigest\\":\\"$(jesc "$reg_sha")\\",\\"updateAvailable\\":$upd}"',
   '    items="${items:+$items,}$item"',
   "  done <<DOCKER_PS",
-  "$($SUDO docker ps --format '{{.Names}}' 2>/dev/null)",
+  "$(docker ps --format '{{.Names}}' 2>/dev/null)",
   "DOCKER_PS",
   '  docker_json="[$items]"',
+  "}",
+  "",
+  "# The installed-package manifest: PKG_MANIFEST_CMD, the same command the @dmc/patch",
+  "# model runs for its package diff. Its output is never shipped, only the hash below.",
+  "pkg_manifest() { " + PKG_MANIFEST_CMD + "; }",
+  "",
+  "# sha256 of the manifest sorted in the C locale, as a JSON string; null when the",
+  "# manifest command fails or prints nothing, or no 64-digit digest comes out (no sha256sum).",
+  "collect_packages_hash() {",
+  "  local out digest",
+  '  out="$(pkg_manifest 2>/dev/null)" || return 0',
+  '  [ -n "$out" ] || return 0',
+  '  digest="$(printf \'%s\\n\' "$out" | LC_ALL=C sort | sha256sum 2>/dev/null | cut -c1-64)"',
+  '  if [ "${#digest}" -eq 64 ] && [ -z "$(printf \'%s\' "$digest" | tr -d \'0-9a-f\')" ]; then',
+  '    packages_hash="\\"$digest\\""',
+  "  fi",
   "}",
   "",
   "main() {",
@@ -235,10 +371,16 @@ export const COLLECTOR_SCRIPT: string = [
   "",
   "  collect_docker",
   "",
-  '  printf \'{"_kind":"patch-inventory","schemaVersion":3,"hostname":"%s","osType":"%s","osVersion":"%s","packageManager":"%s","updatesCount":%s,"securityUpdatesCount":%s,"heldBackCount":%s,"removalsCount":%s,"distUpgradeRequired":%s,"totalPackages":%s,"needsReboot":%s,"rebootReason":%s,"dockerEngine":%s,"dockerImages":%s,"scannedAt":"%s"}\\n\' \\',
+  "  collect_packages_hash",
+  "",
+  "  local uid",
+  '  uid="$(id -u 2>/dev/null)"',
+  "  case \"$uid\" in '' | *[!0-9]*) uid=null ;; esac",
+  '  printf \'{"_kind":"patch-inventory","schemaVersion":5,"hostname":"%s","osType":"%s","osVersion":"%s","packageManager":"%s","updatesCount":%s,"securityUpdatesCount":%s,"heldBackCount":%s,"removalsCount":%s,"distUpgradeRequired":%s,"totalPackages":%s,"needsReboot":%s,"rebootReason":%s,"dockerEngine":%s,"dockerImages":%s,"cacheAgeHours":%s,"uid":%s,"dockerSource":"%s","dockerFileB64":"%s","packagesHash":%s,"scannedAt":"%s"}\\n\' \\',
   '    "$(jesc "$hostname_val")" "$(jesc "$os_type")" "$(jesc "$os_version")" "$pkg_mgr" \\',
   '    "$updates" "$security" "$held_back" "$removals" "$dist_required" \\',
-  '    "$total" "$needs_reboot" "$reason_json" "$docker_engine" "$docker_json" "$scanned_at"',
+  '    "$total" "$needs_reboot" "$reason_json" "$docker_engine" "$docker_json" \\',
+  '    "$cache_age" "$uid" "$docker_source" "$docker_file_b64" "$packages_hash" "$scanned_at"',
   "}",
   "",
   "# stdin from /dev/null so nothing in main() can consume the piped script body.",
@@ -258,9 +400,12 @@ const DockerCfg = z.object({
   healthExpectStatus: z.number().int().default(200),
 }).describe("Presence marks this machine as a docker host to inspect/update");
 
+/** A Proxmox node name, as @dmc/proxmox accepts it. */
+const PVE_NODE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$/;
+
 // A user-definable health check. Several may be listed; the machine is healthy
 // only when every check passes. Each runs on the machine's own transport
-// (http from the swamp host; service/command via ssh or pct exec).
+// (http and proxmox-cluster from the swamp host; service/command via ssh or pct exec).
 const HealthCheck = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("http"),
@@ -274,39 +419,121 @@ const HealthCheck = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("service"),
     label: z.string().optional(),
-    name: z.string().min(1).describe(
-      "systemctl is-active <name> (exit 0 = healthy)",
+    name: z.string().regex(/^[A-Za-z0-9@._:+-]+$/).describe(
+      "A systemd unit or OpenRC service: healthy when `systemctl is-active <name>` passes, or OpenRC's rc-status shows it started (read without root; a crashed daemon is not started)",
+    ),
+  }),
+  z.object({
+    type: z.literal("proxmox-cluster"),
+    label: z.string().optional(),
+    nodeModel: z.string().min(1).describe(
+      "A @dmc/proxmox/node model, run from the swamp host: its clusterHealth method reads " +
+        "/cluster/status with its own API token, which needs Sys.Audit on / (ensureSnapshotAccess " +
+        "with clusterAudit). Nothing runs on the machine and the login gets no secret",
+    ),
+    node: z.string().regex(PVE_NODE_NAME_RE).optional().describe(
+      "The Proxmox node to judge (default: the machine's host). Healthy when the cluster " +
+        "lists it online and, in a cluster, has quorum",
     ),
   }),
   z.object({
     type: z.literal("command"),
     label: z.string().optional(),
-    run: z.string().min(1).describe(
-      "Arbitrary command run in the machine; exit 0 = healthy",
+    run: z.string().min(1).optional().describe(
+      "Shell command run in the machine as the login; exit 0 = healthy. Not with privileged",
+    ),
+    privileged: z.boolean().default(false).describe(
+      "The check needs root: it runs `argv` through sudo -n, and needs an " +
+        "unsafe.privilegedHealth acceptance record. provisionAccess grants exactly that argv",
+    ),
+    argv: z.array(z.string()).min(1).optional().describe(
+      "A privileged check's exact argv (bin first), with the rules of a plug-in command: " +
+        "no shells, interpreters or runners, and arguments of letters, digits and . _ / : = + - only",
     ),
     timeoutSec: z.number().int().default(30),
   }),
-]);
+]).superRefine((c, ctx) => {
+  if (c.type !== "command") return;
+  if (c.privileged) {
+    if (c.argv === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["argv"],
+        message: "a privileged check needs argv",
+      });
+    }
+    if (c.run !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["run"],
+        message: "a privileged check runs argv, not a shell command",
+      });
+    }
+  } else {
+    if (c.run === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["run"],
+        message: "a command check needs run",
+      });
+    }
+    if (c.argv !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["argv"],
+        message: "argv is only for a privileged check",
+      });
+    }
+  }
+});
+
+// Who may change a host's OS packages and reboots (see lib/os_policy.ts for the rules).
+const OsUpdatePolicy = z.enum(OS_UPDATE_POLICIES);
+const OsAutoScope = z.enum(OS_AUTO_SCOPES);
 
 const Machine = z.object({
   host: z.string().min(1).describe("Host name in the sshModel"),
   os: z.boolean().default(true).describe("Collect OS package status"),
+  osUpdatePolicy: OsUpdatePolicy.optional().describe(
+    "Who may change this host's OS packages and reboots. managed (fleet default): " +
+      "@dmc/patch scans, upgrades (safeOsUpdate) and reboots. auto: the host's own updater " +
+      "installs OS updates, so @dmc/patch scans and reboots but never upgrades. scan-only: " +
+      "@dmc/patch only scans; upgrades and reboots are refused, even with force. " +
+      "Absent = inherit globalArguments.osUpdatePolicy.",
+  ),
+  osAutoScope: OsAutoScope.optional().describe(
+    "What the host's own updater installs when the effective osUpdatePolicy is auto: " +
+      "security (security updates only) or all. Only valid on an auto machine; setting it " +
+      "while the effective policy is managed or scan-only is a configuration error.",
+  ),
   health: z.array(HealthCheck).default([]).describe(
     "Health checks used as the healthyAfter verdict for OS update / reboot / docker. " +
       "Every listed check must pass. Empty = reachability fallback. A machine with no checks " +
       "but a `source` updater derives them from that updater model's healthUrl + service globalArgs.",
   ),
   reach: z.enum(["ssh", "pct"]).optional().describe(
-    "How to run the OS scan: ssh (via sshModel) or pct (via the node, for CTs). " +
-      "Unset = try ssh, fall back to pct when it fails and a proxmox ref exists.",
+    "How to reach the machine: ssh (default, via sshModel) or pct (root in a Proxmox " +
+      "container via its node; needs an unsafe.pctExec acceptance record). " +
+      "There is no fallback between them.",
   ),
   docker: DockerCfg.optional(),
   ct: z.object({
-    proxmoxNode: z.string().min(1).describe("Proxmox node the CT runs on"),
+    proxmoxNode: z.string().min(1).optional().describe(
+      "ssh host (in sshModel) of the Proxmox node the CT runs on; pct needs it (reach pct, or the built-in pct snapshots)",
+    ),
     ctid: z.number().int().describe("Proxmox CT (LXC) id"),
+    nodeModel: z.string().min(1).optional().describe(
+      "A @dmc/proxmox/node model whose API token may snapshot this CT: snapshots, rollbacks and deletes go through its snapshotCt / rollbackCt / deleteCtSnapshot / listCtSnapshots, on whichever node the CT runs now. No ssh or root on the node.",
+    ),
+  }).refine((c) => c.proxmoxNode !== undefined || c.nodeModel !== undefined, {
+    message:
+      "ct needs nodeModel (API snapshots) or proxmoxNode (pct on the node)",
   }).optional().describe(
-    "Marks a Proxmox CT and its location for pct exec — scan, OS update (with capture), and reboot. " +
-      "A plain CT needs only this; no app source required.",
+    "Marks a Proxmox CT and its location. It is reached over ssh, like a VM, unless it has an " +
+      "unsafe.pctExec record: then scan, OS update and reboot go through pct exec on " +
+      "proxmoxNode. Its snapshots go through nodeModel (the Proxmox API); without nodeModel " +
+      "the built-in CT snapshots run pct on the node and need that record too, and without " +
+      "either an OS update needs a snapshotter model. No app source required.",
   ),
   // ── Pluggable app updater ───────────────────────────────────────────────
   // `source.model` names ANY model instance that implements the updater
@@ -356,8 +583,9 @@ const Machine = z.object({
   // Snapshot, rollback and cleanup act on ONE artifact, so they are ONE contract:
   // whatever takes a snapshot must also roll it back and delete it. @dmc/patch ships
   // two built-in snapshotters — proxmox-vm (the `vm` node model) and proxmox-ct
-  // (`pct` on the CT's node) — and `snapshotter.model` plugs in any other, reached by
-  // name via runModel. Snapshotter contract — the referenced model MUST expose:
+  // (`pct` on the CT's node, only with unsafe.pctExec) — and `snapshotter.model`
+  // plugs in any other, reached by name via runModel. Snapshotter contract — the
+  // referenced model MUST expose:
   //   • snapshot({ host, name })       — take a snapshot named `name` of `host`.
   //   • rollback({ host, name })       — revert `host` to that snapshot.
   //   • deleteSnapshot({ host, name }) — remove it (pruneSnapshots, after retention).
@@ -404,6 +632,35 @@ const Machine = z.object({
       "apt/dnf/apk/pacman upgrade. Health checks and reboots still use the machine's " +
       "ssh / pct transport.",
   ),
+  unsafe: Unsafe.optional().describe(
+    "Explicitly accepted unsafe paths for this machine. Each present key is an acceptance " +
+      "record (reason, acceptedBy, acceptedAt, reviewBy) and is reported as an accepted risk. " +
+      "Absent = the safe default.",
+  ),
+  trustRemote: z.array(TrustRemote).default([]).describe(
+    "Accepted trust in code fetched at run time by this machine's updater " +
+      "(e.g. community-scripts/ProxmoxVE@main).",
+  ),
+  acceptedRisks: z.array(AcceptedRisk).default([]).describe(
+    "Audit findings accepted for this host, by finding id. Still reported, under accepted risks.",
+  ),
+  from: z.array(SourceAddr).min(1).optional().describe(
+    "Per-machine override of access.from (e.g. a host reached through NAT).",
+  ),
+}).superRefine((m, ctx) => {
+  // An explicit non-auto policy on this machine makes osAutoScope a contradiction. An
+  // inherited one is checked where the policy is resolved (effectivePolicy), at use.
+  if (
+    m.osAutoScope !== undefined &&
+    (m.osUpdatePolicy === "managed" || m.osUpdatePolicy === "scan-only")
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["osAutoScope"],
+      message:
+        `osAutoScope applies only when osUpdatePolicy is auto, but this machine sets osUpdatePolicy: ${m.osUpdatePolicy}`,
+    });
+  }
 });
 
 const GlobalArgs = z.object({
@@ -411,9 +668,34 @@ const GlobalArgs = z.object({
     "Name of the @swamp/ssh model instance used to reach hosts (required — no default)",
   ),
   proxmoxNodes: z.array(z.string()).default([]).describe(
-    "Optional @keeb/proxmox/node / @dmc/proxmox model names, for VM/CT discovery in `import`",
+    "Optional @dmc/proxmox/node model names, for VM/CT discovery in `import`",
+  ),
+  osUpdatePolicy: OsUpdatePolicy.default("managed").describe(
+    "The fleet default osUpdatePolicy. A machine's own osUpdatePolicy overrides it.",
+  ),
+  osAutoScope: OsAutoScope.default("security").describe(
+    "The fleet default osAutoScope, used by a machine whose effective policy is auto.",
   ),
   machines: z.array(Machine).default([]).describe("The decorated fleet"),
+  access: AccessProfile.optional().describe(
+    "The unprivileged login used to reach the fleet, and the root-capable model that provisions it. Required by the access methods.",
+  ),
+}).superRefine((g, ctx) => {
+  // A machine that inherits a non-auto fleet policy cannot carry osAutoScope. Caught here,
+  // at validation, so a bad machine is not found only when a method reaches it.
+  g.machines.forEach((m, i) => {
+    if (
+      m.osAutoScope !== undefined && m.osUpdatePolicy === undefined &&
+      g.osUpdatePolicy !== "auto"
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["machines", i, "osAutoScope"],
+        message:
+          `osAutoScope applies only when osUpdatePolicy is auto, but ${m.host} inherits osUpdatePolicy: ${g.osUpdatePolicy} from the fleet`,
+      });
+    }
+  });
 });
 
 const DockerImage = z.object({
@@ -423,6 +705,9 @@ const DockerImage = z.object({
   registryDigest: z.string(),
   updateAvailable: z.boolean().nullable(),
 });
+
+/** A packages hash: sha256 as 64 lowercase hex characters. */
+const PKG_HASH = /^[0-9a-f]{64}$/;
 
 const Inventory = z.object({
   hostname: z.string(),
@@ -439,8 +724,33 @@ const Inventory = z.object({
   rebootReason: z.string().nullable(),
   dockerEngine: z.string().nullable(),
   dockerImages: z.array(DockerImage).nullable(),
+  dockerSource: z.enum([
+    "none",
+    "socket",
+    "socket-invalid",
+    "file",
+    "file-invalid",
+  ])
+    .nullable().optional().describe(
+      "Where the docker inventory came from: the docker socket, a root-written file, none, or a source whose items failed validation (socket-invalid, file-invalid: then dockerImages is null)",
+    ),
+  dockerFileAgeHours: z.number().nullable().optional().describe(
+    "Hours since the root-written docker inventory file was generated (dockerSource file only)",
+  ),
+  cacheAgeHours: z.number().nullable().optional().describe(
+    "Hours since the package cache was last refreshed by the host's own timers (null = unknown)",
+  ),
+  uid: z.number().int().nullable().optional().describe(
+    "The uid the collector ran as",
+  ),
   reachMethod: z.enum(["ssh", "pct"]).nullable().describe(
     "How this host was scanned (null when an osUpdater model scanned it)",
+  ),
+  acceptedRisksUsed: z.array(z.string()).default([]).describe(
+    "Acceptance records this scan relied on, e.g. unsafe.pctExec",
+  ),
+  securityFindings: z.array(z.string()).default([]).describe(
+    "Security findings from the scan itself, e.g. root-login-unaccepted",
   ),
   osUpdater: z.string().nullable().optional().describe(
     "The osUpdater model that scanned this host; null/absent = the bundled collector",
@@ -454,6 +764,19 @@ const Inventory = z.object({
     "Health-check verdict, or null when no checks are defined",
   ),
   error: z.string().nullable(),
+  packagesHash: z.string().regex(PKG_HASH).nullable().default(null).describe(
+    "sha256 of the sorted installed-package manifest, as read by this scan (null = unknown: no collector hash, or an osUpdater model, which has none in this release)",
+  ),
+  packagesBaseline: z.string().regex(PKG_HASH).nullable().default(null)
+    .describe(
+      "The last package hash @dmc/patch saw for this host, carried across reads that could not produce one",
+    ),
+  packagesChangedOutsidePatch: z.boolean().nullable().default(null).describe(
+    "true when this scan found the package set changed since @dmc/patch last saw it (the host's own updater, a person, another tool); null = unknown",
+  ),
+  lastOutsideChangeAt: z.string().nullable().default(null).describe(
+    "When a scan last found an outside change (ISO time), carried until the next one",
+  ),
   scannedAt: z.string(),
 });
 
@@ -552,6 +875,9 @@ const RunRecord = z.object({
   snapshot: z.string().nullable(),
   rolledBack: z.boolean(),
   needsReboot: z.boolean().nullable(),
+  acceptedRisksUsed: z.array(z.string()).default([]).describe(
+    "Acceptance records this run relied on, e.g. unsafe.privilegedUpdater or trustRemote:<source>",
+  ),
   timestamp: z.string(),
 });
 
@@ -568,6 +894,13 @@ const SnapshotterRefSchema = z.discriminatedUnion("kind", [
     kind: z.literal("proxmox-vm"),
     node: z.string().describe("Proxmox node model that holds the VM"),
     vmid: z.number().int(),
+  }),
+  z.object({
+    kind: z.literal("proxmox-ct-api"),
+    node: z.string().describe(
+      "Proxmox node model whose API token snapshots the CT",
+    ),
+    ctid: z.number().int(),
   }),
   z.object({
     kind: z.literal("proxmox-ct"),
@@ -589,14 +922,14 @@ const SnapshotterRefSchema = z.discriminatedUnion("kind", [
 const SnapshotRecord = z.object({
   host: z.string(),
   kind: z.enum(["vm", "ct", "model"]).default("vm").describe(
-    "vm → node-model snapshot API; ct → pct snapshot on the node host; " +
+    "vm → node-model snapshot API; ct → node-model CT snapshot API or pct snapshot on the node host; " +
       "model → a pluggable snapshotter model (see `snapshotter`)",
   ),
   vmid: z.number().nullable().describe(
     "VM id, or CT id when kind=ct; null when kind=model",
   ),
   proxmoxNode: z.string().nullable().describe(
-    "node model (vm) or ssh host running pct (ct); null when kind=model",
+    "node model (vm, or ct through the API) or ssh host running pct (ct); null when kind=model",
   ),
   snapshotter: SnapshotterRefSchema.optional().describe(
     "The implementation that took this snapshot; `rollback` and `pruneSnapshots` " +
@@ -664,6 +997,80 @@ const RetainedImage = z.object({
   healthConfirmed: z.boolean(),
   status: z.enum(["active", "pruned"]),
   prunedAt: z.string().nullable(),
+});
+
+// The swamp-patch access login. The plan is the rendered access for one host; a run is
+// the append-only record of one host in provisionAccess or revokeAccess.
+const AccessPlan = z.object({
+  host: z.string(),
+  user: z.string(),
+  keyLine: z.string(),
+  from: z.array(z.string()),
+  docker: z.boolean(),
+  provisionScriptSha256: z.string(),
+  revokeScriptSha256: z.string(),
+  provisionScript: z.string(),
+  generatedAt: z.string(),
+});
+
+const AccessRun = z.object({
+  host: z.string(),
+  action: z.enum(["provision", "revoke"]),
+  dryRun: z.boolean(),
+  ok: z.boolean(),
+  exitCode: z.number().nullable(),
+  outcome: z.enum([
+    "applied",
+    "dry-run",
+    "refused-takeover",
+    "refused-preflight",
+    "failed",
+    "skipped",
+  ]),
+  result: z.unknown().nullable(),
+  detail: z.string(),
+  scriptSha256: z.string(),
+  sudo: z.boolean(),
+  ranAt: z.string(),
+});
+
+// The access audit. auditAccess writes one accessAudit record per host: the findings of the
+// two probes, the accepted risks they matched, and whether the host passed the failOn level.
+const FailOn = z.enum(["none", "high", "critical"]);
+const AuditFinding = z.object({
+  id: z.string(),
+  severity: z.enum(["critical", "high", "warning", "info"]),
+  message: z.string(),
+}).strict();
+const Count = z.number().int().min(0);
+const AccessAudit = z.object({
+  host: z.string(),
+  auditedAt: z.string(),
+  ok: z.boolean(),
+  findings: z.array(AuditFinding),
+  acceptedRisks: z.array(AuditFinding.extend({
+    record: z.object({
+      reason: z.string(),
+      acceptedBy: z.string(),
+      acceptedAt: z.string(),
+      reviewBy: z.string(),
+    }).loose(),
+  })),
+  summary: z.object({
+    critical: Count,
+    high: Count,
+    warning: Count,
+    info: Count,
+    accepted: Count,
+    overdue: Count,
+  }).strict(),
+  userProbe: z.unknown().nullable(),
+  rootProbe: z.unknown().nullable(),
+  userProbeError: z.string().nullable(),
+  rootProbeError: z.string().nullable(),
+  pluginGrants: z.array(z.string()).default([]).describe(
+    "The sudoers text of the commands the machine's plugged models declare (privileges), with @name@ where each path goes: part of the expected grants",
+  ),
 });
 
 /** Minimal LogTape-style logger supplied by swamp as `context.logger`. */
@@ -995,6 +1402,8 @@ export interface HostRun {
   host: string;
   stdout: string;
   exitCode: number;
+  /** Set only when the record has it: ssh's own errors (exit 255) are only here. */
+  stderr?: string;
 }
 
 /** Per-host results of one `<sshModel> script` call, plus the call's own verdict. */
@@ -1036,13 +1445,15 @@ export async function freshRunResults(
 }
 
 /** Run `<sshModel> script` (fan-out) and return per-host output and the call's verdict.
- *  Throws only when the call failed and no host result can be found. */
+ *  Throws only when the call failed and no host result can be found. `sudo` is passed
+ *  to the call only when true. */
 export async function runScriptOutcome(
   sshModel: string,
   hosts: string[],
   script: string,
   timeoutSec: number,
   swamp: SwampApi,
+  sudo = false,
 ): Promise<ScriptOutcome> {
   const t0 = Date.now();
   const res = await swamp.run(sshModel, "script", {
@@ -1051,6 +1462,7 @@ export async function runScriptOutcome(
     script,
     captureOutput: true,
     timeoutSec,
+    ...(sudo ? { sudo: true } : {}),
   });
   let artifacts = res.artifacts;
   if (!res.ok && artifacts.length === 0) {
@@ -1063,10 +1475,11 @@ export async function runScriptOutcome(
   }
   const runs = artifacts
     .filter((at) => typeof at.host === "string")
-    .map((at) => ({
+    .map((at): HostRun => ({
       host: at.host as string,
       stdout: (at.stdout as string) ?? "",
       exitCode: (at.exitCode as number) ?? -1,
+      ...(typeof at.stderr === "string" ? { stderr: at.stderr } : {}),
     }));
   return { runs, ok: res.ok, error: res.error };
 }
@@ -1184,7 +1597,7 @@ export function utf8b64(s: string): string {
 
 export interface MachineShape {
   host: string;
-  ct?: { proxmoxNode: string; ctid: number };
+  ct?: { proxmoxNode?: string; ctid: number; nodeModel?: string };
   source?: { type?: string; model: string };
   proxmox?: { model: string };
   vm?: { proxmoxNode: string; vmid: number };
@@ -1192,6 +1605,7 @@ export interface MachineShape {
   osUpdater?: { model: string };
   reach?: "ssh" | "pct";
   health?: Array<z.infer<typeof HealthCheck>>;
+  unsafe?: UnsafeT;
 }
 
 /** True when a machine is a Proxmox CT (new `ct`, or legacy pct/proxmox ref). */
@@ -1209,13 +1623,20 @@ export function appSource(m: MachineShape): string | null {
   return null;
 }
 
-/** Resolve a CT's node + ctid: from `ct`, else legacy (read from the proxmox model's
- *  globalArguments). */
+/** Resolve a CT's node + ctid for pct: from `ct`, else legacy (read from the proxmox
+ *  model's globalArguments). A `ct` with only a nodeModel has no node for pct. */
 export async function ctLocation(
   m: MachineShape,
   swamp: SwampApi,
 ): Promise<{ node: string; ctid: number }> {
-  if (m.ct) return { node: m.ct.proxmoxNode, ctid: m.ct.ctid };
+  if (m.ct) {
+    if (!m.ct.proxmoxNode) {
+      throw new Error(
+        `${m.host}: pct needs ct.proxmoxNode (the ssh host of the CT's node)`,
+      );
+    }
+    return { node: m.ct.proxmoxNode, ctid: m.ct.ctid };
+  }
   const model = m.proxmox?.model;
   if (!model) {
     throw new Error(
@@ -1271,43 +1692,50 @@ export async function resolveHealthChecks(
 // choose one (`transportFor`):
 //   • ssh — the host itself, through the ssh model's `script` (multi-line) and `exec`
 //           (one command) methods.
-//   • pct — a Proxmox CT, through `pct` on its node over the ssh model (a CT often has
-//           no ssh of its own). Scripts are shipped base64-encoded into `pct exec`.
+//   • pct — a Proxmox CT with an unsafe.pctExec record (root in the container), through
+//           `pct` on its node over the ssh model. Scripts are shipped base64-encoded into
+//           `pct exec`. Containers without the record are reached over ssh; pct is never
+//           a fallback. The built-in CT snapshots (`pct snapshot` on the node) need the same record.
 // safeOsUpdate, reboot, the health checks, pruneSnapshots' live gate and the
 // host-reachable check reach a machine only through a Transport; none of them branches
 // on ssh-vs-pct. `scan` keeps its own batched fan-out (one call for every ssh host, one
 // per node) to stay under swamp's runModel call budget.
 // ---------------------------------------------------------------------------
 
-/** Lists the installed packages, one `name<TAB>version` line each (rpm / dpkg / apk /
- *  pacman). pacman comes last: Debian ships an unrelated `pacman` game. */
-export const PKG_MANIFEST_CMD =
-  `if command -v rpm >/dev/null 2>&1; then rpm -qa --qf '%{NAME}\\t%{VERSION}-%{RELEASE}\\n'; ` +
-  `elif command -v dpkg-query >/dev/null 2>&1; then dpkg-query -W -f='\${Package}\\t\${Version}\\n'; ` +
-  `elif command -v apk >/dev/null 2>&1; then apk info -v | sed 's/-\\([^-]*-r[0-9][0-9]*\\)$/\\t\\1/'; ` +
-  `elif command -v pacman >/dev/null 2>&1; then pacman -Q | tr ' ' '\\t'; fi`;
-
 /** The built-in OS upgrade, for the package manager the machine has. Works as root
  *  (pct exec) or through `sudo -n` (ssh as non-root). apt honours `mode` (safe =
  *  `upgrade`, never removes; full = `full-upgrade`); dnf, apk and pacman always do a
  *  full upgrade (pacman supports no other kind). */
 export function osUpgradeScript(mode: "safe" | "full"): string {
-  const aptMode = mode === "full" ? "full-upgrade" : "upgrade";
-  // DEBIAN_FRONTEND is exported (not inlined after $SUDO) so it never lands in
-  // command position — `$SUDO VAR=val cmd` breaks when $SUDO is non-empty.
-  return [
-    `export DEBIAN_FRONTEND=noninteractive`,
+  // Every command is a table entry (access_sudoers.ts), run by the absolute path that
+  // `command -v` finds on this host: the sudoers entry names that same path, and sudo matches
+  // the argv exactly. DEBIAN_FRONTEND comes from the table's env entry, through /usr/bin/env.
+  const upgrade = mode === "full" ? "apt-full-upgrade" : "apt-upgrade";
+  const families: Array<{
+    family: "apt" | "dnf" | "apk" | "pacman";
+    ids: string[];
+  }> = [
+    { family: "apt", ids: ["apt-update", upgrade] },
+    { family: "dnf", ids: ["dnf-upgrade"] },
+    { family: "apk", ids: ["apk-upgrade"] },
+    { family: "pacman", ids: ["pacman-upgrade"] },
+  ];
+  const lines = [
     `SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"`,
-    `if command -v apt-get >/dev/null 2>&1; then`,
-    `  $SUDO apt-get update -qq && $SUDO apt-get -y ${aptMode}`,
-    `elif command -v dnf >/dev/null 2>&1; then`,
-    `  $SUDO dnf -y upgrade`,
-    `elif command -v apk >/dev/null 2>&1; then`,
-    `  $SUDO apk upgrade`,
-    `elif command -v pacman >/dev/null 2>&1; then`,
-    `  $SUDO pacman -Syu --noconfirm`,
-    `else echo "no known package manager" >&2; exit 3; fi`,
-  ].join("\n");
+    RUNTIME_ABS_FN,
+  ];
+  families.forEach(({ family, ids }, i) => {
+    const cmds = ids.map(privCommand);
+    lines.push(
+      `${i === 0 ? "if" : "elif"} command -v ${
+        FAMILY_PROBES[family][0]
+      } >/dev/null 2>&1; then`,
+    );
+    for (const l of runtimeResolveLines(cmds)) lines.push(`  ${l}`);
+    lines.push(`  ${cmds.map(runtimeLine).join(" && ")}`);
+  });
+  lines.push(`else echo "no known package manager" >&2; exit 3; fi`);
+  return lines.join("\n");
 }
 
 /** The installed-package manifest from PKG_MANIFEST_CMD's output: name → version. */
@@ -1339,9 +1767,14 @@ export function diffPkgs(
   return out;
 }
 
-/** Reboot over ssh, scheduled with systemd-run so the exec call returns before sshd dies. */
-const SSH_REBOOT_CMD = `SUDO=""; [ "$(id -u)" != 0 ] && SUDO="sudo -n"; ` +
-  `$SUDO systemd-run --on-active=3 --timer-property=AccuracySec=100ms systemctl reboot`;
+/** Reboot over ssh, scheduled with systemd-run so the exec call returns before sshd dies.
+ *  The command is the table's reboot entry (access_sudoers.ts), run by its absolute path. */
+export const SSH_REBOOT_CMD = [
+  `SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"`,
+  RUNTIME_ABS_FN,
+  ...runtimeResolveLines([privCommand("reboot")]),
+  runtimeLine(privCommand("reboot")),
+].join("\n");
 
 /** How @dmc/patch reaches one machine. */
 export interface Transport {
@@ -1385,6 +1818,130 @@ export interface TransportDeps {
   swamp: SwampApi;
 }
 
+/** The package-set fields of one inventory record. */
+export interface PackageState {
+  packagesHash: string | null;
+  packagesBaseline: string | null;
+  packagesChangedOutsidePatch: boolean | null;
+  lastOutsideChangeAt: string | null;
+}
+
+/** The packages hash of a value, or null when it is not one (an unknown value is null). */
+export function packagesHashOf(v: unknown): string | null {
+  return typeof v === "string" && PKG_HASH.test(v) ? v : null;
+}
+
+/**
+ * Whether the package set changed outside @dmc/patch since @dmc/patch last saw it.
+ *
+ * `prev` is the host's previous inventory record (null when there is none). `currentHash`
+ * is this read's hash, null when the read could not produce one. The verdict is null when
+ * either side is unknown, so an unknown read never reads as "unchanged". The baseline is
+ * the last hash @dmc/patch saw: this read's hash, or the carried one when this read has
+ * none. A record written before packagesBaseline existed has only packagesHash, which
+ * serves as the baseline.
+ */
+export function outsidePackageChange(
+  prev: {
+    packagesHash?: unknown;
+    packagesBaseline?: unknown;
+    lastOutsideChangeAt?: unknown;
+  } | null,
+  currentHash: unknown,
+  nowIso: string,
+): PackageState {
+  const now = packagesHashOf(currentHash);
+  const prevBaseline = packagesHashOf(
+    prev?.packagesBaseline ?? prev?.packagesHash,
+  );
+  const changed = now !== null && prevBaseline !== null
+    ? now !== prevBaseline
+    : null;
+  const carried = typeof prev?.lastOutsideChangeAt === "string"
+    ? prev.lastOutsideChangeAt
+    : null;
+  return {
+    packagesHash: now,
+    packagesBaseline: now ?? prevBaseline,
+    packagesChangedOutsidePatch: changed,
+    lastOutsideChangeAt: changed === true ? nowIso : carried,
+  };
+}
+
+/**
+ * The package-set fields of a safeOsUpdate record.
+ *
+ * The outside-change verdict reads `beforeHash`, the package set just before the update,
+ * against the previous record: a change that happened before this update is flagged. The
+ * baseline and packagesHash describe the state the update leaves behind (`finalHash`), so
+ * @dmc/patch's own upgrade never reads as an outside change on the next scan. When that
+ * state is unknown, the baseline is carried: the last hash @dmc/patch saw (the before
+ * read's, when it had one).
+ */
+export function updatedPackageState(
+  prev: {
+    packagesHash?: unknown;
+    packagesBaseline?: unknown;
+    lastOutsideChangeAt?: unknown;
+  } | null,
+  beforeHash: unknown,
+  finalHash: unknown,
+  nowIso: string,
+): PackageState {
+  const verdict = outsidePackageChange(prev, beforeHash, nowIso);
+  const left = packagesHashOf(finalHash);
+  return {
+    packagesHash: left,
+    packagesBaseline: left ?? verdict.packagesBaseline,
+    packagesChangedOutsidePatch: verdict.packagesChangedOutsidePatch,
+    lastOutsideChangeAt: verdict.lastOutsideChangeAt,
+  };
+}
+
+/** The inventory stored for one collector line. A schemaVersion 4 line has no packagesHash;
+ *  the writers set the package-set fields from the verdict, so it stores as unknown.
+ *  A `file` docker inventory is checked by parseDockerFile here, and only its result is
+ *  kept: the base64 itself is never stored, and a file that fails the check gives
+ *  `file-invalid` with no images. */
+function inventoryFromCollector(
+  line: string,
+  logger?: Logger,
+): Record<string, unknown> {
+  const { dockerFileB64, ...inv } = JSON.parse(line) as Record<string, unknown>;
+  if (inv.dockerSource === "file") {
+    const parsed = parseDockerFile(String(dockerFileB64 ?? ""), new Date());
+    if (parsed.ok) {
+      return {
+        ...inv,
+        dockerEngine: parsed.dockerEngine,
+        dockerImages: parsed.dockerImages,
+        dockerFileAgeHours: parsed.ageHours,
+      };
+    }
+    logger?.warn("docker inventory file rejected: {error}", {
+      error: parsed.error,
+    });
+    return {
+      ...inv,
+      dockerSource: "file-invalid",
+      dockerImages: null,
+      dockerFileAgeHours: null,
+    };
+  }
+  // The socket items were never checked before. A schemaVersion 3 line has no
+  // dockerSource but does carry dockerImages, so it is checked too. A null list (no
+  // engine) is left alone.
+  const fromSocket = inv.dockerSource === "socket" ||
+    inv.dockerSource === undefined;
+  if (!fromSocket || !Array.isArray(inv.dockerImages)) return inv;
+  const checked = validateDockerImages(inv.dockerImages);
+  if (checked.ok) return inv;
+  logger?.warn("docker inventory from the socket rejected: {error}", {
+    error: checked.error,
+  });
+  return { ...inv, dockerSource: "socket-invalid", dockerImages: null };
+}
+
 /** The patch inventory from a collector run; null when there is no answer, no marker
  *  line, or no valid JSON. */
 async function scanWith(
@@ -1393,7 +1950,9 @@ async function scanWith(
   try {
     const { out } = await script(COLLECTOR_SCRIPT, 240);
     const line = markerLine(out, "patch-inventory");
-    return line ? JSON.parse(line) as z.infer<typeof Inventory> : null;
+    return line
+      ? inventoryFromCollector(line) as z.infer<typeof Inventory>
+      : null;
   } catch {
     return null;
   }
@@ -1499,18 +2058,47 @@ export function pctTransport(
   };
 }
 
-/** Which transport a machine uses, from its decorations alone (no lookup): pct for a CT
- *  that is not also a VM, ssh otherwise. */
+/** The refusal for a machine that asks for pct (`reach: "pct"`) without an
+ *  unsafe.pctExec acceptance record; null otherwise. pct is root in the container, so it
+ *  is never a fallback: the machine is refused, not moved to pct. */
+export function pctRefusal(m: MachineShape): string | null {
+  if (m.reach !== "pct" || unsafeRecord(m, "pctExec") !== null) return null;
+  return `machine "${m.host}" asks for pct (root in the container) but has no unsafe.pctExec acceptance record — add one (reason, acceptedBy, acceptedAt, reviewBy) or reach it over ssh`;
+}
+
+/** The refusal for the built-in CT snapshotter on a machine; null when it may run. It runs
+ *  `pct snapshot|rollback|delsnapshot` as root on the CT's node, the same root access as pct
+ *  exec, so it needs the same unsafe.pctExec record. A CT reached over ssh without the
+ *  record gets no root on its node: it needs ct.nodeModel or a snapshotter model instead. */
+export function pctSnapshotRefusal(m: MachineShape): string | null {
+  if (unsafeRecord(m, "pctExec") !== null) return null;
+  return `CT "${m.host}": the built-in pct snapshots run pct as root on its node, which needs an unsafe.pctExec acceptance record — add ct.nodeModel (snapshots through the Proxmox API), a snapshotter model, or the record`;
+}
+
+/** True when a machine's snapshots run pct on its node: a CT (not also a VM) with no
+ *  snapshotter model and no ct.nodeModel. Only then is its pct location resolved, and only
+ *  then does it need the unsafe.pctExec record for its snapshots. */
+export function usesPctSnapshots(m: MachineShape): boolean {
+  return !m.vm && isCtMachine(m) && !m.snapshotter?.model && !m.ct?.nodeModel;
+}
+
+/** Which transport a machine uses, from its decorations alone (no lookup): pct only for a
+ *  CT that is not also a VM and has an unsafe.pctExec record; ssh otherwise. */
 export function transportVia(m: MachineShape): "ssh" | "pct" {
-  return isCtMachine(m) && !m.vm ? "pct" : "ssh";
+  return isCtMachine(m) && !m.vm && unsafeRecord(m, "pctExec") !== null
+    ? "pct"
+    : "ssh";
 }
 
 /** The transport for a machine. A CT's location is resolved here (a legacy CT reads it
- *  from its proxmox model). */
+ *  from its proxmox model). A refused machine throws its pctRefusal: it never falls back
+ *  to ssh or to pct. */
 export async function transportFor(
   m: MachineShape,
   deps: TransportDeps,
 ): Promise<Transport> {
+  const refusal = pctRefusal(m);
+  if (refusal) throw new Error(refusal);
   if (transportVia(m) === "pct") {
     return pctTransport(m.host, await ctLocation(m, deps.swamp), deps);
   }
@@ -1554,6 +2142,76 @@ export function inventoryHealth(
   return h ? { healthy: h.healthy, checks: h.results } : null;
 }
 
+/** The fields of a @dmc/proxmox/node `clusterHealth` record that the verdict reads. */
+const ClusterHealthRecord = z.object({
+  node: z.string(),
+  clustered: z.boolean(),
+  quorate: z.boolean().nullable(),
+  nodeListed: z.boolean(),
+  nodeOnline: z.boolean(),
+  nodesOnline: z.number(),
+  nodesTotal: z.number(),
+  healthy: z.boolean(),
+  problems: z.array(z.string()),
+});
+
+/** A proxmox-cluster check: run the node model's clusterHealth for `node` from the swamp
+ *  host and judge its record. Fails closed: a failed run, no record for the node, more than
+ *  one, or a record that does not parse is unhealthy. Healthy needs the model's own verdict
+ *  AND the facts behind it: listed, online, and quorate in a cluster (quorate null only for
+ *  a standalone node), with no problem listed. */
+export async function proxmoxClusterVerdict(
+  model: string,
+  node: string,
+  swamp: SwampApi,
+): Promise<{ ok: boolean; detail: string }> {
+  let res: RunOutcome;
+  try {
+    res = await swamp.run(model, "clusterHealth", { node });
+  } catch (e) {
+    return {
+      ok: false,
+      detail: `${model} clusterHealth failed: ${
+        tail((e as Error).message, 120)
+      }`,
+    };
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      detail: `${model} clusterHealth failed: ${tail(res.error, 120)}`,
+    };
+  }
+  const records = res.artifacts.flatMap((a) => {
+    const p = ClusterHealthRecord.safeParse(a);
+    return p.success && p.data.node === node ? [p.data] : [];
+  });
+  if (records.length !== 1) {
+    return {
+      ok: false,
+      detail: records.length === 0
+        ? `${model} clusterHealth gave no readable record for ${node}`
+        : `${model} clusterHealth gave ${records.length} records for ${node}`,
+    };
+  }
+  const h = records[0];
+  const quorumOk = h.clustered ? h.quorate === true : h.quorate === null;
+  const ok = h.healthy && h.nodeListed && h.nodeOnline && quorumOk &&
+    h.problems.length === 0;
+  if (ok) {
+    return {
+      ok,
+      detail: `online, ${
+        h.clustered ? "quorate" : "standalone"
+      } (${h.nodesOnline}/${h.nodesTotal} nodes online)`,
+    };
+  }
+  const why = h.problems.length
+    ? h.problems.join("; ")
+    : `listed ${h.nodeListed}, online ${h.nodeOnline}, quorate ${h.quorate}`;
+  return { ok, detail: tail(why, 200) };
+}
+
 /** Evaluate a machine's health checks (all must pass). Empty list ⇒ healthy=true.
  *  http checks run from the swamp host. ALL service + command checks run in ONE shell
  *  call on the machine (see `healthBatchScript`). A check whose result is missing
@@ -1564,26 +2222,51 @@ export async function evalHealth(
   sshModel: string,
   swamp: SwampApi,
 ): Promise<HealthResult> {
-  // The shell checks, in order: their batch index is their position in this list.
-  const shell = checks.filter((c) => c.type !== "http");
+  // The shell checks, in order: their batch index is their position in this list. A
+  // privileged check that may not run is left out of the batch and fails with the reason.
+  const refusedChecks = new Map<z.infer<typeof HealthCheck>, string>();
+  const snippet = (c: z.infer<typeof HealthCheck>): string | null => {
+    if (c.type === "service") {
+      // Init-agnostic: systemd (is-active) OR OpenRC (Alpine). Not `rc-service <name>
+      // status`: it runs the service's init script, which may need root (valkey's checks
+      // that it can read its config). rc-status reads OpenRC's state without root and
+      // shows a dead daemon as crashed. The name is restricted by the schema.
+      return `systemctl is-active '${c.name}' >/dev/null 2>&1 || rc-status -a -f ini 2>/dev/null | awk -v s='${c.name}' '$1 == s && $2 == "=" && $3 == "started" { f = 1 } END { exit !f }'`;
+    }
+    if (c.type !== "command") return null;
+    if (!c.privileged) return c.run ?? "false";
+    const p = privilegedHealthCommand(m, c);
+    if (!p.ok) {
+      refusedChecks.set(c, p.error);
+      return null;
+    }
+    // The exact argv the sudoers entry grants, by its absolute path on the host.
+    return [
+      `SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"`,
+      RUNTIME_ABS_FN,
+      ...runtimeResolveLines([p.command]),
+      runtimeLine(p.command),
+    ].join("\n");
+  };
+  const batch = checks.flatMap((c) => {
+    const s = snippet(c);
+    return s === null ? [] : [{ c, s }];
+  });
+  const batchIndex = new Map(batch.map(({ c }, i) => [c, i]));
   let rcs = new Map<number, number>();
-  if (shell.length) {
-    const snippets = shell.map((c) =>
-      c.type === "service"
-        // Init-agnostic: systemd (is-active) OR OpenRC (rc-service status, for Alpine).
-        ? `systemctl is-active ${c.name} >/dev/null 2>&1 || rc-service ${c.name} status >/dev/null 2>&1`
-        : (c as { run: string }).run
-    );
-    const timeoutSec = shell.reduce(
-      (t, c) => t + (c.type === "command" ? c.timeoutSec : 30),
+  if (batch.length) {
+    const timeoutSec = batch.reduce(
+      (t, { c }) => t + (c.type === "command" ? c.timeoutSec : 30),
       0,
     );
     const transport = await transportFor(m, { sshModel, swamp });
-    const r = await transport.script(healthBatchScript(snippets), timeoutSec);
+    const r = await transport.script(
+      healthBatchScript(batch.map(({ s }) => s)),
+      timeoutSec,
+    );
     rcs = parseHealthBatch(r.out);
   }
   const results: HealthResult["results"] = [];
-  let si = 0; // index of the next shell check in the batch
   for (const c of checks) {
     let ok = false;
     let detail = "";
@@ -1607,14 +2290,24 @@ export async function evalHealth(
       } finally {
         clearTimeout(timer);
       }
+    } else if (c.type === "proxmox-cluster") {
+      const node = c.node ?? m.host;
+      if (!label) label = `proxmox cluster: ${node} online and quorate`;
+      ({ ok, detail } = await proxmoxClusterVerdict(c.nodeModel, node, swamp));
     } else {
       if (!label) {
         label = c.type === "service"
           ? `service ${c.name} active`
-          : `command: ${c.run.slice(0, 40)}`;
+          : c.privileged
+          ? `privileged: ${(c.argv ?? []).join(" ").slice(0, 40)}`
+          : `command: ${(c.run ?? "").slice(0, 40)}`;
       }
-      const rc = rcs.get(si++);
-      if (rc === undefined) {
+      const refused = refusedChecks.get(c);
+      const bi = batchIndex.get(c);
+      const rc = bi === undefined ? undefined : rcs.get(bi);
+      if (refused !== undefined) {
+        detail = `refused: ${refused}`;
+      } else if (rc === undefined) {
         detail = "no result";
       } else {
         ok = rc === 0;
@@ -1759,11 +2452,14 @@ export function vmSnapshotNames(
 // Snapshotters — the pluggable snapshot lifecycle.
 //
 // Snapshot, rollback and cleanup act on one artifact, so ONE implementation owns all
-// three. Three implementations sit behind the `Snapshotter` interface:
+// three. Four implementations sit behind the `Snapshotter` interface:
 //   • proxmox-vm — the `vm` node model: snapshotVm / rollbackVm / deleteVmSnapshot /
 //                  listVmSnapshots (built in).
+//   • proxmox-ct-api — the `ct.nodeModel` node model: snapshotCt / rollbackCt /
+//                  deleteCtSnapshot / listCtSnapshots through the Proxmox API (built in).
 //   • proxmox-ct — `pct snapshot|rollback|delsnapshot|listsnapshot` on the CT's node,
-//                  over the ssh model (built in).
+//                  over the ssh model (built in; only for a machine with an
+//                  unsafe.pctExec record, see pctSnapshotRefusal).
 //   • model      — any model named by a machine's `snapshotter.model`, driven by name
 //                  through runModel with the snapshotter contract (the extension point).
 // safeOsUpdate picks the implementation from the machine's decorations
@@ -1808,8 +2504,9 @@ const SILENT_LOGGER: Logger = {
 };
 
 /** The snapshotter a machine uses now, from its decorations. An explicit
- *  `snapshotter.model` wins; else the built-in proxmox-vm (`vm`); else proxmox-ct when
- *  the caller passes the CT's resolved location; else null — no snapshot guard. */
+ *  `snapshotter.model` wins; else the built-in proxmox-vm (`vm`); else proxmox-ct-api
+ *  (`ct.nodeModel`); else proxmox-ct when the caller passes the CT's resolved pct
+ *  location; else null — no snapshot guard. */
 export function snapshotterRefFor(
   m: MachineShape,
   ct?: { node: string; ctid: number },
@@ -1820,8 +2517,95 @@ export function snapshotterRefFor(
   if (m.vm) {
     return { kind: "proxmox-vm", node: m.vm.proxmoxNode, vmid: m.vm.vmid };
   }
+  if (m.ct?.nodeModel) {
+    return { kind: "proxmox-ct-api", node: m.ct.nodeModel, ctid: m.ct.ctid };
+  }
   if (ct) return { kind: "proxmox-ct", node: ct.node, ctid: ct.ctid };
   return null;
+}
+
+/** The node model whose API token takes a machine's snapshots, and the guest; null when no
+ *  node model does (a snapshotter model, pct, or no guard). Follows snapshotterRefFor. */
+export function snapshotTokenTarget(
+  m: MachineShape,
+): { model: string; guest: { type: "vm" | "ct"; vmid: number } } | null {
+  const ref = snapshotterRefFor(m);
+  if (ref?.kind === "proxmox-vm") {
+    return { model: ref.node, guest: { type: "vm", vmid: ref.vmid } };
+  }
+  if (ref?.kind === "proxmox-ct-api") {
+    return { model: ref.node, guest: { type: "ct", vmid: ref.ctid } };
+  }
+  return null;
+}
+
+/** The node models a machine's own proxmox-cluster health checks read through. */
+export function clusterCheckModels(m: MachineShape): string[] {
+  return [
+    ...new Set(
+      (m.health ?? []).flatMap((c) =>
+        c.type === "proxmox-cluster" ? [c.nodeModel] : []
+      ),
+    ),
+  ];
+}
+
+/** One entry per node model a machine uses: the one behind its snapshots (with the guest)
+ *  and the ones its proxmox-cluster checks read through. Sys.Audit on / is required for a
+ *  model this machine's check uses, allowed for one another machine of `fleet` checks
+ *  through, and extra otherwise. */
+export function apiTokenUses(
+  m: MachineShape,
+  fleet: MachineShape[],
+): Array<{
+  model: string;
+  guest: { type: "vm" | "ct"; vmid: number } | null;
+  clusterAudit: "required" | "allowed" | "extra";
+}> {
+  const snap = snapshotTokenTarget(m);
+  const own = new Set(clusterCheckModels(m));
+  const fleetChecks = new Set(fleet.flatMap(clusterCheckModels));
+  const models = new Set([...(snap ? [snap.model] : []), ...own]);
+  return [...models].map((model) => ({
+    model,
+    guest: snap?.model === model ? snap.guest : null,
+    clusterAudit: own.has(model)
+      ? "required"
+      : fleetChecks.has(model)
+      ? "allowed"
+      : "extra",
+  }));
+}
+
+/** Each distinct node model's `permissions` answer (the effective privileges of its own
+ *  token), read once per model. A failed run or a missing record is kept as the error. */
+export async function readTokenPermissions(
+  models: string[],
+  swamp: SwampApi,
+): Promise<Map<string, { paths: unknown; error: string | null }>> {
+  const out = new Map<string, { paths: unknown; error: string | null }>();
+  for (const model of new Set(models)) {
+    try {
+      const res = await swamp.run(model, "permissions", {});
+      if (!res.ok) {
+        out.set(model, {
+          paths: null,
+          error: tail(res.error, 200) || `${model} permissions failed`,
+        });
+        continue;
+      }
+      const paths = res.artifacts[0]?.paths;
+      out.set(
+        model,
+        paths === undefined
+          ? { paths: null, error: "no permissions record" }
+          : { paths, error: null },
+      );
+    } catch (e) {
+      out.set(model, { paths: null, error: (e as Error).message });
+    }
+  }
+  return out;
 }
 
 /** The snapshotter that took a recorded snapshot. Records written before snapshotters
@@ -1856,6 +2640,7 @@ export function snapshotRecordLocation(ref: SnapshotterRef): {
         proxmoxNode: ref.node,
         snapshotter: ref,
       };
+    case "proxmox-ct-api":
     case "proxmox-ct":
       return {
         kind: "ct",
@@ -1876,6 +2661,8 @@ export function snapshotFailedMessage(
   switch (ref.kind) {
     case "proxmox-vm":
       return `snapshot failed on ${ref.node} for vmid ${ref.vmid} — aborting update`;
+    case "proxmox-ct-api":
+      return `snapshot failed on ${ref.node} for ctid ${ref.ctid} — aborting update`;
     case "proxmox-ct":
       return `pct snapshot failed for ctid ${ref.ctid} on ${ref.node} — aborting update`;
     case "model":
@@ -1903,6 +2690,35 @@ export function snapshotterFor(
         rollback: (name) => call("rollbackVm", name),
         delete: (name) => call("deleteVmSnapshot", name),
         list: () => vmSnapshotNames(node, vmid, swamp),
+      };
+    }
+    case "proxmox-ct-api": {
+      // vmid is the node model's name for the guest id. Proxmox stops a CT to roll it
+      // back; start: true brings it up again for the health checks that follow.
+      const { node, ctid } = ref;
+      return {
+        ref,
+        where: `CT ${ctid} via node model "${node}"`,
+        snapshot: (name) =>
+          runLogged(swamp, node, "snapshotCt", { vmid: ctid, name }, logger),
+        rollback: (name) =>
+          runLogged(
+            swamp,
+            node,
+            "rollbackCt",
+            { vmid: ctid, name, start: true },
+            logger,
+          ),
+        delete: (name) =>
+          runLogged(
+            swamp,
+            node,
+            "deleteCtSnapshot",
+            { vmid: ctid, name },
+            logger,
+          ),
+        list: () =>
+          listedSnapshotNames(node, "listCtSnapshots", { vmid: ctid }, swamp),
       };
     }
     case "proxmox-ct": {
@@ -1997,9 +2813,17 @@ export async function modelOsScan(
       ...s,
       hostname: s.hostname ?? host,
       reachMethod: null,
+      acceptedRisksUsed: [],
+      securityFindings: [],
       osUpdater: model,
       health: null,
       error: null,
+      // No packages hash from an osUpdater model in this release, so the outside-change
+      // verdict is unknown here; the writer (scan, safeOsUpdate, reboot) sets the real one.
+      packagesHash: null,
+      packagesBaseline: null,
+      packagesChangedOutsidePatch: null,
+      lastOutsideChangeAt: null,
       scannedAt: s.scannedAt ?? new Date().toISOString(),
     },
     error: "",
@@ -2109,7 +2933,8 @@ export function checkDockerConfigured(ctx: CheckCtx): CheckResult {
   );
 }
 
-/** `live` — the machine answers: ssh `true`, or `pct status` on the node for a CT. */
+/** `live` — the machine answers: ssh `true`, or `pct status` on the node for a CT with an
+ *  unsafe.pctExec record. */
 export async function checkHostReachable(ctx: CheckCtx): Promise<CheckResult> {
   const found = checkMachine(ctx);
   if (!found) return PASS;
@@ -2134,6 +2959,89 @@ export async function checkHostReachable(ctx: CheckCtx): Promise<CheckResult> {
         }`,
     );
   }
+}
+
+/**
+ * The login an @swamp/ssh definition uses for one host: the host entry's transport.user,
+ * else the default transport.user. Null when the definition, the host entry or the user
+ * cannot be read, so the login is unknown.
+ */
+async function sshLogin(
+  repo: DefinitionLookup | undefined,
+  sshModel: string,
+  host: string,
+): Promise<string | null> {
+  let ga: Record<string, unknown> | null;
+  try {
+    ga = await definitionGlobals(repo, sshModel);
+  } catch {
+    return null;
+  }
+  if (!ga) return null;
+  const hosts = Array.isArray(ga.hosts)
+    ? ga.hosts as Array<{ name?: unknown; transport?: { user?: unknown } }>
+    : [];
+  const entry = hosts.find((h) => h?.name === host);
+  if (!entry) return null;
+  const defaults = ga.transport as { user?: unknown } | undefined;
+  const user = entry.transport?.user ?? defaults?.user;
+  return typeof user === "string" && user !== "" ? user : null;
+}
+
+/**
+ * `policy` — the machine reaches its host only through an accepted path. A pct machine
+ * (or any machine that asks for pct) needs an unsafe.pctExec record; a root ssh login
+ * needs an unsafe.rootSsh record. safeUpdate always uses ssh, so only the login applies
+ * to it. An unreadable login fails closed.
+ */
+export async function checkRestrictedTransport(
+  ctx: CheckCtx,
+): Promise<CheckResult> {
+  const found = checkMachine(ctx);
+  if (!found) return PASS;
+  const { host, machine } = found;
+  const sshModel = ctx.globalArgs.sshModel;
+  const hint = skipHint("restricted-transport", "policy");
+  const isSafeUpdate = ctx.methodName === "safeUpdate";
+  if (!isSafeUpdate) {
+    const refusal = pctRefusal(machine);
+    if (refusal) return fail(`${refusal}. ${hint}`);
+  }
+  // The login is read for the host the transport really uses: the machine itself over
+  // ssh, or its node for a pct CT (pct runs over the node's ssh login).
+  let loginHost = host;
+  let node: string | null = null;
+  if (!isSafeUpdate && transportVia(machine) === "pct") {
+    try {
+      node = (await ctLocation(machine, checkSwamp(ctx))).node;
+      loginHost = node;
+    } catch (e) {
+      return fail(
+        `Could not find the Proxmox node of "${host}": ${
+          (e as Error).message.slice(0, 200)
+        }. ${hint}`,
+      );
+    }
+  }
+  const login = await sshLogin(ctx.definitionRepository, sshModel, loginHost);
+  if (login === null) {
+    return fail(
+      `Could not read the ssh login for "${loginHost}" from ${sshModel}: its definition, ` +
+        `its host entry or its user cannot be read, so the login is unknown. ` +
+        `Check that ${sshModel} lists "${loginHost}" in hosts. ${hint}`,
+    );
+  }
+  if (login === "root" && unsafeRecord(machine, "rootSsh") === null) {
+    return fail(
+      node === null
+        ? `machine "${host}" logs in as root through ${sshModel} but has no unsafe.rootSsh ` +
+          `acceptance record — use an unprivileged login (access.user) or add the record. ${hint}`
+        : `machine "${host}" is reached through pct on node "${node}", which logs in as root ` +
+          `through ${sshModel}, but has no unsafe.rootSsh acceptance record — use an ` +
+          `unprivileged login for the node or add the record. ${hint}`,
+    );
+  }
+  return PASS;
 }
 
 /** `live` — the machine's own health checks pass now. No checks resolved = nothing to gate. */
@@ -2172,8 +3080,8 @@ export async function checkBaselineHealthy(
   }
 }
 
-/** `live` — the machine's snapshotter (a pluggable model, or the built-in VM node model /
- *  CT pct) answers a list, and (rollback) a snapshot exists. */
+/** `live` — the machine's snapshotter (a pluggable model, the built-in VM / CT node model,
+ *  or CT pct, only with unsafe.pctExec) answers a list, and (rollback) a snapshot exists. */
 export async function checkSnapshotTargetResolves(
   ctx: CheckCtx,
 ): Promise<CheckResult> {
@@ -2184,6 +3092,11 @@ export async function checkSnapshotTargetResolves(
   const isCt = !machine.vm && isCtMachine(machine);
   // No snapshot guard (bare metal without a snapshotter): nothing to resolve.
   if (!machine.snapshotter && !machine.vm && !isCt) return PASS;
+  const pctSnaps = usesPctSnapshots(machine);
+  if (pctSnaps) {
+    const refusal = pctSnapshotRefusal(machine);
+    if (refusal) return fail(`${refusal}. ${hint}`);
+  }
   const wanted = checkArg(ctx, "snapshot");
   const needSnapshot = ctx.methodName === "rollback";
   const swamp = checkSwamp(ctx);
@@ -2191,9 +3104,7 @@ export async function checkSnapshotTargetResolves(
   let where = "the snapshot target";
   try {
     // The CT location is only needed for the built-in pct snapshotter.
-    const ct = !machine.snapshotter && isCt
-      ? await ctLocation(machine, swamp)
-      : undefined;
+    const ct = pctSnaps ? await ctLocation(machine, swamp) : undefined;
     const snapper = snapshotterFor(snapshotterRefFor(machine, ct)!, {
       sshModel: ctx.globalArgs.sshModel,
       swamp,
@@ -2412,10 +3323,980 @@ export function parseCtSections(
   return sections;
 }
 
+// ---------------------------------------------------------------------------
+// Plug-in privileges (lib/plugin_privileges.ts). A plugged model declares the root commands
+// it needs with `privileges({ host })`. pluginPrivilegesFor is the one place that asks,
+// validates and applies the rules; provisioning, the audit, the `privileges-declared` check
+// and the safeOsUpdate guard all use it.
+//   • An app updater (`source`, or the legacy `proxmox`) and an `osUpdater` must declare,
+//     unless the machine has an unsafe.privilegedUpdater record: then a missing or failing
+//     declaration grants nothing, and the record is an accepted risk used.
+//   • A `snapshotter` always declares: there is no unsafe key for it. One that works through
+//     an API declares no commands.
+//   • `remoteCode: true` needs a trustRemote record for each source in remoteSources, with or
+//     without unsafe.privilegedUpdater.
+// ---------------------------------------------------------------------------
+
+/** The part a plugged model plays for a machine. "health" is the machine's own privileged
+ *  health checks (healthPrivilegesFor): not a model, but granted and checked the same way. */
+export type PluginRole = "updater" | "osUpdater" | "snapshotter" | "health";
+
+/** The distinct plugged models of a machine, each with its roles, in role order. */
+export function pluggedModels(
+  m: MachineShape,
+): Array<{ model: string; roles: PluginRole[] }> {
+  const out: Array<{ model: string; roles: PluginRole[] }> = [];
+  const add = (model: string | null | undefined, role: PluginRole) => {
+    if (!model) return;
+    const known = out.find((x) => x.model === model);
+    if (!known) out.push({ model, roles: [role] });
+    else if (!known.roles.includes(role)) known.roles.push(role);
+  };
+  // appSource is the updater that runs: `source`, else the legacy `proxmox`.
+  add(appSource(m), "updater");
+  add(m.osUpdater?.model, "osUpdater");
+  add(m.snapshotter?.model, "snapshotter");
+  return out;
+}
+
+/** What one plugged model of a machine may run, or why it is refused. */
+export interface ModelPrivileges {
+  model: string;
+  roles: PluginRole[];
+  commands: PrivCommand[];
+  errors: string[];
+  acceptedRisksUsed: string[];
+  remote: Array<{ model: string; source: string }>;
+}
+
+/** What a machine's plugged models may run, in all, and per model. */
+export interface PluginPrivileges {
+  commands: PrivCommand[];
+  errors: string[];
+  acceptedRisksUsed: string[];
+  remote: Array<{ model: string; source: string }>;
+  models: ModelPrivileges[];
+}
+
+function combinePrivileges(models: ModelPrivileges[]): PluginPrivileges {
+  return {
+    commands: models.flatMap((x) => x.commands),
+    errors: models.flatMap((x) => x.errors),
+    acceptedRisksUsed: [...new Set(models.flatMap((x) => x.acceptedRisksUsed))],
+    remote: models.flatMap((x) => x.remote),
+    models,
+  };
+}
+
+/** Only the plugged models that play one of these roles: the ones a method will use. */
+export function privilegesForRoles(
+  p: PluginPrivileges,
+  roles: readonly PluginRole[],
+): PluginPrivileges {
+  return combinePrivileges(
+    p.models.filter((x) => x.roles.some((r) => roles.includes(r))),
+  );
+}
+
+/**
+ * Ask each distinct plugged model of a machine once for `privileges({ host })`, validate the
+ * answer, and apply the rules above. Never throws for a plug-in's answer: a refusal is an
+ * error in the result, and a caller that sees errors must not grant or run anything.
+ */
+export async function pluginPrivilegesFor(
+  machine: MachineShape & { trustRemote?: ReadonlyArray<{ source: string }> },
+  swamp: SwampApi,
+): Promise<PluginPrivileges> {
+  const excused = unsafeRecord(machine, "privilegedUpdater") !== null;
+  const trusted = new Set((machine.trustRemote ?? []).map((t) => t.source));
+  const models: ModelPrivileges[] = [];
+  let next = 1;
+  for (const { model, roles } of pluggedModels(machine)) {
+    const entry: ModelPrivileges = {
+      model,
+      roles,
+      commands: [],
+      errors: [],
+      acceptedRisksUsed: [],
+      remote: [],
+    };
+    models.push(entry);
+    const res = await swamp.run(model, "privileges", { host: machine.host });
+    const raw = res.ok ? res.artifacts[0] ?? null : null;
+    const didNotRun = `privileges of "${model}" did not run: ${
+      tail(res.error, 200) || "failed"
+    }`;
+    const parsed = res.ok
+      ? parsePluginPrivileges(model, raw, next)
+      : { ok: false as const, errors: [didNotRun] };
+    // What the plug-in says about remote code, even in an answer that does not parse: an
+    // unsafe record excuses a missing declaration, never untrusted remote code.
+    const remoteSources = parsed.ok ? parsed.remoteSources : remoteClaim(raw);
+    const untrusted = remoteSources.filter((s) => !trusted.has(s));
+    if (untrusted.length > 0) {
+      entry.errors.push(
+        `"${model}" runs remote code from ${
+          untrusted.join(", ")
+        }, but the machine has no trustRemote record with ${
+          untrusted.length === 1 ? "that source" : "those sources"
+        }`,
+      );
+      continue;
+    }
+    if (!parsed.ok) {
+      // A snapshotter has no unsafe key: it always declares.
+      if (roles.includes("snapshotter") || !excused) {
+        entry.errors.push(...parsed.errors);
+        continue;
+      }
+      entry.acceptedRisksUsed.push("unsafe.privilegedUpdater");
+    } else {
+      entry.commands = parsed.commands;
+      next += parsed.commands.length;
+    }
+    for (const source of remoteSources) {
+      entry.acceptedRisksUsed.push(`trustRemote:${source}`);
+      entry.remote.push({ model, source });
+    }
+  }
+  const health = healthPrivilegesFor(machine, next);
+  if (health !== null) models.push(health);
+  return combinePrivileges(models);
+}
+
+/** The name the privileged health checks go by in errors and in the per-model list. */
+const HEALTH_CHECKS = "health checks";
+
+type CommandCheck = Extract<z.infer<typeof HealthCheck>, { type: "command" }>;
+
+/** True for a health check that runs as root. */
+function isPrivilegedCheck(c: z.infer<typeof HealthCheck>): c is CommandCheck {
+  return c.type === "command" && c.privileged === true;
+}
+
+/** True when the machine lists a health check that runs as root. */
+export function hasPrivilegedHealth(m: MachineShape): boolean {
+  return (m.health ?? []).some(isPrivilegedCheck);
+}
+
+/** A check's name in messages: its label, else its position in the machine's list. */
+function checkName(c: z.infer<typeof HealthCheck>, i: number): string {
+  return c.label ? `"${c.label}"` : `health[${i}]`;
+}
+
+/**
+ * The root command of one privileged health check as the runtime runs it, or why it may not
+ * run: the machine needs an unsafe.privilegedHealth record, and the argv must pass the rules
+ * of a plug-in command. Checked again at every run, because the checks before it can be skipped.
+ */
+export function privilegedHealthCommand(
+  m: MachineShape,
+  c: CommandCheck,
+): { ok: true; command: PrivCommand } | { ok: false; error: string } {
+  if (unsafeRecord(m, "privilegedHealth") === null) {
+    return {
+      ok: false,
+      error:
+        "a privileged check needs an unsafe.privilegedHealth acceptance record",
+    };
+  }
+  const parsed = parseRootArgv("plugin-1-health", c.argv);
+  return parsed.ok
+    ? parsed
+    : { ok: false, error: `privileged check ${parsed.error}` };
+}
+
+/**
+ * The root commands of a machine's privileged health checks (`privileged: true`), numbered
+ * from `first` like plug-in commands, so they are granted, audited and refused the same way;
+ * null when the machine has none. Every one needs the machine's unsafe.privilegedHealth record
+ * (an accepted risk used), and passes the plug-in command rules. Any error refuses them all.
+ */
+export function healthPrivilegesFor(
+  m: MachineShape,
+  first = 1,
+): ModelPrivileges | null {
+  const checks = (m.health ?? []).map((c, i) => ({ c, i })).filter(({ c }) =>
+    isPrivilegedCheck(c)
+  );
+  if (checks.length === 0) return null;
+  const entry: ModelPrivileges = {
+    model: HEALTH_CHECKS,
+    roles: ["health"],
+    commands: [],
+    errors: [],
+    acceptedRisksUsed: [],
+    remote: [],
+  };
+  if (unsafeRecord(m, "privilegedHealth") === null) {
+    entry.errors.push(
+      `${HEALTH_CHECKS}: ${
+        checks.map(({ c, i }) => checkName(c, i)).join(", ")
+      } ${
+        checks.length === 1 ? "is" : "are"
+      } privileged, but the machine has no unsafe.privilegedHealth acceptance record`,
+    );
+    return entry;
+  }
+  if (checks.length > MAX_PLUGIN_COMMANDS) {
+    entry.errors.push(
+      `${HEALTH_CHECKS}: at most ${MAX_PLUGIN_COMMANDS} privileged checks per machine`,
+    );
+    return entry;
+  }
+  checks.forEach(({ c, i }, k) => {
+    const parsed = parseRootArgv(
+      `plugin-${first + k}-health`,
+      (c as CommandCheck).argv,
+    );
+    if (parsed.ok) entry.commands.push(parsed.command);
+    else {entry.errors.push(
+        `${HEALTH_CHECKS}: ${checkName(c, i)}: ${parsed.error}`,
+      );}
+  });
+  if (entry.errors.length > 0) entry.commands = [];
+  else entry.acceptedRisksUsed.push("unsafe.privilegedHealth");
+  return entry;
+}
+
+/**
+ * The remote sources an answer that did not parse still claims, when remoteCode is true: the
+ * strings in remoteSources, and a string remoteSource (the key before the list). An entry that
+ * is not a string, or no source at all, adds "(unnamed)", which is never trusted. Anything
+ * else claims none.
+ */
+export function remoteClaim(raw: unknown): string[] {
+  if (typeof raw !== "object" || raw === null) return [];
+  const r = raw as {
+    remoteCode?: unknown;
+    remoteSource?: unknown;
+    remoteSources?: unknown;
+  };
+  if (r.remoteCode !== true) return [];
+  const out: string[] = [];
+  if (Array.isArray(r.remoteSources)) {
+    for (const s of r.remoteSources) {
+      out.push(typeof s === "string" ? s : "(unnamed)");
+    }
+  } else if (r.remoteSources !== undefined) out.push("(unnamed)");
+  if (typeof r.remoteSource === "string") out.push(r.remoteSource);
+  else if (r.remoteSource !== undefined) out.push("(unnamed)");
+  return out.length > 0 ? [...new Set(out)] : ["(unnamed)"];
+}
+
+// ---------------------------------------------------------------------------
+// The swamp-patch access login. renderAccess, provisionAccess and revokeAccess reach a
+// host only through access.provisionSshModel, a root-capable login that must differ from
+// sshModel. auditAccess probes a host as the patch login through sshModel and as root
+// through provisionSshModel, and never changes it. scan, safeUpdate, reboot and the rest
+// never use provisionSshModel.
+// ---------------------------------------------------------------------------
+
+type AccessAction = "provision" | "revoke";
+type AccessOutcome = z.infer<typeof AccessRun>["outcome"];
+
+/** One selected machine and the input its access is rendered from. */
+export interface AccessTarget {
+  host: string;
+  input: ProvisionInput;
+}
+
+/**
+ * The access profile, and the machines a method acts on: every machine when `hostsArg` is
+ * absent or empty, else the named ones in fleet order. Throws when `access` is not set,
+ * when its provisioning model is sshModel, or when a named host is not in the fleet.
+ */
+export function accessTargets(
+  globalArgs: z.infer<typeof GlobalArgs>,
+  hostsArg?: string[],
+): { access: AccessProfileT; targets: AccessTarget[] } {
+  const { access, sshModel, machines } = globalArgs;
+  if (!access) {
+    throw new Error(
+      "access is not configured: add access { user, publicKey, from, provisionSshModel } to globalArguments",
+    );
+  }
+  if (access.provisionSshModel === sshModel) {
+    throw new Error(
+      `access.provisionSshModel must differ from sshModel ("${sshModel}"): the patch login must not be able to provision itself`,
+    );
+  }
+  const named = hostsArg ?? [];
+  const known = new Set(machines.map((m) => m.host));
+  const unknown = named.filter((h) => !known.has(h));
+  if (unknown.length > 0) {
+    throw new Error(
+      `No machine ${
+        unknown.map((h) => `"${h}"`).join(", ")
+      } in globalArguments.machines`,
+    );
+  }
+  const selected = named.length > 0
+    ? machines.filter((m) => named.includes(m.host))
+    : machines;
+  return {
+    access,
+    targets: selected.map((m) => {
+      // The one place the OS policy is read for access: capabilitiesFor throws on a bad policy.
+      const caps = capabilitiesFor(m, globalArgs);
+      return {
+        host: m.host,
+        input: {
+          user: access.user,
+          publicKey: access.publicKey,
+          from: m.from ?? access.from,
+          docker: caps.docker,
+          autoUpdates: caps.autoUpdates,
+          sudo: {
+            osUpgrade: caps.osUpgrade,
+            reboot: caps.reboot,
+            docker: caps.docker,
+          },
+          dockerProjects: dockerProjectsFor(m),
+        },
+      };
+    }),
+  };
+}
+
+/**
+ * accessTargets with each machine's plug-in commands (pluginPrivilegesFor) added to its sudo
+ * input, so the required set is the table's commands and the plug-ins' together. A machine
+ * whose plug-ins have errors is not a target: it is listed in `refused` with the errors, and
+ * must not be provisioned.
+ */
+export async function accessTargetsWithPlugins(
+  globalArgs: z.infer<typeof GlobalArgs>,
+  hostsArg: string[] | undefined,
+  swamp: SwampApi,
+): Promise<{
+  access: AccessProfileT;
+  targets: AccessTarget[];
+  refused: Array<{ host: string; errors: string[] }>;
+}> {
+  const { access, targets } = accessTargets(globalArgs, hostsArg);
+  const kept: AccessTarget[] = [];
+  const refused: Array<{ host: string; errors: string[] }> = [];
+  for (const t of targets) {
+    const machine = globalArgs.machines.find((m) => m.host === t.host)!;
+    const p = await pluginPrivilegesFor(machine, swamp);
+    if (p.errors.length > 0) {
+      refused.push({ host: t.host, errors: p.errors });
+      continue;
+    }
+    kept.push({
+      host: t.host,
+      input: { ...t.input, sudo: { ...t.input.sudo, extra: p.commands } },
+    });
+  }
+  return { access, targets: kept, refused };
+}
+
+/** The error a run throws for machines whose plug-in privileges are refused. */
+function pluginRefusalMessage(
+  refused: Array<{ host: string; errors: string[] }>,
+): string {
+  return `plug-in privileges refused on ${
+    refused.map((r) => `${r.host} (${r.errors.join("; ")})`).join(", ")
+  }`;
+}
+
+/**
+ * The compose project the docker helper may run for a machine: one, named from its compose
+ * directory, when the docker block has a composePath. A docker block without one has none, and
+ * the runtime refuses to reach it through the helper.
+ */
+export function dockerProjectsFor(m: {
+  docker?: { composePath?: string; service?: string } | null;
+}): DockerProject[] {
+  const d = m.docker;
+  if (!d || !d.composePath) return [];
+  return [{
+    name: dockerProjectName(d.composePath),
+    composeDir: d.composePath,
+    service: d.service ?? "-",
+  }];
+}
+
+/**
+ * One helper call as the runtime runs it: `sudo -n`, then the helper's fixed path, the
+ * subcommand and its arguments, each shell-quoted. Both safeUpdate and pruneImages build their
+ * helper calls here, so the argv that runs is the argv that lib/docker_helper.ts validates.
+ */
+export function helperLine(sub: HelperSub, ...args: string[]): string {
+  return `sudo -n ${helperArgv(sub, ...args).map(shQuote).join(" ")}`;
+}
+
+/**
+ * The helper's project for a machine: its compose directory's name. Throws when the machine has
+ * no composePath, because the helper can only run a project it lists.
+ */
+export function helperProject(
+  host: string,
+  composePath: string | undefined,
+): string {
+  if (!composePath) {
+    throw new Error(
+      `machine "${host}" has no docker composePath: a login that is not root reaches docker through swamp-patch-docker, which runs one compose project, so add composePath`,
+    );
+  }
+  return dockerProjectName(composePath);
+}
+
+/** One container of a docker project, as safeUpdate reads it: its image ref and id, state and health. */
+export interface DockerContainer {
+  ref: string;
+  imageId: string;
+  status: string;
+  health: string;
+}
+
+/**
+ * The rows of `swamp-patch-docker inspect`: one `id|configImage|imageId|state|health` line per
+ * container. Any other line (docker's own warnings, merged into the output) is skipped; a row is
+ * recognised by its hex container id.
+ */
+export function parseInspectRows(out: string): DockerContainer[] {
+  const rows: DockerContainer[] = [];
+  for (const raw of out.split("\n")) {
+    const m = raw.trim().match(
+      /^[0-9a-f]{12,64}\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)$/,
+    );
+    if (m) {
+      rows.push({ ref: m[1], imageId: m[2], status: m[3], health: m[4] });
+    }
+  }
+  return rows;
+}
+
+/** The unique name of one accessRun record: its action, host and run time. */
+function accessRunName(action: AccessAction, host: string, ts: string): string {
+  return `access-${action}-${host}-${ts.replace(/[:.]/g, "-")}`;
+}
+
+/** Hex SHA-256 of a text. The scripts are recorded by digest, next to their text. */
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text),
+  );
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * The accessPlan record of each target, named by host: the rendered authorized_keys line
+ * and both scripts, with their digests. Contacts no host.
+ */
+async function writeAccessPlans(
+  context: Ctx,
+  access: AccessProfileT,
+  targets: AccessTarget[],
+): Promise<Array<{ name: string }>> {
+  const generatedAt = new Date().toISOString();
+  const revokeScriptSha256 = await sha256Hex(revokeScript(access.user));
+  const handles: Array<{ name: string }> = [];
+  for (const { host, input } of targets) {
+    const script = provisionScript(input);
+    handles.push(
+      // Not the bare host name: inventory records use it, and reports that pick the
+      // latest record by name would let a newer plan hide a host's inventory.
+      await context.writeResource("accessPlan", `access-plan-${host}`, {
+        host,
+        user: input.user,
+        keyLine: authorizedKeysLine(input.publicKey, input.from),
+        from: input.from,
+        docker: input.docker,
+        provisionScriptSha256: await sha256Hex(script),
+        revokeScriptSha256,
+        provisionScript: script,
+        generatedAt,
+      }),
+    );
+  }
+  return handles;
+}
+
+/** The parsed result line of one action in a host's stdout, or null when there is none. */
+function accessResult(action: AccessAction, stdout: string): unknown {
+  const line = markerLine(stdout, `patch-access-${action}`);
+  if (line === null) return null;
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The outcome of one host. Exit 0 with a result line is applied. Only provision reads
+ * exit 3 (a foreign account is never taken over), exit 4 (preflight refused) and exit 5
+ * (a pre-flight refused: the host cannot take auto updates, or sudo is missing, and nothing
+ * was changed). Exit 6 is failed, not refused: the sudoers step found that its grants do
+ * not parse or are not included, and it removed what it had installed, so the host is not
+ * left with a grant it did not check. Anything else is failed.
+ */
+function accessOutcome(
+  action: AccessAction,
+  exitCode: number,
+  hasResult: boolean,
+): AccessOutcome {
+  if (exitCode === 0 && hasResult) return "applied";
+  if (action === "provision" && exitCode === 3) return "refused-takeover";
+  if (action === "provision" && (exitCode === 4 || exitCode === 5)) {
+    return "refused-preflight";
+  }
+  return "failed";
+}
+
+/** One host of an access method, and the script it runs. */
+interface AccessJob {
+  host: string;
+  script: string;
+  scriptSha256: string;
+}
+
+/** What one host's accessRun record says about its run. */
+interface AccessHostResult {
+  outcome: AccessOutcome;
+  exitCode: number | null;
+  result: unknown;
+  detail: string;
+  sudo: boolean;
+}
+
+const NOT_REACHED: AccessHostResult = {
+  outcome: "failed",
+  exitCode: null,
+  result: null,
+  detail: "not reached",
+  sudo: false,
+};
+
+/**
+ * The shared flow of provisionAccess and revokeAccess. A dry run contacts no host and
+ * writes a dry-run record per host. A real run reads each host's login from
+ * provisionSshModel: an unreadable login is skipped, a root login runs the script as is,
+ * and any other login runs it under sudo. Hosts with the same script and sudo share one
+ * script call. Every host gets its accessRun record before the run throws, which it does
+ * when a host was refused or failed. A `refused` host (its plug-in privileges did not pass)
+ * is never contacted, in a dry run too: its record is refused-preflight with the errors.
+ */
+async function runAccess(
+  context: Ctx,
+  action: AccessAction,
+  jobs: AccessJob[],
+  provisionSshModel: string,
+  dryRun: boolean,
+  refused: Array<{ host: string; errors: string[] }> = [],
+): Promise<Array<{ name: string }>> {
+  const ranAt = new Date().toISOString();
+  const swamp = methodSwamp(context);
+  const results = new Map<string, AccessHostResult>();
+  if (dryRun) {
+    for (const job of jobs) {
+      results.set(job.host, {
+        outcome: "dry-run",
+        exitCode: null,
+        result: null,
+        detail: "dry run: no host was contacted",
+        sudo: false,
+      });
+    }
+  } else {
+    // One group per distinct script and sudo flag: each group is one script call.
+    const groups = new Map<
+      string,
+      { sudo: boolean; script: string; jobs: AccessJob[] }
+    >();
+    for (const job of jobs) {
+      const login = await sshLogin(
+        context.definitionRepository,
+        provisionSshModel,
+        job.host,
+      );
+      if (login === null) {
+        results.set(job.host, {
+          outcome: "skipped",
+          exitCode: null,
+          result: null,
+          detail: `login cannot be read from ${provisionSshModel}`,
+          sudo: false,
+        });
+        continue;
+      }
+      const sudo = login !== "root";
+      const key = `${job.scriptSha256} ${sudo}`;
+      const group = groups.get(key) ?? { sudo, script: job.script, jobs: [] };
+      group.jobs.push(job);
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      const hosts = group.jobs.map((j) => j.host);
+      try {
+        const res = await runScriptOutcome(
+          provisionSshModel,
+          hosts,
+          group.script,
+          300,
+          swamp,
+          group.sudo,
+        );
+        for (const host of hosts) {
+          const run = res.runs.find((r) => r.host === host);
+          if (!run) {
+            results.set(host, {
+              outcome: "failed",
+              exitCode: null,
+              result: null,
+              detail: `no result for this host from ${provisionSshModel}`,
+              sudo: group.sudo,
+            });
+            continue;
+          }
+          const result = accessResult(action, run.stdout);
+          results.set(host, {
+            outcome: accessOutcome(action, run.exitCode, result !== null),
+            exitCode: run.exitCode,
+            result,
+            detail: tail(run.stdout, 400),
+            sudo: group.sudo,
+          });
+        }
+      } catch (e) {
+        for (const host of hosts) {
+          results.set(host, {
+            outcome: "failed",
+            exitCode: null,
+            result: null,
+            detail: tail((e as Error).message, 400),
+            sudo: group.sudo,
+          });
+        }
+      }
+    }
+  }
+
+  for (const r of refused) {
+    results.set(r.host, {
+      outcome: "refused-preflight",
+      exitCode: null,
+      result: null,
+      detail: tail(`plug-in privileges: ${r.errors.join("; ")}`, 400),
+      sudo: false,
+    });
+  }
+  const all: AccessJob[] = [
+    ...jobs,
+    ...refused.map((r) => ({ host: r.host, script: "", scriptSha256: "" })),
+  ];
+
+  const handles: Array<{ name: string }> = [];
+  const bad: string[] = [];
+  for (const job of all) {
+    const r = results.get(job.host) ?? NOT_REACHED;
+    const done = r.outcome === "applied" || r.outcome === "dry-run";
+    handles.push(
+      await context.writeResource(
+        "accessRun",
+        accessRunName(action, job.host, ranAt),
+        {
+          host: job.host,
+          action,
+          dryRun,
+          ok: done,
+          exitCode: r.exitCode,
+          outcome: r.outcome,
+          result: r.result,
+          detail: r.detail,
+          scriptSha256: job.scriptSha256,
+          sudo: r.sudo,
+          ranAt,
+        },
+      ),
+    );
+    if (!done) {
+      context.logger.warn("{action} on {host}: {outcome}: {detail}", {
+        action,
+        host: job.host,
+        outcome: r.outcome,
+        detail: r.detail,
+      });
+    }
+    // Anything but applied (or a dry run) fails the run, a skipped host included: a run
+    // that reports success while a host has no access would hide the gap.
+    if (!done) bad.push(`${job.host} (${r.outcome})`);
+  }
+  if (bad.length > 0) {
+    throw new Error(
+      `access ${action} refused or failed on ${
+        bad.join(", ")
+      }; the accessRun records hold the detail`,
+    );
+  }
+  return handles;
+}
+
+/** How serious each severity is. A run fails on a finding at or above its failOn level. */
+const SEVERITY_RANK: Record<Severity, number> = {
+  info: 0,
+  warning: 1,
+  high: 2,
+  critical: 3,
+};
+const FAIL_ON_RANK: Record<z.infer<typeof FailOn>, number> = {
+  none: Infinity,
+  high: SEVERITY_RANK.high,
+  critical: SEVERITY_RANK.critical,
+};
+
+/** The findings at or above the failOn level. `none` matches none of them. */
+function failingFindings(
+  findings: Finding[],
+  failOn: z.infer<typeof FailOn>,
+): Finding[] {
+  return findings.filter((f) =>
+    SEVERITY_RANK[f.severity] >= FAIL_ON_RANK[failOn]
+  );
+}
+
+/** What one probe gave one host: its parsed JSON line, or the error the audit records. */
+interface ProbeOutcome {
+  probe: unknown;
+  error: string | null;
+}
+
+/**
+ * The parsed probe line of one host's run. When there is no line, or it is not JSON, the
+ * error is the exit code and the last 300 characters of stdout and of stderr (where ssh
+ * says why it could not log in). No run: no result.
+ */
+export function probeOutcome(
+  kind: string,
+  run: HostRun | undefined,
+): ProbeOutcome {
+  if (run === undefined) {
+    return { probe: null, error: "no result for this host" };
+  }
+  const line = markerLine(run.stdout, kind);
+  if (line !== null) {
+    try {
+      return { probe: JSON.parse(line), error: null };
+    } catch {
+      // Not JSON: the error below is recorded instead.
+    }
+  }
+  const out = tail(run.stdout.trim(), 300);
+  const err = tail((run.stderr ?? "").trim(), 300);
+  const parts = err === "" ? [out] : [out, `stderr: ${err}`];
+  const detail = parts.filter((s) => s !== "").join("; ");
+  return { probe: null, error: `exit ${run.exitCode}: ${detail}` };
+}
+
+/**
+ * The user probe: one `<sshModel> script` call over every selected host, as the patch login
+ * and without sudo. A call that throws gives every host its error.
+ */
+async function runUserProbe(
+  sshModel: string,
+  hosts: string[],
+  swamp: SwampApi,
+): Promise<Map<string, ProbeOutcome>> {
+  const outcomes = new Map<string, ProbeOutcome>();
+  try {
+    const res = await runScriptOutcome(
+      sshModel,
+      hosts,
+      userProbeScript(),
+      60,
+      swamp,
+    );
+    for (const host of hosts) {
+      outcomes.set(
+        host,
+        probeOutcome(
+          "patch-access-user-probe",
+          res.runs.find((r) => r.host === host),
+        ),
+      );
+    }
+  } catch (e) {
+    for (const host of hosts) {
+      outcomes.set(host, {
+        probe: null,
+        error: tail((e as Error).message, 300),
+      });
+    }
+  }
+  return outcomes;
+}
+
+/**
+ * The root probe, through provisionSshModel. Each host's login is read from that model: a
+ * login that cannot be read is not contacted, a root login runs the script as is, and any
+ * other login runs it under sudo. Hosts with the same sudo flag share one script call.
+ */
+async function runRootProbe(
+  context: Ctx,
+  access: AccessProfileT,
+  hosts: string[],
+): Promise<Map<string, ProbeOutcome>> {
+  const { provisionSshModel } = access;
+  const swamp = methodSwamp(context);
+  const script = rootProbeScript(access.user, access.publicKey);
+  const outcomes = new Map<string, ProbeOutcome>();
+  const groups = new Map<boolean, string[]>();
+  for (const host of hosts) {
+    const login = await sshLogin(
+      context.definitionRepository,
+      provisionSshModel,
+      host,
+    );
+    if (login === null) {
+      outcomes.set(host, {
+        probe: null,
+        error: `login cannot be read from ${provisionSshModel}`,
+      });
+      continue;
+    }
+    const sudo = login !== "root";
+    groups.set(sudo, [...(groups.get(sudo) ?? []), host]);
+  }
+  for (const [sudo, group] of groups) {
+    try {
+      const res = await runScriptOutcome(
+        provisionSshModel,
+        group,
+        script,
+        120,
+        swamp,
+        sudo,
+      );
+      for (const host of group) {
+        outcomes.set(
+          host,
+          probeOutcome(
+            "patch-access-root-probe",
+            res.runs.find((r) => r.host === host),
+          ),
+        );
+      }
+    } catch (e) {
+      for (const host of group) {
+        outcomes.set(host, {
+          probe: null,
+          error: tail((e as Error).message, 300),
+        });
+      }
+    }
+  }
+  return outcomes;
+}
+
+/**
+ * `policy` — the access methods have an `access` profile whose provisionSshModel is not
+ * sshModel (the patch login must not be able to provision itself), and every `hosts` they
+ * name is in the fleet.
+ */
+export function checkAccessConfigured(ctx: CheckCtx): CheckResult {
+  const { access, sshModel, machines } = ctx.globalArgs;
+  const hint = skipHint("access-configured", "policy");
+  if (!access) {
+    return fail(
+      `access is not configured: add access { user, publicKey, from, provisionSshModel } to globalArguments. ${hint}`,
+    );
+  }
+  if (access.provisionSshModel === sshModel) {
+    return fail(
+      `access.provisionSshModel must differ from sshModel ("${sshModel}"): the patch login must not be able to provision itself. ${hint}`,
+    );
+  }
+  const hosts = checkArg(ctx, "hosts");
+  if (Array.isArray(hosts)) {
+    const missing = hosts.filter((h) =>
+      typeof h === "string" && !h.includes("${{") &&
+      !machines.some((m) => m.host === h)
+    );
+    if (missing.length > 0) {
+      return fail(
+        `No machine ${
+          missing.map((h) => `"${h}"`).join(", ")
+        } in globalArguments.machines. Fix the host name, or add the machine to the fleet. ${hint}`,
+      );
+    }
+  }
+  return PASS;
+}
+
+/**
+ * The plugged models each method uses. safeUpdate (docker) uses none. The access methods use
+ * every plugged model, because their grants are the plug-ins' declarations.
+ */
+const METHOD_PLUGIN_ROLES: Record<string, readonly PluginRole[]> = {
+  safeOsUpdate: ["updater", "osUpdater", "snapshotter", "health"],
+  rollback: ["snapshotter"],
+  pruneSnapshots: ["snapshotter", "osUpdater"],
+  renderAccess: ["updater", "osUpdater", "snapshotter", "health"],
+  provisionAccess: ["updater", "osUpdater", "snapshotter", "health"],
+  auditAccess: ["updater", "osUpdater", "snapshotter", "health"],
+};
+
+/** The access methods: they act on `hosts` (default every machine), not on one `host`. */
+const ACCESS_METHODS = ["renderAccess", "provisionAccess", "auditAccess"];
+
+/**
+ * `policy` — every plugged model the method will use declares its privileges, and passes
+ * the rules of pluginPrivilegesFor. For a host method the machine of `host`; for an access
+ * method every selected machine.
+ */
+export async function checkPrivilegesDeclared(
+  ctx: CheckCtx,
+): Promise<CheckResult> {
+  const method = ctx.methodName ?? "";
+  const roles = METHOD_PLUGIN_ROLES[method] ?? [];
+  let machines: Machine[];
+  if (ACCESS_METHODS.includes(method)) {
+    const hosts = checkArg(ctx, "hosts");
+    const named = Array.isArray(hosts) && hosts.length > 0
+      ? hosts.filter((h): h is string => typeof h === "string")
+      : null;
+    // An unknown host is access-configured's finding, not this one's.
+    machines = ctx.globalArgs.machines.filter((m) =>
+      named === null || named.includes(m.host)
+    );
+  } else {
+    const found = checkMachine(ctx);
+    machines = found ? [found.machine] : [];
+  }
+  const swamp = checkSwamp(ctx);
+  const problems: string[] = [];
+  for (const machine of machines) {
+    if (pluggedModels(machine).length === 0 && !hasPrivilegedHealth(machine)) {
+      continue;
+    }
+    const p = privilegesForRoles(
+      await pluginPrivilegesFor(machine, swamp),
+      roles,
+    );
+    if (p.errors.length > 0) {
+      problems.push(`${machine.host}: ${p.errors.join("; ")}`);
+    }
+  }
+  if (problems.length === 0) return PASS;
+  return fail(
+    `Plug-in privileges refused: ${problems.join(" | ")}. ` +
+      `Each plugged model must answer privileges({ host }) with { commands, helpers: [], remoteCode }; ` +
+      `an app updater or osUpdater without it needs an unsafe.privilegedUpdater record, and remote code needs a trustRemote record for each of its sources. ` +
+      `A privileged health check needs an unsafe.privilegedHealth record and an argv that passes the plug-in command rules. ${
+        skipHint("privileges-declared", "policy")
+      }`,
+  );
+}
+
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.10.25.1",
+  version: "2026.11.07.1",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
@@ -2447,6 +4328,20 @@ export const model = {
         "pluggable `osUpdater` (any model that implements scanOs / upgradeOs / " +
         "listPackages). The built-in OS layer adds pacman (Arch). Inventory records gain " +
         "an optional `osUpdater` field.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.07.1",
+      description:
+        "Restricted access. New optional globalArguments: `access`, `osUpdatePolicy`, " +
+        "`osAutoScope`; per machine `unsafe`, `trustRemote`, `acceptedRisks`, " +
+        "`osUpdatePolicy`, `osAutoScope`, `ct.nodeModel`, and `proxmox-cluster` / " +
+        "privileged `command` health checks. No migration is done, but some " +
+        "definitions need changes: `reach: pct` needs an `unsafe.pctExec` record, a root " +
+        "login needs `unsafe.rootSsh`, a CT snapshot needs `ct.nodeModel` (or " +
+        "`unsafe.pctExec` and a root node login), a `service` check name may use only " +
+        "A-Za-z0-9@._:+-, and plugged models must declare `privileges` (or the machine " +
+        "needs `unsafe.privilegedUpdater`). See the README's upgrade notes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2510,6 +4405,27 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 50,
     },
+    accessPlan: {
+      description:
+        "The rendered swamp-patch access login of one host: the authorized_keys line, the provisioning and revoke scripts, with their SHA-256 digests",
+      schema: AccessPlan,
+      lifetime: "infinite" as const,
+      garbageCollection: 20,
+    },
+    accessRun: {
+      description:
+        "Append-only record of one host in provisionAccess or revokeAccess: dry run, applied, refused, skipped or failed, with the script digest and the result",
+      schema: AccessRun,
+      lifetime: "infinite" as const,
+      garbageCollection: 100,
+    },
+    accessAudit: {
+      description:
+        "The read-only audit of one host's swamp-patch access login (auditAccess): the findings of the user and root probes, the accepted risks they matched, the summary counts, and whether the host passed the failOn level",
+      schema: AccessAudit,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
   },
   checks: {
     "host-in-fleet": {
@@ -2544,10 +4460,17 @@ export const model = {
     },
     "host-reachable": {
       description:
-        "The machine answers: ssh `true` through the sshModel, or `pct status` on the node for a CT. Not run for rollback, because a broken host is why you roll back",
+        "The machine answers: ssh `true` through the sshModel, or `pct status` on the node for a CT with an unsafe.pctExec record. Not run for rollback, because a broken host is why you roll back",
       labels: ["live"],
       appliesTo: ["safeUpdate", "safeOsUpdate", "reboot"],
       execute: (context: CheckCtx) => checkHostReachable(context),
+    },
+    "restricted-transport": {
+      description:
+        "The machine reaches its host only through an accepted path: a pct machine needs an unsafe.pctExec record, and a root ssh login needs an unsafe.rootSsh record. The login is read from the sshModel's hosts; an unreadable login fails",
+      labels: ["policy"],
+      appliesTo: ["safeUpdate", "safeOsUpdate", "reboot", "rollback"],
+      execute: (context: CheckCtx) => checkRestrictedTransport(context),
     },
     "baseline-healthy": {
       description:
@@ -2558,10 +4481,37 @@ export const model = {
     },
     "snapshot-target-resolves": {
       description:
-        "The VM/CT snapshot target resolves and its Proxmox node answers; for rollback, a snapshot also exists. A machine with no vm/ct passes",
+        "The VM/CT snapshot target resolves and its Proxmox node answers; for rollback, a snapshot also exists. A CT with ct.nodeModel lists through that node model (the Proxmox API); a CT without nodeModel or a snapshotter needs an unsafe.pctExec record (the built-in pct snapshots run pct as root on its node). A machine with no vm/ct passes",
       labels: ["live"],
       appliesTo: ["safeOsUpdate", "rollback", "pruneSnapshots"],
       execute: (context: CheckCtx) => checkSnapshotTargetResolves(context),
+    },
+    "access-configured": {
+      description:
+        "The access methods have an `access` profile whose provisionSshModel differs from sshModel (the patch login must not provision itself), and the `hosts` they name are in the fleet",
+      labels: ["policy"],
+      appliesTo: [
+        "renderAccess",
+        "provisionAccess",
+        "revokeAccess",
+        "auditAccess",
+      ],
+      execute: (context: CheckCtx) =>
+        Promise.resolve(checkAccessConfigured(context)),
+    },
+    "privileges-declared": {
+      description:
+        "Every plugged model the method uses (app updater, osUpdater, snapshotter) answers privileges({ host }) with a valid declaration: its root commands become sudoers grants. An app updater or osUpdater without one needs an unsafe.privilegedUpdater record; a snapshotter always declares; remote code needs a trustRemote record for each of its sources. A privileged health check needs an unsafe.privilegedHealth record and a valid argv. Machines without plugged models or privileged checks pass",
+      labels: ["policy"],
+      appliesTo: [
+        "safeOsUpdate",
+        "rollback",
+        "pruneSnapshots",
+        "renderAccess",
+        "provisionAccess",
+        "auditAccess",
+      ],
+      execute: (context: CheckCtx) => checkPrivilegesDeclared(context),
     },
   },
   methods: {
@@ -2579,6 +4529,10 @@ export const model = {
             name: string,
             data: unknown,
           ) => Promise<{ name: string }>;
+          readResource: (
+            name: string,
+            version?: number,
+          ) => Promise<Record<string, unknown> | null>;
         },
       ) => {
         const { sshModel, machines } = context.globalArgs;
@@ -2621,14 +4575,18 @@ export const model = {
           dockerEngine: null,
           dockerImages: null,
           reachMethod: null,
+          acceptedRisksUsed: [],
+          securityFindings: [],
           health: null,
           error,
           scannedAt,
         });
 
-        // Per machine: reach=ssh (default) tries SSH then falls back to pct when a
-        // CT location exists; reach=pct goes straight to pct. reachMethod records
-        // which worked. A failure of one host or node never sinks the others.
+        // Per machine: one transport, no fallback. ssh (default) runs the collector over
+        // ssh; a CT with an unsafe.pctExec record runs it through pct on its node. A
+        // machine that asks for pct without that record is refused: it gets an error
+        // record and is not contacted. reachMethod records the transport that worked.
+        // A failure of one host or node never sinks the others.
         const scanned = machines.filter((m) => m.os !== false);
         const lines = new Map<string, { line: string; via: "ssh" | "pct" }>();
         const errs = new Map<string, string>();
@@ -2638,11 +4596,69 @@ export const model = {
         // A machine with an `osUpdater` model is scanned by that model (step 2b), never
         // by the bundled collector.
         const collected = scanned.filter((m) => !m.osUpdater);
+        const refused = new Set<string>();
+        for (const m of collected) {
+          const why = pctRefusal(m);
+          if (why) {
+            refused.add(m.host);
+            addErr(m.host, why);
+          }
+        }
 
-        // 1) ONE ssh `script` call runs the collector on every ssh host.
-        const sshHosts = collected.filter((m) => m.reach !== "pct").map((m) =>
-          m.host
-        );
+        // Before any contact, the login the transport reaches the host with is read from the
+        // ssh definition. A pct CT is checked on its node, because pct runs over the node's
+        // login, but the unsafe.rootSsh record that counts is the CT's own. An unknown login
+        // is refused, and so is a root login without that record. A refused machine is never
+        // contacted, so it gets no health checks either.
+        const logins = new Map<string, string | null>();
+        const loginOf = async (target: string): Promise<string | null> => {
+          if (!logins.has(target)) {
+            logins.set(
+              target,
+              await sshLogin(context.definitionRepository, sshModel, target),
+            );
+          }
+          return logins.get(target) ?? null;
+        };
+        // Machines that log in as root with their own unsafe.rootSsh record.
+        const rootRisk = new Set<string>();
+        for (const m of collected) {
+          if (refused.has(m.host)) continue;
+          let target = m.host;
+          if (transportVia(m) === "pct") {
+            try {
+              target = (await ctLocation(m, swamp)).node;
+            } catch (e) {
+              refused.add(m.host);
+              addErr(m.host, `pct: ${(e as Error).message.slice(0, 90)}`);
+              continue;
+            }
+          }
+          const login = await loginOf(target);
+          if (login === null) {
+            refused.add(m.host);
+            addErr(
+              m.host,
+              `refused: the ssh login for "${target}" cannot be read from ${sshModel}, so a root login cannot be ruled out`,
+            );
+          } else if (login === "root") {
+            if (unsafeRecord(m, "rootSsh") === null) {
+              refused.add(m.host);
+              addErr(
+                m.host,
+                `refused: logs in as root through ${sshModel} (host "${target}") without an unsafe.rootSsh acceptance record — use an unprivileged login (access.user) or add the record`,
+              );
+            } else {
+              rootRisk.add(m.host);
+            }
+          }
+        }
+
+        // 1) ONE ssh `script` call runs the collector on every ssh host (a refused
+        // machine is not one).
+        const sshHosts = collected.filter((m) =>
+          transportVia(m) === "ssh" && !refused.has(m.host)
+        ).map((m) => m.host);
         if (sshHosts.length) {
           try {
             const res = await runScriptOutcome(
@@ -2669,11 +4685,12 @@ export const model = {
           }
         }
 
-        // 2) CTs with no inventory yet go to pct, grouped by node: ONE call per node
-        // runs the collector in each of its CTs (see ctBatchScript).
+        // 2) The pct machines (a CT with an unsafe.pctExec record), grouped by node: ONE
+        // call per node runs the collector in each of its CTs (see ctBatchScript). An ssh
+        // failure of a CT is never retried through pct.
         const byNode = new Map<string, Array<{ host: string; ctid: number }>>();
         for (const m of collected) {
-          if (lines.has(m.host) || !isCtMachine(m)) continue;
+          if (transportVia(m) !== "pct" || refused.has(m.host)) continue;
           try {
             const { node, ctid } = await ctLocation(m, swamp);
             byNode.set(node, [...(byNode.get(node) ?? []), {
@@ -2746,7 +4763,10 @@ export const model = {
             checks: Array<{ label: string; ok: boolean; detail: string }>;
           } | null = null;
           try {
-            const checks = await resolveHealthChecks(m, swamp);
+            // A refused machine is not contacted, so it gets no health checks either.
+            const checks = refused.has(h)
+              ? []
+              : await resolveHealthChecks(m, swamp);
             if (checks.length) {
               const hres = await evalHealth(m, checks, sshModel, swamp);
               health = { healthy: hres.healthy, checks: hres.results };
@@ -2755,24 +4775,52 @@ export const model = {
 
           const found = lines.get(h);
           const modelInv = modelInvs.get(h);
+          // The previous record of this host: the package-set verdict reads its baseline.
+          const prev = await context.readResource(h);
           if (modelInv) {
+            // An osUpdater model's scan has no packages hash in this release: the read is
+            // unknown (null), so the verdict is null and the baseline is carried.
             handles.push(
               await context.writeResource("inventory", h, {
                 ...modelInv,
                 health,
+                ...outsidePackageChange(prev, null, scannedAt),
               }),
             );
           } else if (found) {
+            const inv = inventoryFromCollector(found.line, context.logger);
+            // uid 0 over ssh without an unsafe.rootSsh record is a finding. Through pct it is
+            // expected: root in the container is what pctExec accepts.
+            const rootUnaccepted = found.via === "ssh" && inv.uid === 0 &&
+              unsafeRecord(m, "rootSsh") === null;
+            if (rootUnaccepted) {
+              context.logger.warn(
+                "{host} ran the collector as uid 0 over ssh without an unsafe.rootSsh record (root-login-unaccepted)",
+                { host: h },
+              );
+            }
             handles.push(
               await context.writeResource(
                 "inventory",
                 h,
                 {
-                  ...(JSON.parse(found.line) as Record<string, unknown>),
+                  ...inv,
                   reachMethod: found.via,
+                  acceptedRisksUsed: [
+                    ...(found.via === "pct" ? ["unsafe.pctExec"] : []),
+                    ...(rootRisk.has(h) ? ["unsafe.rootSsh"] : []),
+                  ],
+                  securityFindings: rootUnaccepted
+                    ? ["root-login-unaccepted"]
+                    : [],
                   osUpdater: null,
                   health,
                   error: null,
+                  ...outsidePackageChange(
+                    prev,
+                    packagesHashOf(inv.packagesHash),
+                    scannedAt,
+                  ),
                 },
               ),
             );
@@ -2782,16 +4830,19 @@ export const model = {
                 ...errorInv(h, errs.get(h) || "unreachable"),
                 osUpdater: m.osUpdater?.model ?? null,
                 health,
+                // No read, so no hash: the verdict is unknown and the baseline is carried.
+                ...outsidePackageChange(prev, null, scannedAt),
               }),
             );
           }
         }
 
         // 4) Fire checkUpdate on each machine's app source (community-script) for
-        // fresh data the report reads; best-effort, never fails the scan.
+        // fresh data the report reads; best-effort, never fails the scan. A refused
+        // machine is not contacted, so its source is not asked either.
         for (const m of machines) {
           const src = appSource(m);
-          if (src) {
+          if (src && !refused.has(m.host)) {
             await runLogged(swamp, src, "checkUpdate", {}, context.logger);
           }
         }
@@ -2909,10 +4960,11 @@ export const model = {
           }
           if (g?.type === "lxc") {
             lines.push(
-              `    reach: pct`,
-              `    ct:   # Proxmox CT — OS update via pct exec (captured)`,
+              `    ct:   # Proxmox CT — location`,
               `      proxmoxNode: ${g.pnode}`,
               `      ctid: ${g.vmid}`,
+              `      # nodeModel: <@dmc/proxmox/node model>   # snapshots through the Proxmox API (else pct with unsafe.pctExec)`,
+              `    # reached over ssh; to use pct instead add unsafe.pctExec (reason, acceptedBy, acceptedAt, reviewBy)`,
               `    # source:   # optional app updater on top of the OS lifecycle`,
               `    #   type: community-script`,
               `    #   model: ${name}   # a @dmc/proxmox/community-script instance`,
@@ -2963,7 +5015,7 @@ export const model = {
           lines.push(
             "",
             `# Discovered guests not in ${sshModel}. Add these to its host list so the`,
-            `# fleet can SSH them (adjust user/tags; CTs also need sshd, else use pct exec):`,
+            `# fleet can SSH them (adjust user/tags; CTs also need sshd, or add unsafe.pctExec to reach one through pct):`,
             "#   hosts:",
           );
           for (const h of newSshHosts) {
@@ -3021,6 +5073,26 @@ export const model = {
           throw new Error(`machine "${args.host}" has no docker decoration`);
         }
         const dcfg = machine.docker;
+        // A root login runs docker directly. Any other login (or one that cannot be read) reaches
+        // docker only through the root-owned helper, so it needs the machine's compose project.
+        const login = await sshLogin(
+          context.definitionRepository,
+          sshModel,
+          args.host,
+        );
+        const project = login === "root"
+          ? null
+          : helperProject(args.host, dcfg.composePath);
+        if (
+          project !== null && args.service !== undefined &&
+          args.service !== dcfg.service
+        ) {
+          throw new Error(
+            `machine "${args.host}": a service override (${args.service}) cannot go through swamp-patch-docker, which runs the service in its project list (${
+              dcfg.service ?? "all services"
+            })`,
+          );
+        }
         const svc = args.service ?? dcfg.service ?? null;
         const svcArg = svc ? ` ${svc}` : "";
         const cd = dcfg.composePath ? `cd ${dcfg.composePath} && ` : "";
@@ -3063,20 +5135,37 @@ export const model = {
             timestamp: runTs,
           });
 
-        const idsOf = async (): Promise<string[]> =>
-          (await ex(`${cd}docker compose ps -q${svcArg}`)).out.split("\n").map((
-            s,
-          ) => s.trim()).filter(Boolean);
-        const snapshot = async (
-          ids: string[],
-        ): Promise<Map<string, string>> => {
-          const map = new Map<string, string>();
+        // The project's containers, one row each. Through the helper it is one `inspect` call; a
+        // root login gets the direct `compose ps` and `inspect` commands it always had.
+        const containers = async (): Promise<DockerContainer[]> => {
+          if (project !== null) {
+            const r = await ex(helperLine("inspect", project), 60);
+            if (r.rc !== 0) {
+              throw new Error(
+                `swamp-patch-docker inspect failed (rc ${r.rc}): ${
+                  tail(r.out, 300)
+                }`,
+              );
+            }
+            return parseInspectRows(r.out);
+          }
+          const ids = (await ex(`${cd}docker compose ps -q${svcArg}`)).out
+            .split("\n").map((s) => s.trim()).filter(Boolean);
+          const rows: DockerContainer[] = [];
           for (const id of ids) {
             const r = await ex(
-              `docker inspect ${id} --format '{{.Config.Image}}|{{.Image}}'`,
+              `docker inspect ${id} --format '{{.Config.Image}}|{{.Image}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'`,
             );
-            const [ref, img] = r.out.trim().split("|");
-            if (ref && img) map.set(ref, img);
+            const [ref = "", imageId = "", status = "", health = ""] = r.out
+              .trim().split("|");
+            rows.push({ ref, imageId, status, health });
+          }
+          return rows;
+        };
+        const snapshotOf = (rows: DockerContainer[]): Map<string, string> => {
+          const map = new Map<string, string>();
+          for (const r of rows) {
+            if (r.ref && r.imageId) map.set(r.ref, r.imageId);
           }
           return map;
         };
@@ -3100,22 +5189,44 @@ export const model = {
               clearTimeout(t);
             }
           }
-          const ids = await idsOf();
-          if (ids.length === 0) return false;
-          for (const id of ids) {
-            const r = await ex(
-              `docker inspect ${id} --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'`,
-            );
-            const [status, hs] = r.out.trim().split("|");
-            if (status === "exited" || status === "dead") return false;
-            if (hs === "unhealthy") return false;
-            if (status !== "running" || hs === "starting") return null;
+          const rows = await containers();
+          if (rows.length === 0) return false;
+          for (const r of rows) {
+            if (r.status === "exited" || r.status === "dead") return false;
+            if (r.health === "unhealthy") return false;
+            if (r.status !== "running" || r.health === "starting") return null;
           }
           return true;
         };
+        // The new images: pull, then up -d (through the helper, or directly for a root login).
+        const pullUp = () =>
+          project !== null ? ex(helperLine("update", project), 300) : ex(
+            `${cd}docker compose pull${svcArg} && docker compose up -d${svcArg}`,
+            300,
+          );
+        // Puts every image of `oldImages` back. The helper restores one ref at a time, and the
+        // direct path tags them all and then recreates once, as it always did.
+        const rollBack = async (oldImages: Map<string, string>) => {
+          if (project !== null) {
+            for (const [ref, oldImg] of oldImages) {
+              const r = await ex(
+                helperLine("restore", project, ref, oldImg),
+                300,
+              );
+              if (r.rc !== 0) {
+                log(`restore of ${ref} failed (rc ${r.rc})`);
+              }
+            }
+            return;
+          }
+          for (const [ref, oldImg] of oldImages) {
+            await ex(`docker tag ${oldImg} ${ref}`);
+          }
+          await ex(`${cd}docker compose up -d --force-recreate${svcArg}`, 300);
+        };
 
-        const beforeIds = await idsOf();
-        if (beforeIds.length === 0) {
+        const beforeRows = await containers();
+        if (beforeRows.length === 0) {
           log("no running containers — nothing to update");
           const handle = await context.writeResource(
             "update",
@@ -3138,7 +5249,7 @@ export const model = {
           );
           return { dataHandles: [handle, await writeRun("skipped", false)] };
         }
-        const before = await snapshot(beforeIds);
+        const before = snapshotOf(beforeRows);
         log(
           `before: ${
             [...before.entries()].map(([r, i]) => `${r}=${i.slice(0, 19)}`)
@@ -3146,10 +5257,7 @@ export const model = {
           }`,
         );
 
-        const up = await ex(
-          `${cd}docker compose pull${svcArg} && docker compose up -d${svcArg}`,
-          300,
-        );
+        const up = await pullUp();
         if (up.rc !== 0) {
           log(`pull/up failed (rc ${up.rc}) — nothing changed`);
           const handle = await context.writeResource(
@@ -3178,7 +5286,7 @@ export const model = {
           return { dataHandles: [handle, await writeRun("unhealthy", false)] };
         }
 
-        const after = await snapshot(await idsOf());
+        const after = snapshotOf(await containers());
         const imageChanged = [...after.entries()].some(([ref, img]) =>
           before.get(ref) !== img
         );
@@ -3209,10 +5317,7 @@ export const model = {
           // and retired later by pruneImages (see the retained-image records below).
         } else if (args.rollbackOnFailure) {
           log("unhealthy — rolling back to previous image(s)");
-          for (const [ref, oldImg] of before.entries()) {
-            await ex(`docker tag ${oldImg} ${ref}`);
-          }
-          await ex(`${cd}docker compose up -d --force-recreate${svcArg}`, 300);
+          await rollBack(before);
           rolledBack = true;
           outcome = "rolled-back";
           log(
@@ -3299,13 +5404,16 @@ export const model = {
         "The snapshot guard is pluggable: a `snapshotter` decoration names any model that " +
         "implements the snapshotter contract (it also guards bare metal); otherwise a " +
         "Proxmox VM (vm decoration) is snapshotted via its node model and a Proxmox CT " +
-        "(ct decoration) via pct, and bare metal is upgraded unguarded. VMs and bare metal " +
-        "upgrade over ssh; CTs via pct exec. An app updater (`source`) runs on top for any " +
+        "(ct decoration) with pct on its node, and bare metal is upgraded unguarded. VMs, " +
+        "containers and bare metal are reached over ssh; pct (root in the container) is used " +
+        "only for a CT with an unsafe.pctExec record. An app updater (`source`) runs on top for any " +
         "machine kind, under the same snapshot: it is called with snapshot:false when " +
         "@dmc/patch took the snapshot, and with no arguments on an unguarded machine. " +
         "The OS package layer is pluggable too: an `osUpdater` decoration names any model " +
         "that implements the OS updater contract (scanOs / upgradeOs / listPackages); " +
-        "otherwise the built-in apt/dnf/apk/pacman upgrade runs. Reboot is never automatic.",
+        "otherwise the built-in apt/dnf/apk/pacman upgrade runs. Reboot is never automatic. " +
+        "Refused, before any change, unless the machine's effective osUpdatePolicy is managed " +
+        "and os is not false (auto: the host upgrades itself; scan-only: never upgraded).",
       arguments: z.object({
         host: z.string().min(1).describe("Machine (host) to update"),
         mode: z.enum(["safe", "full"]).default("safe").describe(
@@ -3335,6 +5443,23 @@ export const model = {
         const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
         if (!machine) throw new Error(`no machine "${args.host}" in the fleet`);
+        // Fail closed before any side effect: no snapshot, no connection, no upgrade unless
+        // the OS policy allows it. An inconsistent policy throws here too.
+        const refusal = osRefusal("safeOsUpdate", machine, context.globalArgs);
+        if (refusal) throw new Error(refusal);
+        // The plugged models this update runs must pass their privileges, before any side
+        // effect too: the privileges-declared check can be skipped.
+        const plugins = privilegesForRoles(
+          await pluginPrivilegesFor(machine, swamp),
+          METHOD_PLUGIN_ROLES.safeOsUpdate,
+        );
+        if (plugins.errors.length > 0) {
+          throw new Error(
+            `safeOsUpdate of ${args.host} refused: plug-in privileges: ${
+              plugins.errors.join("; ")
+            }`,
+          );
+        }
         const logs: string[] = [];
         const log = (m: string) => {
           logs.push(m);
@@ -3371,12 +5496,25 @@ export const model = {
           return h.healthy;
         };
 
-        // Reach the machine (pct on its node for a CT, ssh otherwise) and pick its
-        // snapshot guard: an explicit `snapshotter`, else the built-in proxmox-vm (`vm`)
-        // or proxmox-ct (a CT), else none — bare metal is upgraded unguarded. From here
+        // Reach the machine (pct on its node for a CT with an unsafe.pctExec record, ssh
+        // otherwise). The transport and the snapshot guard are chosen separately: an
+        // explicit `snapshotter`, else the built-in proxmox-vm (`vm`), proxmox-ct-api
+        // (`ct.nodeModel`) or proxmox-ct (a CT with an unsafe.pctExec record, snapshotted
+        // with pct on its node), else none — bare metal is upgraded unguarded. A CT is
+        // never upgraded unguarded: one with no snapshotter, no nodeModel and no record, or
+        // whose location cannot be resolved, aborts the update before any change. From here
         // one flow serves every machine kind.
         const transport = await transportFor(machine, { sshModel, swamp });
-        const snapRef = snapshotterRefFor(machine, transport.ct);
+        const isCt = !machine.vm && isCtMachine(machine);
+        const pctSnaps = usesPctSnapshots(machine);
+        if (pctSnaps) {
+          const refusal = pctSnapshotRefusal(machine);
+          if (refusal) {
+            throw new Error(`safeOsUpdate of ${args.host} refused: ${refusal}`);
+          }
+        }
+        const ct = pctSnaps ? await ctLocation(machine, swamp) : undefined;
+        const snapRef = snapshotterRefFor(machine, ct);
         const snapper = snapRef
           ? snapshotterFor(snapRef, {
             sshModel,
@@ -3385,8 +5523,11 @@ export const model = {
             logger: context.logger,
           })
           : null;
-        const kind: z.infer<typeof OsUpdateResult>["kind"] =
-          transport.via === "pct" ? "ct" : machine.vm ? "vm" : "bare-metal";
+        const kind: z.infer<typeof OsUpdateResult>["kind"] = isCt
+          ? "ct"
+          : machine.vm
+          ? "vm"
+          : "bare-metal";
         // The OS package layer: an explicit `osUpdater` model, else the built-in one.
         const os = osUpdaterFor(machine, transport, {
           swamp,
@@ -3495,6 +5636,12 @@ export const model = {
           log(`healthy after (${after?.updatesCount ?? "?"} updates left)`);
         }
 
+        // After a rollback the post-update scan describes the state that was rolled back,
+        // not the machine: read the restored machine once. A failed read leaves its hash
+        // unknown, and the record then carries the baseline (see updatedPackageState).
+        const restored = rolledBack && after ? await os.scan() : null;
+        const leftBehind = rolledBack ? restored : after;
+
         const runTs = new Date().toISOString();
         const dataHandles = [
           await context.writeResource("osUpdate", `os-update-${args.host}`, {
@@ -3531,6 +5678,7 @@ export const model = {
               snapshot: snap,
               rolledBack,
               needsReboot: after?.needsReboot ?? null,
+              acceptedRisksUsed: plugins.acceptedRisksUsed,
               timestamp: runTs,
             },
           ),
@@ -3566,14 +5714,28 @@ export const model = {
         // Refresh the inventory from the post-update scan so needsReboot (and the update
         // counts) are current for the reboot guard and the report.
         if (after) {
+          const prev = await context.readResource(args.host);
           dataHandles.push(
             await context.writeResource("inventory", args.host, {
               ...after,
               reachMethod: os.model ? null : transport.via,
+              acceptedRisksUsed: [
+                ...new Set([
+                  ...(after.acceptedRisksUsed ?? []),
+                  ...plugins.acceptedRisksUsed,
+                ]),
+              ],
               osUpdater: os.model,
+              securityFindings: [],
               // After a rollback the restored state is unchecked: leave it to the next scan.
               health: rolledBack ? null : inventoryHealth(lastHealth),
               error: null,
+              ...updatedPackageState(
+                prev,
+                before.packagesHash,
+                leftBehind?.packagesHash,
+                runTs,
+              ),
             }),
           );
         }
@@ -3586,7 +5748,7 @@ export const model = {
     },
     reboot: {
       description:
-        "Gracefully reboot one machine. ssh hosts (VM / bare metal) → `systemctl reboot` over sshModel (scheduled with systemd-run so the call returns before the link drops); Proxmox CTs (reach=pct) → `pct reboot <ctid>` on the node. Guarded on the last scan's needsReboot unless force. Optionally waits for the host to return and re-scans to confirm needsReboot cleared.",
+        "Gracefully reboot one machine. ssh hosts (VM / bare metal) → `systemctl reboot` over sshModel (scheduled with systemd-run so the call returns before the link drops); containers reached over ssh, or with an unsafe.pctExec record through pct → `pct reboot <ctid>` on the node. Guarded on the last scan's needsReboot unless force. Optionally waits for the host to return and re-scans to confirm needsReboot cleared. Refused, even with force, when the machine's effective osUpdatePolicy is scan-only.",
       arguments: z.object({
         host: z.string().min(1).describe("Machine (host) to reboot"),
         force: z.boolean().default(false).describe(
@@ -3611,6 +5773,19 @@ export const model = {
         const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
         if (!machine) throw new Error(`no machine "${args.host}" in the fleet`);
+        // Fail closed before any side effect, and before force can skip the guard: a
+        // scan-only machine (or os false) is never rebooted.
+        const refusal = osRefusal("reboot", machine, context.globalArgs);
+        if (refusal) throw new Error(refusal);
+        // The health checks after the reboot must be able to run: a privileged one without
+        // its record or with a refused argv stops the reboot before it starts.
+        const health = healthPrivilegesFor(machine);
+        if (health !== null && health.errors.length > 0) {
+          throw new Error(
+            `reboot of ${args.host} refused: ${health.errors.join("; ")}`,
+          );
+        }
+        let healthRan = false;
         const logs: string[] = [];
         const log = (m: string) => {
           logs.push(m);
@@ -3645,6 +5820,8 @@ export const model = {
             snapshot: null,
             rolledBack: false,
             needsReboot: needsRebootAfter,
+            // A privileged health check is an accepted risk used only when the checks ran.
+            acceptedRisksUsed: healthRan ? health?.acceptedRisksUsed ?? [] : [],
             timestamp: ts,
           });
 
@@ -3747,6 +5924,7 @@ export const model = {
         let appHealthy: boolean | null = null;
         let rebootHealth: HealthResult | null = null;
         if (confirmed && checks.length) {
+          healthRan = true;
           const h = await evalHealthWithGrace(
             () => evalHealth(machine, checks, sshModel, swamp),
             args.healthGraceSec,
@@ -3799,13 +5977,20 @@ export const model = {
         // Refresh the inventory from the post-reboot confirming scan so needsReboot
         // (and the status report) reflect the rebooted host.
         if (confirmInv) {
+          const prev = await context.readResource(args.host);
           dh.push(
             await context.writeResource("inventory", args.host, {
               ...confirmInv,
               reachMethod: os.model ? null : via,
               osUpdater: os.model,
+              securityFindings: [],
               health: inventoryHealth(rebootHealth),
               error: null,
+              ...outsidePackageChange(
+                prev,
+                packagesHashOf(confirmInv.packagesHash),
+                new Date().toISOString(),
+              ),
             }),
           );
         }
@@ -3845,9 +6030,12 @@ export const model = {
         snapshot: z.string().optional().describe(
           "Snapshot name; default = newest active retained snapshot",
         ),
+        healthGraceSec: z.number().int().min(0).default(120).describe(
+          "Grace window for the post-rollback health check. A rolled-back machine boots again, so while it is unhealthy, re-check every 10 s until healthy or this many seconds have passed. 0 = check once.",
+        ),
       }),
       execute: async (
-        args: { host: string; snapshot?: string },
+        args: { host: string; snapshot?: string; healthGraceSec: number },
         context: Ctx,
       ) => {
         const { sshModel, machines } = context.globalArgs;
@@ -3889,8 +6077,16 @@ export const model = {
         }
         const a = target.a;
         // Roll back through the snapshotter that TOOK this snapshot (from the record),
-        // not whatever the machine is decorated with now.
-        const snapper = snapshotterFor(snapshotterRefFromRecord(a), {
+        // not whatever the machine is decorated with now. A pct snapshot still needs the
+        // machine's unsafe.pctExec record: the rollback runs pct as root on the node.
+        const ref = snapshotterRefFromRecord(a);
+        if (ref.kind === "proxmox-ct") {
+          const refusal = pctSnapshotRefusal(machine);
+          if (refusal) {
+            throw new Error(`rollback of ${args.host} refused: ${refusal}`);
+          }
+        }
+        const snapper = snapshotterFor(ref, {
           sshModel,
           swamp,
           host: args.host,
@@ -3901,11 +6097,17 @@ export const model = {
         const ok = await snapper.rollback(a.name);
         log(ok ? `rolled back to ${a.name}` : `ROLLBACK FAILED for ${a.name}`);
 
-        // Best-effort health verdict after the revert.
+        // Best-effort health verdict after the revert. The machine was just started
+        // from the snapshot and its services may still be starting: allow the grace
+        // window, as after an update.
         const checks = await resolveHealthChecks(machine, swamp);
         let healthy: boolean | null = null;
         if (ok && checks.length) {
-          const h = await evalHealth(machine, checks, sshModel, swamp);
+          const h = await evalHealthWithGrace(
+            () => evalHealth(machine, checks, sshModel, swamp),
+            args.healthGraceSec,
+            context.logger,
+          );
           healthy = h.healthy;
           log(
             `post-rollback health: ${
@@ -3977,8 +6179,8 @@ export const model = {
         const now = Date.now();
         const scannedAt = new Date().toISOString();
         // Final live gate: the machine answers a scan through its OS updater (over its own
-        // transport — pct on its node for a CT, which often has no ssh — unless an
-        // osUpdater model scans it) AND no reboot is pending.
+        // transport — ssh, or pct on its node for a CT with an unsafe.pctExec record —
+        // unless an osUpdater model scans it) AND no reboot is pending.
         const healthyNow = async (m: MachineShape): Promise<boolean> => {
           try {
             const transport = await transportFor(m, { sshModel, swamp });
@@ -4061,6 +6263,13 @@ export const model = {
             });
             continue;
           }
+          const pctRefused = ref.kind === "proxmox-ct"
+            ? pctSnapshotRefusal(machine)
+            : null;
+          if (pctRefused) {
+            kept.push({ host: a.host, name: a.name, reason: pctRefused });
+            continue;
+          }
           const label = ref.kind === "model" ? `model:${ref.model}` : null;
           if (args.dryRun) {
             pruned.push({
@@ -4137,7 +6346,7 @@ export const model = {
         args: { host?: string; dryRun: boolean },
         context: Ctx,
       ) => {
-        const { sshModel } = context.globalArgs;
+        const { sshModel, machines } = context.globalArgs;
         const swamp = methodSwamp(context);
         context.logger.info(
           "Pruning retained images (host={host} dryRun={dryRun})",
@@ -4145,16 +6354,49 @@ export const model = {
         );
         const now = Date.now();
         const scannedAt = new Date().toISOString();
-        // Reachability gate: the docker host answers a trivial command.
-        const reachable = async (host: string): Promise<boolean> => {
+        // How one host's docker is reached, read once per host: a root login runs docker directly;
+        // any other login runs it through the helper, which needs the host's compose project.
+        const routes = new Map<
+          string,
+          { project: string | null } | { refused: string }
+        >();
+        const routeOf = async (
+          host: string,
+        ): Promise<{ project: string | null } | { refused: string }> => {
+          const known = routes.get(host);
+          if (known !== undefined) return known;
+          let route: { project: string | null } | { refused: string };
+          const login = await sshLogin(
+            context.definitionRepository,
+            sshModel,
+            host,
+          );
+          const m = machines.find((x) => x.host === host);
+          if (login === "root") {
+            route = { project: null };
+          } else if (!m) {
+            route = { refused: "the host is no longer in the fleet" };
+          } else {
+            try {
+              route = { project: helperProject(host, m.docker?.composePath) };
+            } catch (e) {
+              route = { refused: (e as Error).message };
+            }
+          }
+          routes.set(host, route);
+          return route;
+        };
+        // Reachability gate: the docker host answers a trivial command (through the helper, `ps`,
+        // for a login that is not root).
+        const reachable = async (
+          host: string,
+          project: string | null,
+        ): Promise<boolean> => {
           try {
-            return (await nodeExec(
-              sshModel,
-              host,
-              "docker version --format '{{.Server.Version}}'",
-              30,
-              swamp,
-            )).rc === 0;
+            const line = project === null
+              ? "docker version --format '{{.Server.Version}}'"
+              : helperLine("ps", project);
+            return (await nodeExec(sshModel, host, line, 30, swamp)).rc === 0;
           } catch {
             return false;
           }
@@ -4182,7 +6424,12 @@ export const model = {
             });
             continue;
           }
-          if (!(await reachable(a.host))) {
+          const route = await routeOf(a.host);
+          if ("refused" in route) {
+            kept.push({ host: a.host, name: a.ref, reason: route.refused });
+            continue;
+          }
+          if (!(await reachable(a.host, route.project))) {
             kept.push({
               host: a.host,
               name: a.ref,
@@ -4198,14 +6445,24 @@ export const model = {
             });
             continue;
           }
-          // `docker rmi` by id is inherently safe: it refuses if the image is still in use.
-          const rm = await nodeExec(
-            sshModel,
-            a.host,
-            `docker rmi ${a.imageId}`,
-            60,
-            swamp,
-          );
+          // `docker rmi` by id is inherently safe: it refuses if the image is still in use. The
+          // helper's `prune` runs the same `docker rmi` after it checks the id's form.
+          let rmLine: string;
+          if (route.project === null) {
+            rmLine = `docker rmi ${a.imageId}`;
+          } else {
+            try {
+              rmLine = helperLine("prune", a.imageId);
+            } catch {
+              kept.push({
+                host: a.host,
+                name: a.ref,
+                reason: "the image id is not one swamp-patch-docker accepts",
+              });
+              continue;
+            }
+          }
+          const rm = await nodeExec(sshModel, a.host, rmLine, 60, swamp);
           if (rm.rc !== 0) {
             kept.push({
               host: a.host,
@@ -4373,6 +6630,279 @@ export const model = {
           },
         );
         return { dataHandles: [handle] };
+      },
+    },
+    renderAccess: {
+      description:
+        "Render the swamp-patch access login of each selected machine into an accessPlan record: the authorized_keys line (one key, restricted by from=), and the provisioning and revoke scripts with their digests. The sudoers grants include what the machine's plugged models declare with privileges({ host }). Contacts no host and does not use sshModel. A machine whose plug-in privileges are refused gets no plan, and fails the run after the others are written.",
+      arguments: z.object({
+        hosts: z.array(z.string()).optional().describe(
+          "Limit to these hosts (default: every machine)",
+        ),
+      }),
+      execute: async (args: { hosts?: string[] }, context: Ctx) => {
+        const { access, targets, refused } = await accessTargetsWithPlugins(
+          context.globalArgs,
+          args.hosts,
+          methodSwamp(context),
+        );
+        context.logger.info("Rendering the access plan of {count} machine(s)", {
+          count: targets.length,
+        });
+        const handles = await writeAccessPlans(context, access, targets);
+        if (refused.length > 0) throw new Error(pluginRefusalMessage(refused));
+        return { dataHandles: handles };
+      },
+    },
+    provisionAccess: {
+      description:
+        "Install the swamp-patch access login on each selected machine through access.provisionSshModel, which must differ from sshModel. " +
+        "The login gets one key, restricted by from=, is kept out of root, sudo and docker groups, and refuses to take over an account it did not create. " +
+        "Its sudoers grants are the table's commands and what the machine's plugged models declare with privileges({ host }); a machine whose plug-in privileges are refused is not contacted (refused-preflight). " +
+        "Dry run unless dryRun is false; a dry run contacts no host. Every host gets an accessRun record. A refused or failed host fails the run after all hosts are tried.",
+      arguments: z.object({
+        hosts: z.array(z.string()).optional().describe(
+          "Limit to these hosts (default: every machine)",
+        ),
+        dryRun: z.boolean().default(true).describe(
+          "Write the plans and a dry-run record per host, and contact no host (default true)",
+        ),
+      }),
+      execute: async (
+        args: { hosts?: string[]; dryRun: boolean },
+        context: Ctx,
+      ) => {
+        const { access, targets, refused } = await accessTargetsWithPlugins(
+          context.globalArgs,
+          args.hosts,
+          methodSwamp(context),
+        );
+        // Only an explicit false applies. A missing value is a dry run.
+        const dryRun = args.dryRun !== false;
+        const jobs: AccessJob[] = [];
+        for (const { host, input } of targets) {
+          const script = provisionScript(input);
+          jobs.push({ host, script, scriptSha256: await sha256Hex(script) });
+        }
+        context.logger.info(
+          "provisionAccess ({mode}) of {count} machine(s) through {model}",
+          {
+            mode: dryRun ? "dry run" : "apply",
+            count: targets.length,
+            model: access.provisionSshModel,
+          },
+        );
+        const plans = await writeAccessPlans(context, access, targets);
+        const runs = await runAccess(
+          context,
+          "provision",
+          jobs,
+          access.provisionSshModel,
+          dryRun,
+          refused,
+        );
+        return { dataHandles: [...plans, ...runs] };
+      },
+    },
+    revokeAccess: {
+      description:
+        "Remove the swamp-patch access login from each selected machine through access.provisionSshModel, which must differ from sshModel. Only what @dmc/patch installed goes: the account and its group when the marker and token show that it made them, the sudoers grant, the managed cache and docker files. Dry run unless dryRun is false; a dry run contacts no host. Every host gets an accessRun record. A failed host fails the run after all hosts are tried.",
+      arguments: z.object({
+        hosts: z.array(z.string()).optional().describe(
+          "Limit to these hosts (default: every machine)",
+        ),
+        dryRun: z.boolean().default(true).describe(
+          "Write a dry-run record per host, and contact no host (default true)",
+        ),
+      }),
+      execute: async (
+        args: { hosts?: string[]; dryRun: boolean },
+        context: Ctx,
+      ) => {
+        const { access, targets } = accessTargets(
+          context.globalArgs,
+          args.hosts,
+        );
+        // Only an explicit false applies. A missing value is a dry run.
+        const dryRun = args.dryRun !== false;
+        const script = revokeScript(access.user);
+        const scriptSha256 = await sha256Hex(script);
+        const jobs: AccessJob[] = targets.map(({ host }) => ({
+          host,
+          script,
+          scriptSha256,
+        }));
+        context.logger.info(
+          "revokeAccess ({mode}) of {count} machine(s) through {model}",
+          {
+            mode: dryRun ? "dry run" : "apply",
+            count: targets.length,
+            model: access.provisionSshModel,
+          },
+        );
+        const runs = await runAccess(
+          context,
+          "revoke",
+          jobs,
+          access.provisionSshModel,
+          dryRun,
+        );
+        return { dataHandles: runs };
+      },
+    },
+    auditAccess: {
+      description:
+        "Read-only audit of the swamp-patch access login on each selected machine. Probes each host as the patch login (through sshModel, no sudo) and as root (through access.provisionSshModel), " +
+        "reads the effective privileges of the API token behind each VM / CT snapshot and each proxmox-cluster health check (the node model's permissions method, once per model: api-token-extra critical, api-token-missing and api-token-unread high; " +
+        "Sys.Audit on / without propagation is allowed only for a model some machine's proxmox-cluster check uses, and required on that machine), " +
+        "evaluates the findings with the machine's accepted risks, and writes one accessAudit record per host. Never changes a host. After every host is written, the run fails when a host has a finding at or above failOn (none never fails).",
+      arguments: z.object({
+        hosts: z.array(z.string()).optional().describe(
+          "Limit to these hosts (default: every machine)",
+        ),
+        failOn: FailOn.default("high").describe(
+          "Fail the run when a host has a finding at or above this severity, after every host is written; none never fails (default high, so a host whose probes did not run also fails)",
+        ),
+      }),
+      execute: async (
+        args: { hosts?: string[]; failOn?: z.infer<typeof FailOn> },
+        context: Ctx,
+      ) => {
+        // An unknown state must not pass: probe-failed / probe-invalid are high.
+        const failOn = args.failOn ?? "high";
+        const { access, targets } = accessTargets(
+          context.globalArgs,
+          args.hosts,
+        );
+        const { sshModel } = context.globalArgs;
+        const hosts = targets.map((t) => t.host);
+        if (hosts.length === 0) {
+          context.logger.info(
+            "auditAccess: no machines selected, nothing to audit",
+            {},
+          );
+          return { dataHandles: [] };
+        }
+        const machines = context.globalArgs.machines.filter((m) =>
+          hosts.includes(m.host)
+        );
+        // The OS policy is resolved before any probe: an inconsistent one is a config error.
+        // autoUpdates and the sudo capabilities are what accessTargets provisions, so the
+        // audit checks that same scope and that same required set.
+        const policies = new Map(
+          machines.map((m) => {
+            const caps = capabilitiesFor(m, context.globalArgs);
+            return [m.host, {
+              policy: effectivePolicy(m, context.globalArgs).policy,
+              autoUpdates: caps.autoUpdates,
+              sudo: { osUpgrade: caps.osUpgrade, reboot: caps.reboot },
+            }];
+          }),
+        );
+        const swamp = methodSwamp(context);
+        const userProbes = await runUserProbe(sshModel, hosts, swamp);
+        const rootProbes = await runRootProbe(context, access, hosts);
+        // The API tokens each machine uses (snapshots, proxmox-cluster checks), read once
+        // per node model. Sys.Audit on / is judged against the whole fleet's checks.
+        const tokenUses = new Map(
+          machines.map((m) => [
+            m.host,
+            apiTokenUses(m, context.globalArgs.machines),
+          ]),
+        );
+        const tokenPerms = await readTokenPermissions(
+          [...tokenUses.values()].flatMap((uses) => uses.map((u) => u.model)),
+          swamp,
+        );
+        const now = new Date();
+        context.logger.info("Auditing the access of {count} machine(s)", {
+          count: machines.length,
+        });
+        const handles: Array<{ name: string }> = [];
+        const failed: string[] = [];
+        for (const machine of machines) {
+          const { host } = machine;
+          const user = userProbes.get(host)!;
+          const root = rootProbes.get(host)!;
+          // Part of the expected grants. A refused plug-in adds nothing here; the
+          // privileges-declared check reports it.
+          const plugins = await pluginPrivilegesFor(machine, swamp);
+          const audit = await evaluateAudit({
+            host,
+            user: access.user,
+            publicKey: access.publicKey,
+            from: machine.from ?? access.from,
+            docker: !!machine.docker,
+            userProbe: user.probe,
+            userProbeError: user.error,
+            rootProbe: root.probe,
+            rootProbeError: root.error,
+            machine: {
+              unsafe: machine.unsafe,
+              trustRemote: machine.trustRemote,
+              acceptedRisks: machine.acceptedRisks,
+              osUpdatePolicy: policies.get(host)?.policy,
+              autoUpdates: policies.get(host)?.autoUpdates,
+              dockerProjects: dockerProjectsFor(machine),
+              pluginCommands: plugins.commands,
+              sudo: policies.get(host)?.sudo,
+              apiTokens: (tokenUses.get(host) ?? []).map((u) => ({
+                ...u,
+                ...tokenPerms.get(u.model)!,
+              })),
+            },
+            now,
+          });
+          const failing = failingFindings(audit.findings, failOn);
+          handles.push(
+            await context.writeResource("accessAudit", `access-audit-${host}`, {
+              host,
+              auditedAt: now.toISOString(),
+              ok: failing.length === 0,
+              findings: audit.findings,
+              acceptedRisks: audit.acceptedRisks,
+              summary: audit.summary,
+              userProbe: user.probe,
+              rootProbe: root.probe,
+              userProbeError: user.error,
+              rootProbeError: root.error,
+              pluginGrants: plugins.commands.map(sudoersTemplate),
+            }),
+          );
+          const s = audit.summary;
+          context.logger.info(
+            "access audit of {host}: {critical} critical, {high} high, {warning} warning, {info} info, {accepted} accepted, {overdue} overdue",
+            {
+              host,
+              critical: s.critical,
+              high: s.high,
+              warning: s.warning,
+              info: s.info,
+              accepted: s.accepted,
+              overdue: s.overdue,
+            },
+          );
+          for (const f of audit.findings) {
+            if (f.severity === "critical" || f.severity === "high") {
+              context.logger.warn("{host} {id}: {message}", {
+                host,
+                id: f.id,
+                message: f.message,
+              });
+            }
+          }
+          if (failing.length > 0) {
+            failed.push(`${host}: ${failing.map((f) => f.id).join(", ")}`);
+          }
+        }
+        if (failed.length > 0) {
+          throw new Error(
+            `access audit failed on ${
+              failed.join("; ")
+            }; the accessAudit records hold the detail`,
+          );
+        }
+        return { dataHandles: handles };
       },
     },
   },
