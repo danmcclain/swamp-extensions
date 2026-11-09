@@ -18,9 +18,11 @@ const GlobalArgsSchema = z.object({
     "Cloud console ID to target. When mode='cloud' and omitted, all consoles " +
       "visible to the key are discovered and scanned.",
   ),
-  verifyTls: z.boolean().default(true).describe(
-    "Verify the console's TLS certificate in local mode. Set false for the " +
-      "self-signed certificate on a factory UDM (routes calls through curl).",
+  caCert: z.string().optional().describe(
+    "PEM certificate(s) to trust for a console with a self-signed TLS " +
+      "certificate (local mode only). Trusted in addition to the system " +
+      "roots; the host name is still checked. Not needed when the console " +
+      "has a publicly trusted certificate.",
   ),
 });
 
@@ -178,69 +180,148 @@ const SiteClientsSchema = z.object({
   clients: z.array(ClientSchema),
 });
 
+const NetworkDomainResultSchema = z.object({
+  networkId: z.string(),
+  networkName: z.string(),
+  vlanId: z.number().optional(),
+  currentDomain: z.string().optional().describe(
+    "Domain name before the run (empty or absent when none is set)",
+  ),
+  newDomain: z.string(),
+  action: z.enum(["change", "unchanged"]),
+  applied: z.boolean().describe("True when this run sent the update"),
+  verified: z.boolean().optional().describe(
+    "Live runs: re-read shows the new domain and no other field changed",
+  ),
+});
+
+const NetworkDomainChangeSchema = z.object({
+  ranAt: z.string(),
+  mode: z.enum(["local", "cloud"]),
+  target: z.string(),
+  consoleId: z.string().optional(),
+  consoleShortname: z.string().optional(),
+  siteId: z.string(),
+  siteName: z.string(),
+  domain: z.string(),
+  dryRun: z.boolean(),
+  changeCount: z.number().describe(
+    "Networks whose domain differs from the requested one",
+  ),
+  networks: z.array(NetworkDomainResultSchema),
+});
+
+const DnsRecordResultSchema = z.object({
+  name: z.string(),
+  ipv4Address: z.string(),
+  ttlSeconds: z.number(),
+  action: z.enum(["create", "update", "unchanged"]),
+  policyId: z.string().optional(),
+  currentIpv4Address: z.string().optional(),
+  currentTtlSeconds: z.number().optional(),
+  currentEnabled: z.boolean().optional(),
+  applied: z.boolean().describe("True when this run sent the create/update"),
+  verified: z.boolean().optional().describe(
+    "Live runs: re-read shows exactly this record and no other field changed",
+  ),
+});
+
+const DnsRecordChangeSchema = z.object({
+  ranAt: z.string(),
+  mode: z.enum(["local", "cloud"]),
+  target: z.string(),
+  consoleId: z.string().optional(),
+  consoleShortname: z.string().optional(),
+  siteId: z.string(),
+  siteName: z.string(),
+  dryRun: z.boolean(),
+  changeCount: z.number().describe("Records to create or update"),
+  records: z.array(DnsRecordResultSchema),
+});
+
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 interface RequestOptions {
-  /** Route through curl (-k) for a self-signed local cert instead of fetch. */
-  insecure?: boolean;
+  /** PEM certificate(s) to trust in addition to the system roots. */
+  caCert?: string;
   /** JSON request body for POST/PUT/PATCH. */
   body?: unknown;
 }
 
 // ── pure helpers (unit-tested in unifi_networks_test.ts) ──────────────────────
 
+const PEM_CERT_RE =
+  /^\s*(?:-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*)+$/;
+
 /**
- * Build the curl argv for a request. `-k` skips TLS verification (self-signed
- * UDM cert); `-w "\n%{http_code}"` appends the status on its own trailing line
- * so the caller can recover it from stdout. A body adds the JSON content type.
+ * The caCert to trust, or undefined when none is set. Fails closed: a caCert
+ * that is still an unresolved ${{ }} expression or is not a PEM certificate
+ * bundle is an error, and so is a caCert in cloud mode (the cloud proxy has a
+ * publicly trusted certificate). Certificate checks can never be turned off.
  * Exported for testing.
  */
-export function buildCurlArgs(
-  method: string,
-  url: string,
-  apiKey: string,
-  body?: unknown,
-): string[] {
-  const args = [
-    "-sk",
-    "-X",
-    method,
-    "--connect-timeout",
-    "10",
-    "-H",
-    `X-API-KEY: ${apiKey}`,
-    "-H",
-    "Accept: application/json",
-    "-w",
-    "\n%{http_code}",
-  ];
-  if (body !== undefined) {
-    args.push(
-      "-H",
-      "Content-Type: application/json",
-      "--data-binary",
-      JSON.stringify(body),
+export function resolveCaCert(
+  g: { mode: string; caCert?: string },
+): string | undefined {
+  const ca = g.caCert;
+  if (ca === undefined) return undefined;
+  if (g.mode !== "local") {
+    throw new Error(
+      "caCert applies only to mode='local'; the cloud proxy has a publicly " +
+        "trusted certificate",
     );
   }
-  args.push(url);
-  return args;
+  if (ca.includes("${{")) {
+    throw new Error(
+      "caCert is still an unresolved ${{ }} expression; check the reference",
+    );
+  }
+  if (!PEM_CERT_RE.test(ca)) {
+    throw new Error(
+      "caCert is not a PEM certificate bundle (-----BEGIN CERTIFICATE----- ...)",
+    );
+  }
+  return ca;
 }
 
 /**
- * Split curl stdout (body followed by "\n%{http_code}") into status + body.
- * Uses the LAST newline so a JSON body containing newlines is preserved, and
- * tolerates an empty body (e.g. a 204). Exported for testing.
+ * Turn a fetch failure into an actionable error. A TLS failure says how to
+ * fix it: set caCert for a self-signed console certificate, or check that
+ * caCert signs the certificate and that the certificate names the host.
+ * Exported for testing.
  */
-export function parseCurlOutput(raw: string): { status: number; body: string } {
-  const nl = raw.lastIndexOf("\n");
-  if (nl < 0) return { status: parseInt(raw, 10), body: "" };
-  return { status: parseInt(raw.slice(nl + 1), 10), body: raw.slice(0, nl) };
+export function describeFetchError(
+  method: string,
+  url: string,
+  err: unknown,
+  caCertSet: boolean,
+): Error {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/CaUsedAsEndEntity/.test(msg)) {
+    return new Error(
+      `${method} ${url}: TLS check failed (${msg}). The console presents a ` +
+        "CA certificate (basicConstraints CA:TRUE) as its server " +
+        "certificate, which the TLS library refuses even with caCert. Give " +
+        "the console a server certificate (CA:FALSE), or one signed by a CA " +
+        "that you set as caCert.",
+    );
+  }
+  if (/certificate|tls|ssl|UnknownIssuer|NotValidForName/i.test(msg)) {
+    return new Error(
+      `${method} ${url}: TLS check failed (${msg}). ` +
+        (caCertSet
+          ? "caCert does not sign the console certificate, or the " +
+            "certificate does not name the host."
+          : "For a console with a self-signed certificate, set caCert to " +
+            "its PEM certificate."),
+    );
+  }
+  return new Error(`${method} ${url} failed: ${msg}`);
 }
 
 /**
  * Enforce a 2xx status and parse the JSON body, returning null for an empty
- * body (e.g. a 204 from DELETE). Shared by both transports so they behave
- * identically. Exported for testing.
+ * body (e.g. a 204 from DELETE). Exported for testing.
  */
 export function finalizeResponse(
   method: string,
@@ -254,40 +335,13 @@ export function finalizeResponse(
   return text.trim() ? (JSON.parse(text) as Record<string, unknown>) : null;
 }
 
-// ── transports ────────────────────────────────────────────────────────────────
+// ── transport ─────────────────────────────────────────────────────────────────
 
 /**
- * Issue an HTTP request via curl. Factory UDMs present a self-signed cert and
- * Deno's fetch cannot skip TLS verification, so the insecure local path shells
- * out to curl with -k. Returns the HTTP status and raw body; status enforcement
- * is left to apiRequest so both transports behave identically.
- */
-async function curlRequest(
-  method: string,
-  url: string,
-  apiKey: string,
-  body?: unknown,
-): Promise<{ status: number; body: string }> {
-  const cmd = new Deno.Command("curl", {
-    args: buildCurlArgs(method, url, apiKey, body),
-    stdout: "piped",
-    stderr: "piped",
-  });
-  const out = await cmd.output();
-  if (out.code !== 0) {
-    throw new Error(
-      `curl ${method} ${url} failed (exit ${out.code}): ${
-        new TextDecoder().decode(out.stderr)
-      }`,
-    );
-  }
-  return parseCurlOutput(new TextDecoder().decode(out.stdout));
-}
-
-/**
- * Single request core shared by every verb (GET/POST/PUT/PATCH/DELETE) over
- * both transports (fetch when secure, curl when insecure). Verb helpers below
- * are thin wrappers over this.
+ * Single request core shared by every verb (GET/POST/PUT/PATCH/DELETE). Uses
+ * fetch and always verifies the TLS certificate and host name. With caCert,
+ * a per-request HTTP client also trusts that certificate (for a console with
+ * a self-signed certificate); the client is closed on every path.
  */
 async function apiRequest(
   method: string,
@@ -295,44 +349,62 @@ async function apiRequest(
   apiKey: string,
   opts: RequestOptions = {},
 ): Promise<Record<string, unknown> | null> {
-  const { insecure = false, body } = opts;
+  const { caCert, body } = opts;
+  const headers: Record<string, string> = {
+    "X-API-KEY": apiKey,
+    "Accept": "application/json",
+  };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
 
-  let status: number;
-  let text: string;
-  if (insecure) {
-    ({ status, body: text } = await curlRequest(method, url, apiKey, body));
-  } else {
-    const headers: Record<string, string> = {
-      "X-API-KEY": apiKey,
-      "Accept": "application/json",
-    };
-    if (body !== undefined) headers["Content-Type"] = "application/json";
-    const resp = await fetch(url, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    status = resp.status;
-    text = await resp.text();
+  const client = caCert
+    ? Deno.createHttpClient({ caCerts: [caCert] })
+    : undefined;
+  try {
+    let resp: Response;
+    try {
+      resp = await fetch(url, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        client,
+      });
+    } catch (e) {
+      throw describeFetchError(method, url, e, caCert !== undefined);
+    }
+    const text = await resp.text();
+    return finalizeResponse(method, url, resp.status, text);
+  } finally {
+    client?.close();
   }
-
-  return finalizeResponse(method, url, status, text);
 }
 
-// Verb helpers over the shared core. GET/DELETE are the verbs in use today;
-// POST/PUT/PATCH writes are a one-line apiRequest(...) call away when a
-// create/update method is added (the API supports them, e.g. PATCH policies).
-const apiGet = (url: string, apiKey: string, insecure = false) =>
-  apiRequest("GET", url, apiKey, { insecure }).then((r) => r ?? {});
+// Verb helpers over the shared core. PATCH is a one-line apiRequest(...) call
+// away when a patch method is added.
+const apiGet = (url: string, apiKey: string, caCert?: string) =>
+  apiRequest("GET", url, apiKey, { caCert }).then((r) => r ?? {});
 
-const apiDelete = (url: string, apiKey: string, insecure: boolean) =>
-  apiRequest("DELETE", url, apiKey, { insecure }).then(() => undefined);
+const apiPost = (
+  url: string,
+  apiKey: string,
+  body: unknown,
+  caCert: string | undefined,
+) => apiRequest("POST", url, apiKey, { caCert, body }).then((r) => r ?? {});
+
+const apiPut = (
+  url: string,
+  apiKey: string,
+  body: unknown,
+  caCert: string | undefined,
+) => apiRequest("PUT", url, apiKey, { caCert, body }).then((r) => r ?? {});
+
+const apiDelete = (url: string, apiKey: string, caCert: string | undefined) =>
+  apiRequest("DELETE", url, apiKey, { caCert }).then(() => undefined);
 
 async function fetchAllPages(
   base: string,
   path: string,
   apiKey: string,
-  insecure: boolean,
+  caCert: string | undefined,
 ): Promise<Array<Record<string, unknown>>> {
   const items: Array<Record<string, unknown>> = [];
   let offset = 0;
@@ -341,7 +413,7 @@ async function fetchAllPages(
     const page = await apiGet(
       `${base}${path}?offset=${offset}&limit=${limit}`,
       apiKey,
-      insecure,
+      caCert,
     );
     const data = (page.data ?? []) as Array<Record<string, unknown>>;
     items.push(...data);
@@ -521,6 +593,295 @@ export function ipv4InSubnet(
   return (a & mask) === (b & mask);
 }
 
+// ── network domain name (pure, unit-tested) ───────────────────────────────────
+
+/**
+ * True for an RFC 1123 DNS name: dot-separated labels of 1–63 letters, digits
+ * or hyphens, no label starting or ending with a hyphen, 253 chars at most.
+ * A trailing dot (empty last label) is rejected.
+ */
+export function isValidDomainName(domain: string): boolean {
+  if (domain.length === 0 || domain.length > 253) return false;
+  return domain.split(".").every((label) =>
+    /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i.test(label)
+  );
+}
+
+/**
+ * Resolve requested network names to networks by exact, case-insensitive
+ * name. Fails closed: an empty list, a blank name, an unknown name or a name
+ * that matches more than one network throws, listing every problem at once,
+ * before any change is made. Repeated names are selected once.
+ */
+export function selectNetworksByName<T extends { id: string; name: string }>(
+  networks: T[],
+  names: string[],
+): T[] {
+  if (names.length === 0) {
+    throw new Error("networks must name at least one network");
+  }
+  const errors: string[] = [];
+  const selected: T[] = [];
+  const seen = new Set<string>();
+  for (const raw of names) {
+    const want = raw.trim().toLowerCase();
+    if (!want) {
+      errors.push("a network name is empty");
+      continue;
+    }
+    if (seen.has(want)) continue;
+    seen.add(want);
+    const matches = networks.filter((n) => n.name.toLowerCase() === want);
+    if (matches.length === 0) {
+      errors.push(`unknown network "${raw}"`);
+    } else if (matches.length > 1) {
+      errors.push(
+        `ambiguous network "${raw}" matches ${matches.length} networks ` +
+          `(${matches.map((m) => `${m.name} ${m.id}`).join(", ")})`,
+      );
+    } else {
+      selected.push(matches[0]);
+    }
+  }
+  if (errors.length > 0) {
+    throw new Error(
+      `Network selection failed: ${errors.join("; ")}. Known networks: ` +
+        networks.map((n) => n.name).join(", "),
+    );
+  }
+  return selected;
+}
+
+/**
+ * Fields the Get Network Details response carries that the Update Network
+ * body does not accept (the update DTO is the details DTO minus these).
+ */
+const NETWORK_READ_ONLY_FIELDS = ["id", "metadata", "default"];
+
+/** JSON path of the DHCP domain name inside a network details object. */
+export const DOMAIN_NAME_PATH =
+  "ipv4Configuration.dhcpConfiguration.domainName";
+
+/** The planned domain-name change for one network. */
+export interface NetworkDomainPlan {
+  networkId: string;
+  networkName: string;
+  vlanId?: number;
+  currentDomain?: string;
+  newDomain: string;
+  action: "change" | "unchanged";
+  /** Full Update Network (PUT) body: the details with only domainName changed. */
+  body: Obj;
+}
+
+/**
+ * Plan a domain-name change from a Get Network Details object. Update Network
+ * is a full replace (an omitted optional block such as dhcpConfiguration or
+ * ipv6Configuration turns that feature off), so the body is the complete
+ * current object with the read-only fields removed and only domainName set.
+ * Throws unless the network is gateway-managed with a DHCP server, because
+ * the domain name is a setting of the gateway's DHCP server.
+ */
+export function planNetworkDomain(
+  detail: Obj,
+  domain: string,
+): NetworkDomainPlan {
+  const name = String(detail.name ?? detail.id);
+  if (detail.management !== "GATEWAY") {
+    throw new Error(
+      `Network "${name}" is ${detail.management}-managed; only GATEWAY ` +
+        `networks have a gateway DHCP server with a domain name`,
+    );
+  }
+  const dhcp = (detail.ipv4Configuration as Obj | undefined)
+    ?.dhcpConfiguration as Obj | undefined;
+  if (!dhcp || dhcp.mode !== "SERVER") {
+    throw new Error(
+      `Network "${name}" has no gateway DHCP server (DHCP mode ` +
+        `${dhcp?.mode ?? "none"}); the domain name is a DHCP server setting`,
+    );
+  }
+  const body = structuredClone(detail);
+  for (const field of NETWORK_READ_ONLY_FIELDS) delete body[field];
+  ((body.ipv4Configuration as Obj).dhcpConfiguration as Obj).domainName =
+    domain;
+  const currentDomain = dhcp.domainName as string | undefined;
+  return {
+    networkId: detail.id as string,
+    networkName: name,
+    vlanId: detail.vlanId as number | undefined,
+    currentDomain,
+    newDomain: domain,
+    action: currentDomain === domain ? "unchanged" : "change",
+    body,
+  };
+}
+
+/**
+ * Dotted paths whose values differ between two JSON values, skipping the
+ * paths in `ignore`. Arrays compare by index; a key present on one side only
+ * counts as a difference. Used to prove an update changed nothing else.
+ */
+export function diffPaths(
+  a: unknown,
+  b: unknown,
+  ignore: Set<string> = new Set(),
+  path = "",
+): string[] {
+  if (ignore.has(path)) return [];
+  const isObj = (v: unknown): v is Obj =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+  const join = (key: string | number) => (path ? `${path}.${key}` : `${key}`);
+  if (isObj(a) && isObj(b)) {
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    return [...keys].flatMap((k) => {
+      const p = join(k);
+      if (ignore.has(p)) return [];
+      if (!(k in a) || !(k in b)) return [p];
+      return diffPaths(a[k], b[k], ignore, p);
+    });
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return [path || "(root)"];
+    return a.flatMap((v, i) => diffPaths(v, b[i], ignore, join(i)));
+  }
+  return a === b ? [] : [path || "(root)"];
+}
+
+// ── local DNS A records (pure, unit-tested) ───────────────────────────────────
+
+/** One requested local A record: fully qualified name → IPv4 address. */
+export interface DnsRecordRequest {
+  name: string;
+  ipv4Address: string;
+}
+
+/** The planned change for one local A record. */
+export interface DnsARecordPlan {
+  name: string;
+  ipv4Address: string;
+  ttlSeconds: number;
+  action: "create" | "update" | "unchanged";
+  policyId?: string;
+  currentIpv4Address?: string;
+  currentTtlSeconds?: number;
+  currentEnabled?: boolean;
+  /** Existing DNS policy object (update/unchanged only). */
+  before?: Obj;
+  /** Full Create/Update DNS Policy body. */
+  body: Obj;
+}
+
+/** Fields of a DNS policy that the create/update body does not accept. */
+const DNS_POLICY_READ_ONLY_FIELDS = ["id", "metadata"];
+
+/** Record types that cannot share a name with an A record. */
+const DNS_CONFLICTING_TYPES = new Set(["CNAME_RECORD", "FORWARD_DOMAIN"]);
+
+/**
+ * Plan local A records against the site's existing DNS policies. Fails
+ * closed, listing every problem at once before any change: an invalid name
+ * or IPv4 address, a name requested twice, a name that already has a CNAME
+ * or forward-domain policy, or a name with more than one A record. A name
+ * with no A record is created; one A record is updated in place (full body,
+ * only address, TTL and enabled changed) unless it already matches.
+ */
+export function planDnsARecords(
+  existing: Obj[],
+  requests: DnsRecordRequest[],
+  ttlSeconds: number,
+): DnsARecordPlan[] {
+  if (requests.length === 0) {
+    throw new Error("records must list at least one record");
+  }
+  const errors: string[] = [];
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0 || ttlSeconds > 86400) {
+    errors.push(`ttlSeconds ${ttlSeconds} is not an integer from 0 to 86400`);
+  }
+  const plans: DnsARecordPlan[] = [];
+  const seen = new Set<string>();
+  for (const req of requests) {
+    const name = req.name.trim().toLowerCase();
+    const ip = req.ipv4Address.trim();
+    if (!isValidDomainName(name) || name.length > 127) {
+      errors.push(`"${req.name}" is not a valid DNS name (127 chars max)`);
+      continue;
+    }
+    if (ipv4ToInt(ip) === null) {
+      errors.push(`"${req.ipv4Address}" for ${name} is not an IPv4 address`);
+      continue;
+    }
+    if (seen.has(name)) {
+      errors.push(`${name} is requested more than once`);
+      continue;
+    }
+    seen.add(name);
+
+    const same = existing.filter((p) =>
+      String(p.domain ?? "").toLowerCase() === name
+    );
+    const conflicts = same.filter((p) =>
+      DNS_CONFLICTING_TYPES.has(String(p.type))
+    );
+    const aRecords = same.filter((p) => p.type === "A_RECORD");
+    if (conflicts.length > 0) {
+      errors.push(
+        `${name} already has a ${
+          conflicts.map((p) => `${p.type} ${p.id}`).join(", ")
+        } policy`,
+      );
+      continue;
+    }
+    if (aRecords.length > 1) {
+      errors.push(
+        `${name} has ${aRecords.length} A records ` +
+          `(${aRecords.map((p) => `${p.ipv4Address} ${p.id}`).join(", ")})`,
+      );
+      continue;
+    }
+
+    if (aRecords.length === 0) {
+      plans.push({
+        name,
+        ipv4Address: ip,
+        ttlSeconds,
+        action: "create",
+        body: {
+          type: "A_RECORD",
+          enabled: true,
+          domain: name,
+          ipv4Address: ip,
+          ttlSeconds,
+        },
+      });
+      continue;
+    }
+
+    const before = aRecords[0];
+    const body = structuredClone(before);
+    for (const field of DNS_POLICY_READ_ONLY_FIELDS) delete body[field];
+    Object.assign(body, { enabled: true, ipv4Address: ip, ttlSeconds });
+    const matches = before.ipv4Address === ip &&
+      before.ttlSeconds === ttlSeconds && before.enabled === true;
+    plans.push({
+      name,
+      ipv4Address: ip,
+      ttlSeconds,
+      action: matches ? "unchanged" : "update",
+      policyId: before.id as string,
+      currentIpv4Address: before.ipv4Address as string | undefined,
+      currentTtlSeconds: before.ttlSeconds as number | undefined,
+      currentEnabled: before.enabled as boolean | undefined,
+      before,
+      body,
+    });
+  }
+  if (errors.length > 0) {
+    throw new Error(`DNS record plan failed: ${errors.join("; ")}`);
+  }
+  return plans;
+}
+
 /** A network's IPv4 subnet plus the identity we map clients onto. */
 interface Subnet {
   networkId: string;
@@ -612,7 +973,8 @@ interface Target {
   target: string;
   consoleId?: string;
   consoleShortname?: string;
-  insecure: boolean;
+  /** Extra certificate to trust (local mode only). */
+  caCert?: string;
 }
 
 function proxyBase(consoleId: string): string {
@@ -621,6 +983,8 @@ function proxyBase(consoleId: string): string {
 
 /** Resolve the set of consoles to scan from the configured mode + args. */
 async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
+  // Validates caCert first, so a bad or misplaced one fails before any call.
+  const caCert = resolveCaCert(g);
   if (g.mode === "local") {
     if (!g.host) {
       throw new Error("mode='local' requires 'host' (the console IP/hostname)");
@@ -628,7 +992,7 @@ async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
     return [{
       base: `https://${g.host}/proxy/network/integration`,
       target: g.host,
-      insecure: !g.verifyTls,
+      caCert,
     }];
   }
 
@@ -638,7 +1002,6 @@ async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
       base: proxyBase(g.consoleId),
       target: g.consoleId,
       consoleId: g.consoleId,
-      insecure: false,
     }];
   }
 
@@ -654,8 +1017,50 @@ async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
     target: c.id,
     consoleId: c.id,
     consoleShortname: c.shortname,
-    insecure: false,
   }));
+}
+
+/**
+ * Resolve exactly one console for a write method, narrowed by consoleId when
+ * given. Writes never fan out over consoles by accident.
+ */
+async function resolveSingleTarget(
+  g: GlobalArgs,
+  method: string,
+  consoleId?: string,
+): Promise<Target> {
+  let targets = await resolveTargets(g);
+  if (consoleId) targets = targets.filter((t) => t.consoleId === consoleId);
+  if (targets.length !== 1) {
+    throw new Error(
+      `${method} needs exactly one target console; resolved ` +
+        `${targets.length}. Pass consoleId to disambiguate.`,
+    );
+  }
+  return targets[0];
+}
+
+/**
+ * Resolve exactly one site on a console for a write method: the given siteId,
+ * or the only site when the console has one.
+ */
+async function resolveSingleSite(
+  t: Target,
+  apiKey: string,
+  siteId?: string,
+): Promise<{ siteId: string; siteName: string }> {
+  const sites = await fetchAllPages(t.base, "/v1/sites", apiKey, t.caCert);
+  const candidates = siteId ? sites.filter((s) => s.id === siteId) : sites;
+  if (candidates.length !== 1) {
+    throw new Error(
+      siteId
+        ? `Site ${siteId} not found on ${t.target}`
+        : `${t.target} has ${sites.length} sites; pass siteId (one of ` +
+          `${sites.map((s) => `${s.name} ${s.id}`).join(", ")})`,
+    );
+  }
+  const id = candidates[0].id as string;
+  return { siteId: id, siteName: (candidates[0].name as string) ?? id };
 }
 
 /**
@@ -679,6 +1084,9 @@ function instanceName(
 
 interface Ctx {
   globalArgs: GlobalArgs;
+  logger: {
+    info: (message: string, props?: Record<string, unknown>) => void;
+  };
   writeResource: (
     specName: string,
     name: string,
@@ -688,8 +1096,21 @@ interface Ctx {
 
 export const model = {
   type: "@dmc/unifi-networks",
-  version: "2026.07.07.1",
+  version: "2026.11.09.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.11.09.1",
+      description:
+        "Remove verifyTls: the curl -k transport is gone, and a console " +
+        "with a self-signed certificate is trusted with caCert instead. " +
+        "Adds setNetworkDomain and setDnsRecords.",
+      upgradeAttributes: (old: Record<string, unknown>) => {
+        const { verifyTls: _verifyTls, ...rest } = old;
+        return rest;
+      },
+    },
+  ],
   resources: {
     consoles: {
       description: "UniFi consoles visible to the cloud API key",
@@ -723,6 +1144,22 @@ export const model = {
       lifetime: "infinite",
       garbageCollection: 10,
     },
+    networkDomainChange: {
+      description:
+        "Plan or result of a setNetworkDomain run: per network, the current " +
+        "and new DHCP domain name and whether it was applied and verified",
+      schema: NetworkDomainChangeSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    dnsRecordChange: {
+      description:
+        "Plan or result of a setDnsRecords run: per record, the current and " +
+        "new address and TTL and whether it was applied and verified",
+      schema: DnsRecordChangeSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
   },
   methods: {
     consoles: {
@@ -738,6 +1175,7 @@ export const model = {
               "is a cloud API feature)",
           );
         }
+        context.logger.info("consoles: listing consoles visible to the key");
         const hostsData = await apiGet(`${CLOUD_BASE}/v1/hosts`, g.apiKey);
         const consoles = ((hostsData.data ?? []) as Array<
           Record<string, unknown>
@@ -747,6 +1185,9 @@ export const model = {
           fetchedAt: new Date().toISOString(),
           consoleCount: consoles.length,
           consoles,
+        });
+        context.logger.info("consoles: found {count} console(s)", {
+          count: consoles.length,
         });
         return { dataHandles: [handle] };
       },
@@ -760,6 +1201,10 @@ export const model = {
       execute: async (_args: Record<string, never>, context: Ctx) => {
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
+        context.logger.info("{method}: scanning {count} console(s)", {
+          method: "scan",
+          count: targets.length,
+        });
         const disambiguate = targets.length > 1;
         const dataHandles = [];
 
@@ -768,7 +1213,7 @@ export const model = {
             t.base,
             "/v1/sites",
             g.apiKey,
-            t.insecure,
+            t.caCert,
           );
 
           for (const site of sites) {
@@ -778,7 +1223,7 @@ export const model = {
               t.base,
               `/v1/sites/${siteId}/networks`,
               g.apiKey,
-              t.insecure,
+              t.caCert,
             );
 
             const handle = await context.writeResource(
@@ -800,6 +1245,10 @@ export const model = {
           }
         }
 
+        context.logger.info("{method}: wrote {count} site snapshot(s)", {
+          method: "scan",
+          count: dataHandles.length,
+        });
         return { dataHandles };
       },
     },
@@ -812,6 +1261,10 @@ export const model = {
       execute: async (_args: Record<string, never>, context: Ctx) => {
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
+        context.logger.info("{method}: scanning {count} console(s)", {
+          method: "scanFirewall",
+          count: targets.length,
+        });
         const disambiguate = targets.length > 1;
         const dataHandles = [];
 
@@ -820,7 +1273,7 @@ export const model = {
             t.base,
             "/v1/sites",
             g.apiKey,
-            t.insecure,
+            t.caCert,
           );
 
           for (const site of sites) {
@@ -831,13 +1284,13 @@ export const model = {
               t.base,
               `/v1/sites/${siteId}/firewall/zones`,
               g.apiKey,
-              t.insecure,
+              t.caCert,
             );
             const rawPolicies = await fetchAllPages(
               t.base,
               `/v1/sites/${siteId}/firewall/policies`,
               g.apiKey,
-              t.insecure,
+              t.caCert,
             );
 
             const zones = rawZones.map(mapZone);
@@ -869,6 +1322,10 @@ export const model = {
           }
         }
 
+        context.logger.info("{method}: wrote {count} site snapshot(s)", {
+          method: "scanFirewall",
+          count: dataHandles.length,
+        });
         return { dataHandles };
       },
     },
@@ -882,6 +1339,10 @@ export const model = {
       execute: async (_args: Record<string, never>, context: Ctx) => {
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
+        context.logger.info("{method}: scanning {count} console(s)", {
+          method: "scanWifi",
+          count: targets.length,
+        });
         const disambiguate = targets.length > 1;
         const dataHandles = [];
 
@@ -890,7 +1351,7 @@ export const model = {
             t.base,
             "/v1/sites",
             g.apiKey,
-            t.insecure,
+            t.caCert,
           );
 
           for (const site of sites) {
@@ -901,7 +1362,7 @@ export const model = {
               t.base,
               `/v1/sites/${siteId}/networks`,
               g.apiKey,
-              t.insecure,
+              t.caCert,
             );
             const netLookup: NetworkLookup = {};
             let defaultNet:
@@ -922,7 +1383,7 @@ export const model = {
               t.base,
               `/v1/sites/${siteId}/wifi/broadcasts`,
               g.apiKey,
-              t.insecure,
+              t.caCert,
             );
             const wifis = rawWifis.map((w) =>
               mapWifi(w, netLookup, defaultNet)
@@ -947,6 +1408,10 @@ export const model = {
           }
         }
 
+        context.logger.info("{method}: wrote {count} site snapshot(s)", {
+          method: "scanWifi",
+          count: dataHandles.length,
+        });
         return { dataHandles };
       },
     },
@@ -960,6 +1425,10 @@ export const model = {
       execute: async (_args: Record<string, never>, context: Ctx) => {
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
+        context.logger.info("{method}: scanning {count} console(s)", {
+          method: "scanClients",
+          count: targets.length,
+        });
         const disambiguate = targets.length > 1;
         const dataHandles = [];
 
@@ -968,7 +1437,7 @@ export const model = {
             t.base,
             "/v1/sites",
             g.apiKey,
-            t.insecure,
+            t.caCert,
           );
 
           for (const site of sites) {
@@ -981,14 +1450,14 @@ export const model = {
               t.base,
               `/v1/sites/${siteId}/networks`,
               g.apiKey,
-              t.insecure,
+              t.caCert,
             );
             const subnets: Subnet[] = [];
             for (const n of networks) {
               const detail = await apiGet(
                 `${t.base}/v1/sites/${siteId}/networks/${n.id}`,
                 g.apiKey,
-                t.insecure,
+                t.caCert,
               );
               const ipv4 = detail.ipv4Configuration as
                 | Record<string, unknown>
@@ -1010,7 +1479,7 @@ export const model = {
               t.base,
               `/v1/sites/${siteId}/clients`,
               g.apiKey,
-              t.insecure,
+              t.caCert,
             );
             const clients = rawClients.map((c) => mapClient(c, subnets));
 
@@ -1060,6 +1529,10 @@ export const model = {
           }
         }
 
+        context.logger.info("{method}: wrote {count} site snapshot(s)", {
+          method: "scanClients",
+          count: dataHandles.length,
+        });
         return { dataHandles };
       },
     },
@@ -1082,22 +1555,12 @@ export const model = {
         context: Ctx,
       ) => {
         const g = context.globalArgs;
-        let targets = await resolveTargets(g);
-        if (args.consoleId) {
-          targets = targets.filter((t) => t.consoleId === args.consoleId);
-        }
-        if (targets.length !== 1) {
-          throw new Error(
-            `deletePolicy needs exactly one target console; resolved ` +
-              `${targets.length}. Pass consoleId to disambiguate.`,
-          );
-        }
-        const t = targets[0];
+        const t = await resolveSingleTarget(g, "deletePolicy", args.consoleId);
         const policyUrl =
           `${t.base}/v1/sites/${args.siteId}/firewall/policies/${args.policyId}`;
 
         // Verify before destroying (rule #5): must exist and be user-defined
-        const policy = await apiGet(policyUrl, g.apiKey, t.insecure);
+        const policy = await apiGet(policyUrl, g.apiKey, t.caCert);
         const origin = (policy.metadata as Obj)?.origin;
         if (origin !== "USER_DEFINED") {
           throw new Error(
@@ -1106,8 +1569,382 @@ export const model = {
           );
         }
 
-        await apiDelete(policyUrl, g.apiKey, t.insecure);
+        context.logger.info("deletePolicy: deleting {policyId} ({name})", {
+          policyId: args.policyId,
+          name: policy.name,
+        });
+        await apiDelete(policyUrl, g.apiKey, t.caCert);
+        context.logger.info("deletePolicy: deleted {policyId}", {
+          policyId: args.policyId,
+        });
         return { dataHandles: [] };
+      },
+    },
+
+    setNetworkDomain: {
+      description:
+        "Set the DHCP domain name (UniFi 'Domain Name') on the named networks " +
+        "of one site in a single run. Fails closed: unknown or ambiguous " +
+        "names, an invalid domain, or a network without a gateway DHCP " +
+        "server stop the run before any change. dryRun defaults to true and " +
+        "only records each current and new value. A live run sends the full " +
+        "current network with only domainName changed, then re-reads each " +
+        "network and fails if anything else changed.",
+      arguments: z.object({
+        domain: z.string().describe(
+          "Domain name to set, e.g. lan.example (stored lowercase)",
+        ),
+        networks: z.array(z.string()).min(1).describe(
+          "Network names to change (exact match, case-insensitive)",
+        ),
+        dryRun: z.boolean().default(true).describe(
+          "true (default): change nothing, record the plan. false: apply it.",
+        ),
+        siteId: z.string().optional().describe(
+          "Site to change; required when the console has more than one site",
+        ),
+        consoleId: z.string().optional().describe(
+          "Console to target when the key sees more than one",
+        ),
+      }),
+      execute: async (
+        args: {
+          domain: string;
+          networks: string[];
+          dryRun?: boolean;
+          siteId?: string;
+          consoleId?: string;
+        },
+        context: Ctx,
+      ) => {
+        const g = context.globalArgs;
+        // Anything but an explicit false is a dry run.
+        const dryRun = args.dryRun !== false;
+        const domain = args.domain.trim().toLowerCase();
+        if (!isValidDomainName(domain)) {
+          throw new Error(`"${args.domain}" is not a valid DNS domain name`);
+        }
+
+        const t = await resolveSingleTarget(
+          g,
+          "setNetworkDomain",
+          args.consoleId,
+        );
+
+        const { siteId, siteName } = await resolveSingleSite(
+          t,
+          g.apiKey,
+          args.siteId,
+        );
+        const netBase = `${t.base}/v1/sites/${siteId}/networks`;
+
+        // Resolve and plan every network before any write, so a bad name or
+        // an unsupported network changes nothing.
+        const listed = await fetchAllPages(
+          t.base,
+          `/v1/sites/${siteId}/networks`,
+          g.apiKey,
+          t.caCert,
+        );
+        const selected = selectNetworksByName(
+          listed.map((n) => ({ id: n.id as string, name: n.name as string })),
+          args.networks,
+        );
+        const planned: Array<{ before: Obj; plan: NetworkDomainPlan }> = [];
+        for (const n of selected) {
+          const before = await apiGet(
+            `${netBase}/${n.id}`,
+            g.apiKey,
+            t.caCert,
+          );
+          planned.push({ before, plan: planNetworkDomain(before, domain) });
+        }
+
+        const results: Array<z.infer<typeof NetworkDomainResultSchema>> =
+          planned.map(({ plan }) => ({
+            networkId: plan.networkId,
+            networkName: plan.networkName,
+            vlanId: plan.vlanId,
+            currentDomain: plan.currentDomain,
+            newDomain: plan.newDomain,
+            action: plan.action,
+            applied: false,
+          }));
+
+        const record = () =>
+          context.writeResource(
+            "networkDomainChange",
+            instanceName(t, siteName, false),
+            {
+              ranAt: new Date().toISOString(),
+              mode: g.mode,
+              target: t.target,
+              consoleId: t.consoleId,
+              consoleShortname: t.consoleShortname,
+              siteId,
+              siteName,
+              domain,
+              dryRun,
+              changeCount: results.filter((r) => r.action === "change").length,
+              networks: results,
+            },
+          );
+
+        context.logger.info(
+          "setNetworkDomain: {changes} of {count} network(s) on site " +
+            "{siteName} need domain {domain} (dryRun {dryRun})",
+          {
+            changes: results.filter((r) => r.action === "change").length,
+            count: results.length,
+            siteName,
+            domain,
+            dryRun,
+          },
+        );
+
+        if (!dryRun) {
+          for (const [i, { before, plan }] of planned.entries()) {
+            if (plan.action === "unchanged") continue;
+            const url = `${netBase}/${plan.networkId}`;
+            context.logger.info(
+              "setNetworkDomain: setting {network} from {current} to {domain}",
+              {
+                network: plan.networkName,
+                current: plan.currentDomain || "(none)",
+                domain,
+              },
+            );
+            let after: Obj;
+            try {
+              await apiPut(url, g.apiKey, plan.body, t.caCert);
+              results[i].applied = true;
+              after = await apiGet(url, g.apiKey, t.caCert);
+            } catch (e) {
+              // Record which networks were already changed before failing.
+              await record();
+              throw e;
+            }
+            const stray = diffPaths(
+              before,
+              after,
+              new Set([DOMAIN_NAME_PATH]),
+            );
+            const got = ((after.ipv4Configuration as Obj | undefined)
+              ?.dhcpConfiguration as Obj | undefined)?.domainName;
+            results[i].verified = stray.length === 0 && got === domain;
+            if (!results[i].verified) {
+              await record();
+              throw new Error(
+                `Network "${plan.networkName}" updated but verification ` +
+                  `failed: domainName is ${got ?? "unset"}, other changed ` +
+                  `fields: ${stray.join(", ") || "none"}. Stopped before ` +
+                  `the remaining networks.`,
+              );
+            }
+          }
+        }
+
+        const handle = await record();
+        context.logger.info(
+          "setNetworkDomain: done, {applied} network(s) changed and verified",
+          { applied: results.filter((r) => r.applied).length },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    setDnsRecords: {
+      description:
+        "Create or update local DNS A records (UniFi DNS policies) on one " +
+        "site in a single run, e.g. names for hosts with static addresses. " +
+        "Fails closed: an invalid name or address, a repeated name, a name " +
+        "with a CNAME or forward-domain policy, or a name with more than one " +
+        "A record stops the run before any change. dryRun defaults to true " +
+        "and only records each current and new value. A live run creates " +
+        "missing records, updates differing ones in place (full body, only " +
+        "address, TTL and enabled changed), then re-reads all DNS policies " +
+        "and fails unless each name has exactly the requested A record.",
+      arguments: z.object({
+        records: z.array(z.object({
+          name: z.string().describe(
+            "Fully qualified name, e.g. fort.lan.example",
+          ),
+          ipv4Address: z.string().describe("IPv4 address, e.g. 192.0.2.50"),
+        })).min(1).describe("A records to set"),
+        ttlSeconds: z.number().int().min(0).max(86400).default(3600).describe(
+          "TTL for every record in this run (default 3600)",
+        ),
+        dryRun: z.boolean().default(true).describe(
+          "true (default): change nothing, record the plan. false: apply it.",
+        ),
+        siteId: z.string().optional().describe(
+          "Site to change; required when the console has more than one site",
+        ),
+        consoleId: z.string().optional().describe(
+          "Console to target when the key sees more than one",
+        ),
+      }),
+      execute: async (
+        args: {
+          records: DnsRecordRequest[];
+          ttlSeconds?: number;
+          dryRun?: boolean;
+          siteId?: string;
+          consoleId?: string;
+        },
+        context: Ctx,
+      ) => {
+        const g = context.globalArgs;
+        // Anything but an explicit false is a dry run.
+        const dryRun = args.dryRun !== false;
+        const ttl = args.ttlSeconds ?? 3600;
+
+        const t = await resolveSingleTarget(g, "setDnsRecords", args.consoleId);
+        const { siteId, siteName } = await resolveSingleSite(
+          t,
+          g.apiKey,
+          args.siteId,
+        );
+        const dnsPath = `/v1/sites/${siteId}/dns/policies`;
+
+        // Plan every record before any write.
+        const existing = await fetchAllPages(
+          t.base,
+          dnsPath,
+          g.apiKey,
+          t.caCert,
+        );
+        const plans = planDnsARecords(existing, args.records, ttl);
+
+        const results: Array<z.infer<typeof DnsRecordResultSchema>> = plans
+          .map((p) => ({
+            name: p.name,
+            ipv4Address: p.ipv4Address,
+            ttlSeconds: p.ttlSeconds,
+            action: p.action,
+            policyId: p.policyId,
+            currentIpv4Address: p.currentIpv4Address,
+            currentTtlSeconds: p.currentTtlSeconds,
+            currentEnabled: p.currentEnabled,
+            applied: false,
+          }));
+
+        const record = () =>
+          context.writeResource(
+            "dnsRecordChange",
+            instanceName(t, siteName, false),
+            {
+              ranAt: new Date().toISOString(),
+              mode: g.mode,
+              target: t.target,
+              consoleId: t.consoleId,
+              consoleShortname: t.consoleShortname,
+              siteId,
+              siteName,
+              dryRun,
+              changeCount: results.filter((r) => r.action !== "unchanged")
+                .length,
+              records: results,
+            },
+          );
+
+        context.logger.info(
+          "setDnsRecords: {changes} of {count} record(s) on site {siteName} " +
+            "need a change (dryRun {dryRun})",
+          {
+            changes: results.filter((r) => r.action !== "unchanged").length,
+            count: results.length,
+            siteName,
+            dryRun,
+          },
+        );
+
+        if (!dryRun && results.some((r) => r.action !== "unchanged")) {
+          let after: Obj[];
+          try {
+            for (const [i, p] of plans.entries()) {
+              if (p.action !== "unchanged") {
+                context.logger.info("setDnsRecords: {action} {name} -> {ip}", {
+                  action: p.action,
+                  name: p.name,
+                  ip: p.ipv4Address,
+                });
+              }
+              if (p.action === "create") {
+                const created = await apiPost(
+                  `${t.base}${dnsPath}`,
+                  g.apiKey,
+                  p.body,
+                  t.caCert,
+                );
+                results[i].policyId = created.id as string | undefined;
+                results[i].applied = true;
+              } else if (p.action === "update") {
+                await apiPut(
+                  `${t.base}${dnsPath}/${p.policyId}`,
+                  g.apiKey,
+                  p.body,
+                  t.caCert,
+                );
+                results[i].applied = true;
+              }
+            }
+            // Verify all records with one re-read of the site's DNS policies.
+            after = await fetchAllPages(t.base, dnsPath, g.apiKey, t.caCert);
+          } catch (e) {
+            // Record which records were already written before failing.
+            await record();
+            throw e;
+          }
+
+          const failures: string[] = [];
+          for (const [i, p] of plans.entries()) {
+            const found = after.filter((x) =>
+              x.type === "A_RECORD" &&
+              String(x.domain ?? "").toLowerCase() === p.name
+            );
+            const one = found.length === 1 ? found[0] : undefined;
+            const stray = one && p.before
+              ? diffPaths(
+                p.before,
+                one,
+                new Set(["ipv4Address", "ttlSeconds", "enabled"]),
+              )
+              : [];
+            const ok = one !== undefined &&
+              one.ipv4Address === p.ipv4Address &&
+              one.ttlSeconds === p.ttlSeconds && one.enabled === true &&
+              stray.length === 0;
+            if (one) results[i].policyId = one.id as string;
+            if (p.action === "unchanged" && ok) continue;
+            results[i].verified = ok;
+            if (!ok) {
+              failures.push(
+                `${p.name}: found ` +
+                  (found.length === 1
+                    ? `${one?.ipv4Address} ttl ${one?.ttlSeconds} enabled ${one?.enabled}`
+                    : `${found.length} A records`) +
+                  (stray.length
+                    ? `, other changed fields: ${stray.join(", ")}`
+                    : ""),
+              );
+            }
+          }
+          if (failures.length > 0) {
+            await record();
+            throw new Error(
+              `DNS records written but verification failed: ` +
+                failures.join("; "),
+            );
+          }
+        }
+
+        const handle = await record();
+        context.logger.info(
+          "setDnsRecords: done, {applied} record(s) written and verified",
+          { applied: results.filter((r) => r.applied).length },
+        );
+        return { dataHandles: [handle] };
       },
     },
   },
@@ -1118,7 +1955,7 @@ export const model = {
         "before a destructive change. Labelled 'live' (makes an API call) so it " +
         "can be skipped with --skip-check-label live.",
       labels: ["live"],
-      appliesTo: ["deletePolicy"],
+      appliesTo: ["deletePolicy", "setNetworkDomain", "setDnsRecords"],
       // Checks receive globalArgs but not the per-call method arguments, so this
       // verifies connectivity/auth to the resolved target(s); the policy-specific
       // USER_DEFINED guard stays inline in deletePolicy where policyId is known.
@@ -1127,7 +1964,7 @@ export const model = {
         try {
           const targets = await resolveTargets(g);
           const t = targets[0];
-          await apiGet(`${t.base}/v1/info`, g.apiKey, t.insecure);
+          await apiGet(`${t.base}/v1/info`, g.apiKey, t.caCert);
           return { pass: true };
         } catch (e) {
           return {
