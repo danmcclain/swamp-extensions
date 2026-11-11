@@ -57,6 +57,11 @@ function lines(text: string): string[] {
   return text.split("\n").map((l) => l.replace(/\r$/, ""));
 }
 
+// An error names the line by its number, never by its text: the text comes from the host,
+// and the error reaches the log and the terminal.
+const bad = (what: string, i: number) =>
+  `${what} line does not parse (line ${i + 1})`;
+
 type Row = Omit<PendingUpdateT, "security"> & { security?: boolean | null };
 
 // apt: `Inst <name> [<installed>] (<new> <origins> [<arch>])`, maybe followed by ` []`.
@@ -68,10 +73,10 @@ const APT_SECURITY = /(-security|Security:)/i;
 
 function parseApt(text: string): Row[] | string {
   const rows: Row[] = [];
-  for (const l of lines(text)) {
+  for (const [i, l] of lines(text).entries()) {
     if (!l.startsWith("Inst")) continue;
     const m = APT_INST.exec(l);
-    if (!m) return `an apt line does not parse: ${l.slice(0, 80)}`;
+    if (!m) return bad("an apt", i);
     rows.push({
       name: m[1],
       arch: m[5] ?? null,
@@ -91,11 +96,11 @@ const DNF_ROW = /^(\S+)\.([A-Za-z0-9_]+)\s+(\S+)\s+(\S+)\s*$/;
 
 function dnfRows(text: string): Row[] | string {
   const rows: Row[] = [];
-  for (const l of lines(text)) {
+  for (const [i, l] of lines(text).entries()) {
     if (/^Obsoleting Packages/i.test(l)) break;
     if (!DNF_CANDIDATE.test(l)) continue;
     const m = DNF_ROW.exec(l);
-    if (!m) return `a dnf line does not parse: ${l.slice(0, 80)}`;
+    if (!m) return bad("a dnf", i);
     rows.push({ name: m[1], arch: m[2], from: null, to: m[3], source: m[4] });
   }
   return rows;
@@ -106,10 +111,10 @@ const APK_ROW = /^(\S+)-([^-\s]+-r\d+)\s+<\s+(\S+)\s*$/;
 
 function parseApk(text: string): Row[] | string {
   const rows: Row[] = [];
-  for (const l of lines(text)) {
+  for (const [i, l] of lines(text).entries()) {
     if (!l.includes("<")) continue;
     const m = APK_ROW.exec(l);
-    if (!m) return `an apk line does not parse: ${l.slice(0, 80)}`;
+    if (!m) return bad("an apk", i);
     rows.push({
       name: m[1],
       arch: null,
@@ -127,10 +132,10 @@ const PACMAN_ROW = /^(\S+) (\S+) -> (\S+)( \[ignored\])?$/;
 
 function pacmanRows(text: string): Row[] | string {
   const rows: Row[] = [];
-  for (const l of lines(text)) {
+  for (const [i, l] of lines(text).entries()) {
     if (l.trim() === "") continue;
     const m = PACMAN_ROW.exec(l);
-    if (!m) return `a pacman line does not parse: ${l.slice(0, 80)}`;
+    if (!m) return bad("a pacman", i);
     if (m[4]) continue; // pacman will not upgrade an ignored package; the count skips it too.
     rows.push({ name: m[1], arch: null, from: m[2], to: m[3], source: null });
   }
@@ -140,11 +145,11 @@ function pacmanRows(text: string): Row[] | string {
 /** The names in a list of one name per line (arch-audit -u -q). */
 function nameSet(text: string): Set<string> | string {
   const s = new Set<string>();
-  for (const l of lines(text)) {
+  for (const [i, l] of lines(text).entries()) {
     const t = l.trim();
     if (t === "") continue;
     if (!/^[A-Za-z0-9][A-Za-z0-9._+@-]{0,199}$/.test(t)) {
-      return `a security line does not parse: ${t.slice(0, 80)}`;
+      return bad("a security", i);
     }
     s.add(t);
   }

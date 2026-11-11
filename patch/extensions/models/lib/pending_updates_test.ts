@@ -189,3 +189,29 @@ Deno.test("parsePending: more than PENDING_LIMIT entries keeps the first ones an
   assertEquals(r.truncated, true);
   assertEquals(r.items[0].name, "p0");
 });
+
+Deno.test("parsePending: an error names the line by number and never carries host text", () => {
+  const esc = "\u001b]0;owned\u0007";
+  const cases: [string, string, string | null][] = [
+    ["dnf", `ok.noarch 1-1 baseos\nfoo.x86_64 ${esc}\n`, null],
+    ["apt", `Inst ${esc}\n`, null],
+    ["apk", `foo ${esc} < 1\n`, null],
+    ["pacman", `${esc}\n`, null],
+    ["pacman", "openssl 1 -> 2\n", `${esc}\n`],
+  ];
+  for (const [pm, list, sec] of cases) {
+    const e = err(parsePending(pm, b64(list), sec === null ? null : b64(sec)));
+    assert(!e.includes("\u001b") && !e.includes("owned"), e);
+    assert(/\(line \d+\)$/.test(e), e);
+  }
+  assertEquals(
+    err(
+      parsePending(
+        "dnf",
+        b64(`ok.noarch 1-1 baseos\nfoo.x86_64 ${esc}\n`),
+        null,
+      ),
+    ),
+    "a dnf line does not parse (line 2)",
+  );
+});
