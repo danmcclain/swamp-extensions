@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@dmc/patch"
-version: "2026.11.11.1"
+version: "2026.11.11.2"
 description: "Agentless fleet patch management — scan Proxmox VMs/CTs, bare-metal, and VPS hosts for pending updates, apply them safely (snapshot-guarded, health-checked, auto-rollback), and keep an auditable history over @swamp/ssh. Routine work runs as a restricted, audited login with exact sudo grants and a per-machine OS update policy. App updaters, snapshotters and OS updaters are pluggable: bring your own model without upstreaming it. Built-in OS support: apt, dnf, apk and pacman"
 repository: "https://github.com/danmcclain/swamp-extensions"
 license: MIT

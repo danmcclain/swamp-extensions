@@ -61,6 +61,12 @@ import {
   parseDockerFile,
   validateDockerImages,
 } from "./lib/docker_inventory.ts";
+import {
+  parsePending,
+  PENDING_LIMIT,
+  PendingUpdate,
+} from "./lib/pending_updates.ts";
+import type { PendingUpdateT } from "./lib/pending_updates.ts";
 
 // The swamp CLI, used only by `checkSwamp` (pre-flight checks get no runModel).
 const SWAMP_BIN = Deno.env.get("SWAMP_BIN") ?? "swamp";
@@ -122,6 +128,17 @@ export const COLLECTOR_SCRIPT: string = [
   "# Minimal JSON string escaper (backslash, double-quote, strip control chars).",
   "jesc() { printf '%s' \"${1-}\" | sed -e 's/\\\\/\\\\\\\\/g' -e 's/\"/\\\\\"/g' | tr -d '\\000-\\037'; }",
   "",
+  "# Base64 of $1 on one line (GNU base64 -w0, else any base64 with the newlines removed).",
+  'b64() { local o; o="$(printf \'%s\' "${1-}" | base64 -w0 2>/dev/null)" || o="$(printf \'%s\' "${1-}" | base64 | tr -d \'\\n\')"; printf \'%s\' "$o"; }',
+  "",
+  "# The lines of the pending list: at most 5000, more than the model keeps, so it can tell",
+  "# that a list was cut. The text goes out base64; the model parses and checks it.",
+  "pending_lines() { printf '%s\\n' \"${1-}\" | head -n 5000; }",
+  "",
+  '# dnf check-update\'s list without its "Obsoleting Packages" section, which repeats',
+  "# packages the list already has.",
+  "dnf_list() { printf '%s\\n' \"${1-}\" | sed '/^Obsoleting Packages/,$d'; }",
+  "",
   "# Outputs set by the collectors.",
   'pkg_mgr="unknown"',
   'updates="null"; security="null"; total="null"',
@@ -138,6 +155,8 @@ export const COLLECTOR_SCRIPT: string = [
   'cache_age="null"       # hours since the package cache was refreshed, or null if unknown',
   "dnf_user_cache=0       # 1 when dnf answered from its per-user cache (dnf4 fallback)",
   'packages_hash="null"   # sha256 of the sorted package manifest (a JSON string), or null',
+  'pending_b64=""         # base64 of the pending-update lines the count reads ("" = none read)',
+  'pending_sec_b64=""     # base64 of the security list (dnf --security, arch-audit), or ""',
   "",
   'set_reason() { reason_json="\\"$(jesc "$1")\\""; }',
   "",
@@ -183,6 +202,7 @@ export const COLLECTOR_SCRIPT: string = [
   "  # updatesCount = full upgradable set (dist-upgrade Inst), matching PatchMon.",
   '  updates="$dist_inst"',
   "  security=\"$(printf '%s\\n' \"$dist\" | grep '^Inst' | grep -ciE '(-security|Security:)' || true)\"",
+  '  pending_b64="$(b64 "$(pending_lines "$(printf \'%s\\n\' "$dist" | grep \'^Inst\')")")"',
   '  [ -z "$security" ] && security=0',
   '  held_back=$(( dist_inst - plain_inst )); [ "$held_back" -lt 0 ] && held_back=0',
   '  removals="$dist_remv"',
@@ -248,7 +268,8 @@ export const COLLECTOR_SCRIPT: string = [
   "  local rc",
   "  dnf_check; rc=$?",
   '  if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then',
-  "    updates=\"$(printf '%s\\n' \"$dnf_out\" | grep -cE '^[A-Za-z0-9._+-]+\\.[A-Za-z0-9_]+[[:space:]]' || true)\"",
+  '    updates="$(dnf_list "$dnf_out" | grep -cE \'^[A-Za-z0-9._+-]+\\.[A-Za-z0-9_]+[[:space:]]\' || true)"',
+  '    pending_b64="$(b64 "$(pending_lines "$(dnf_list "$dnf_out")")")"',
   "  else",
   '    updates="null"; log "dnf check-update failed (rc $rc)"',
   "  fi",
@@ -256,7 +277,8 @@ export const COLLECTOR_SCRIPT: string = [
   "  # subset of updates), unlike `updateinfo list` which repeats a package per advisory.",
   "  dnf_check --security; rc=$?",
   '  if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then',
-  "    security=\"$(printf '%s\\n' \"$dnf_out\" | grep -cE '^[A-Za-z0-9._+-]+\\.[A-Za-z0-9_]+[[:space:]]' || true)\"",
+  '    security="$(dnf_list "$dnf_out" | grep -cE \'^[A-Za-z0-9._+-]+\\.[A-Za-z0-9_]+[[:space:]]\' || true)"',
+  '    pending_sec_b64="$(b64 "$(dnf_list "$dnf_out")")"',
   "  else",
   '    security="null"; log "dnf check-update --security failed (rc $rc)"',
   "  fi",
@@ -279,12 +301,15 @@ export const COLLECTOR_SCRIPT: string = [
   "collect_apk() {",
   '  pkg_mgr="apk"',
   '  set_cache_age "$(newest_mtime /var/cache/apk/APKINDEX.*.tar.gz)"',
-  "  updates=\"$(apk version -l '<' 2>/dev/null | grep -c '<' || true)\"",
+  "  local list",
+  "  list=\"$(apk version -l '<' 2>/dev/null)\"",
+  "  updates=\"$(printf '%s\\n' \"$list\" | grep -c '<' || true)\"",
+  '  pending_b64="$(b64 "$(pending_lines "$(printf \'%s\\n\' "$list" | grep \'<\')")")"',
   '  security="null"   # Alpine has no distinct security channel',
   "  total=\"$(apk info 2>/dev/null | wc -l | tr -d ' ')\"",
   '  [ -z "$updates" ] && updates=0',
   '  [ -z "$total" ] && total=0',
-  "  if apk version -l '<' 2>/dev/null | grep -q '^linux-'; then",
+  "  if printf '%s\\n' \"$list\" | grep -q '^linux-'; then",
   '    needs_reboot="true"; set_reason "kernel package update available"',
   "  fi",
   "}",
@@ -308,9 +333,13 @@ export const COLLECTOR_SCRIPT: string = [
   '    list="$(pacman -Qu 2>/dev/null || true)"',
   "  fi",
   "  updates=\"$(printf '%s\\n' \"$list\" | grep -v '\\[ignored\\]' | grep -c . || true)\"",
+  '  pending_b64="$(b64 "$(pending_lines "$list")")"',
   "  # arch-audit (optional) lists installed packages with a fixed advisory.",
   "  if command -v arch-audit >/dev/null 2>&1; then",
-  '    security="$(arch-audit -u -q 2>/dev/null | grep -c . || true)"',
+  "    local audit",
+  '    audit="$(arch-audit -u -q 2>/dev/null)"',
+  '    security="$(printf \'%s\\n\' "$audit" | grep -c . || true)"',
+  '    pending_sec_b64="$(b64 "$audit")"',
   '    [ -z "$security" ] && security=0',
   "  fi",
   "  total=\"$(pacman -Qq 2>/dev/null | wc -l | tr -d ' ')\"",
@@ -421,11 +450,11 @@ export const COLLECTOR_SCRIPT: string = [
   "  local uid",
   '  uid="$(id -u 2>/dev/null)"',
   "  case \"$uid\" in '' | *[!0-9]*) uid=null ;; esac",
-  '  printf \'{"_kind":"patch-inventory","schemaVersion":5,"hostname":"%s","osType":"%s","osVersion":"%s","packageManager":"%s","updatesCount":%s,"securityUpdatesCount":%s,"heldBackCount":%s,"removalsCount":%s,"distUpgradeRequired":%s,"totalPackages":%s,"needsReboot":%s,"rebootReason":%s,"dockerEngine":%s,"dockerImages":%s,"cacheAgeHours":%s,"uid":%s,"dockerSource":"%s","dockerFileB64":"%s","packagesHash":%s,"scannedAt":"%s"}\\n\' \\',
+  '  printf \'{"_kind":"patch-inventory","schemaVersion":6,"hostname":"%s","osType":"%s","osVersion":"%s","packageManager":"%s","updatesCount":%s,"securityUpdatesCount":%s,"heldBackCount":%s,"removalsCount":%s,"distUpgradeRequired":%s,"totalPackages":%s,"needsReboot":%s,"rebootReason":%s,"dockerEngine":%s,"dockerImages":%s,"cacheAgeHours":%s,"uid":%s,"dockerSource":"%s","dockerFileB64":"%s","packagesHash":%s,"pendingB64":"%s","pendingSecurityB64":"%s","scannedAt":"%s"}\\n\' \\',
   '    "$(jesc "$hostname_val")" "$(jesc "$os_type")" "$(jesc "$os_version")" "$pkg_mgr" \\',
   '    "$updates" "$security" "$held_back" "$removals" "$dist_required" \\',
   '    "$total" "$needs_reboot" "$reason_json" "$docker_engine" "$docker_json" \\',
-  '    "$cache_age" "$uid" "$docker_source" "$docker_file_b64" "$packages_hash" "$scanned_at"',
+  '    "$cache_age" "$uid" "$docker_source" "$docker_file_b64" "$packages_hash" "$pending_b64" "$pending_sec_b64" "$scanned_at"',
   "}",
   "",
   "# stdin from /dev/null so nothing in main() can consume the piped script body.",
@@ -821,6 +850,14 @@ const Inventory = z.object({
   ),
   lastOutsideChangeAt: z.string().nullable().default(null).describe(
     "When a scan last found an outside change (ISO time), carried until the next one",
+  ),
+  pendingUpdates: z.array(PendingUpdate).max(PENDING_LIMIT).nullable().default(
+    null,
+  ).describe(
+    "The packages updatesCount counts, by name: installed and new version, repository and security flag where the package manager reports them (null = unknown: no list read, a list that did not parse or did not match the count, or an osUpdater model)",
+  ),
+  pendingUpdatesTruncated: z.boolean().default(false).describe(
+    "true when the host had more pending updates than pendingUpdates keeps (the count is still exact)",
   ),
   scannedAt: z.string(),
 });
@@ -1943,16 +1980,73 @@ export function updatedPackageState(
   };
 }
 
+/**
+ * The pending updates of one collector line, by name. Only parsePending's result is
+ * stored, never the base64. The list is unknown (null) when the collector read none (a
+ * line before schemaVersion 6, or a failed count), when it does not parse, or when it
+ * disagrees with the count the collector made from the same lines. No updates is [].
+ */
+export function pendingFromCollector(
+  inv: Record<string, unknown>,
+  pendingB64: unknown,
+  pendingSecurityB64: unknown,
+  logger?: Logger,
+): {
+  pendingUpdates: PendingUpdateT[] | null;
+  pendingUpdatesTruncated: boolean;
+} {
+  const unknown = { pendingUpdates: null, pendingUpdatesTruncated: false };
+  if (typeof pendingB64 !== "string") return unknown;
+  // A failed count is null, and then the collector read no list. An empty string with a
+  // count is an empty list (the shell drops the only newline): the count check below
+  // still holds it to 0.
+  if (typeof inv.updatesCount !== "number") return unknown;
+  // The security list was read exactly when the collector has a security count (dnf
+  // --security, arch-audit); "" is then no security update. Without one, security is unknown.
+  const sec = typeof inv.securityUpdatesCount === "number"
+    ? (typeof pendingSecurityB64 === "string" ? pendingSecurityB64 : "")
+    : null;
+  const parsed = parsePending(
+    String(inv.packageManager ?? ""),
+    pendingB64,
+    sec,
+  );
+  if (!parsed.ok) {
+    logger?.warn("pending update list rejected: {error}", {
+      error: parsed.error,
+    });
+    return unknown;
+  }
+  if (!parsed.truncated && parsed.items.length !== inv.updatesCount) {
+    logger?.warn(
+      "pending update list rejected: {items} entries, but the count is {count}",
+      { items: parsed.items.length, count: inv.updatesCount },
+    );
+    return unknown;
+  }
+  return {
+    pendingUpdates: parsed.items,
+    pendingUpdatesTruncated: parsed.truncated,
+  };
+}
+
 /** The inventory stored for one collector line. A schemaVersion 4 line has no packagesHash;
  *  the writers set the package-set fields from the verdict, so it stores as unknown.
  *  A `file` docker inventory is checked by parseDockerFile here, and only its result is
  *  kept: the base64 itself is never stored, and a file that fails the check gives
- *  `file-invalid` with no images. */
+ *  `file-invalid` with no images. The pending list is handled the same way
+ *  (pendingFromCollector). */
 function inventoryFromCollector(
   line: string,
   logger?: Logger,
 ): Record<string, unknown> {
-  const { dockerFileB64, ...inv } = JSON.parse(line) as Record<string, unknown>;
+  const { dockerFileB64, pendingB64, pendingSecurityB64, ...raw } = JSON.parse(
+    line,
+  ) as Record<string, unknown>;
+  const inv: Record<string, unknown> = {
+    ...raw,
+    ...pendingFromCollector(raw, pendingB64, pendingSecurityB64, logger),
+  };
   if (inv.dockerSource === "file") {
     const parsed = parseDockerFile(String(dockerFileB64 ?? ""), new Date());
     if (parsed.ok) {
@@ -2869,6 +2963,9 @@ export async function modelOsScan(
       packagesBaseline: null,
       packagesChangedOutsidePatch: null,
       lastOutsideChangeAt: null,
+      // The osUpdater contract (scanOs) gives counts only: no list of names.
+      pendingUpdates: null,
+      pendingUpdatesTruncated: false,
       scannedAt: s.scannedAt ?? new Date().toISOString(),
     },
     error: "",
@@ -4342,7 +4439,7 @@ export async function checkPrivilegesDeclared(
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.11.11.1",
+  version: "2026.11.11.2",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
@@ -4396,6 +4493,14 @@ export const model = {
         "Version bump, no globalArguments schema change. dnf hosts get two read-only " +
         "sudo entries (`dnf -q -C check-update`, with and without `--security`) when the " +
         "login has another grant, and the scan uses them: re-run provisionAccess.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.11.2",
+      description:
+        "Version bump, no globalArguments schema change. The inventory lists the pending " +
+        "updates by name (pendingUpdates); earlier records have none (null) until the next " +
+        "scan. dnf counts no longer include the Obsoleting Packages section twice.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

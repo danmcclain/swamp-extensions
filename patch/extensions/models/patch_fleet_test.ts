@@ -25,6 +25,7 @@ import {
   runtimeCommand,
   shellPaths,
 } from "./lib/access_sudoers.ts";
+import { parsePending } from "./lib/pending_updates.ts";
 
 const FAKE_SWAMP = new URL("./testdata/fake_swamp.sh", import.meta.url)
   .pathname;
@@ -5455,7 +5456,7 @@ async function runCollector(
   try {
     const tools = [
       "sed", "tr", "grep", "wc", "ls", "uname", "hostname", "date", "id",
-      "head", "sort", "cat", "tail",
+      "head", "sort", "cat", "tail", "base64",
     ];
     for (const t of tools) {
       const out = await new Deno.Command("sh", {
@@ -5988,8 +5989,16 @@ Deno.test("collector: sudo only for the two granted dnf checks, and never refres
   assertStringIncludes(s, '[ "$(id -u)" -ne 0 ] || return 1');
   assert(!s.includes("apt-get update"));
   assert(!s.includes("apk update"));
-  assertStringIncludes(s, '"schemaVersion":5');
-  for (const key of ["cacheAgeHours", "dockerSource", "dockerFileB64"]) {
+  assertStringIncludes(s, '"schemaVersion":6');
+  for (
+    const key of [
+      "cacheAgeHours",
+      "dockerSource",
+      "dockerFileB64",
+      "pendingB64",
+      "pendingSecurityB64",
+    ]
+  ) {
     assertStringIncludes(s, key);
   }
 });
@@ -6022,7 +6031,7 @@ async function runDnf(
       .filter((l) => l !== "main </dev/null")
       .join("\n");
     const script = body +
-      "\ncollect_dnf\necho \"U=$updates S=$security C=${dnf_user_cache:-0} A=$cache_age\"\n";
+      "\ncollect_dnf\necho \"U=$updates S=$security C=${dnf_user_cache:-0} A=$cache_age P=$pending_b64 Q=$pending_sec_b64\"\n";
     const out = await new Deno.Command("bash", {
       args: ["-c", script],
       env: { PATH: `${dir}:${Deno.env.get("PATH") ?? ""}` },
@@ -6101,6 +6110,222 @@ Deno.test("collector (dnf): sudo gets dnf by its absolute path and exactly the t
   assertEquals(asked.length, 2, r.sudoLog);
   assertMatch(asked[0], /^SUDO -n -l \/\S+\/dnf -q -C check-update$/);
   assertMatch(asked[1], /^SUDO -n -l \/\S+\/dnf -q -C check-update --security$/);
+});
+
+/** The pending lists runDnf printed (P= and Q=, base64; "" when none was read). */
+function pendingOf(out: string): { list: string; sec: string } {
+  const m = /P=(\S*) Q=(\S*)/.exec(out);
+  assert(m, out);
+  return { list: m[1], sec: m[2] };
+}
+
+/** dnf check-update with the obsoletes section Rocky 9 prints after the list. */
+const DNF_WITH_OBSOLETES = [
+  "printf 'docker-ce.x86_64  3:29.9.3-1.el9  docker-ce-stable\\n'",
+  "printf 'grub2-tools.x86_64  1:2.06-127.el9  baseos\\n'",
+  "printf 'kernel-core.x86_64  5.14.0-687.66.1.el9_8  baseos\\n'",
+  "printf 'Obsoleting Packages\\n'",
+  "printf 'grub2-tools.x86_64  1:2.06-127.el9  baseos\\n'",
+  "printf '    grub2-tools.x86_64  1:2.06-126.el9  @baseos\\n'",
+  'case " $* " in *" --security "*) ;; *) exit 100 ;; esac',
+  "exit 100",
+].join("\n");
+
+Deno.test("collector (dnf): the obsoletes section is not counted twice", async () => {
+  // Rocky 9 repeats an obsoleting package after the list; edge counted 49 for 45 packages.
+  const r = await runDnf(DNF_WITH_OBSOLETES);
+  assertStringIncludes(r.out, "U=3 S=3 C=0");
+});
+
+Deno.test("collector (dnf): ships the lines it counts, base64, and the model reads the same number", async () => {
+  const r = await runDnf(DNF_WITH_OBSOLETES);
+  const { list, sec } = pendingOf(r.out);
+  const parsed = parsePending("dnf", list, sec);
+  assert(parsed.ok, parsed.ok ? "" : parsed.error);
+  assertEquals(parsed.items.map((i) => `${i.name} ${i.to} ${i.source}`), [
+    "docker-ce 3:29.9.3-1.el9 docker-ce-stable",
+    "grub2-tools 1:2.06-127.el9 baseos",
+    "kernel-core 5.14.0-687.66.1.el9_8 baseos",
+  ]);
+});
+
+Deno.test("collector (dnf): with the grant, the list and the security list come from root's check", async () => {
+  const r = await runDnf("exit 1", SUDO_GRANTS_CHECKS);
+  const { list, sec } = pendingOf(r.out);
+  const parsed = parsePending("dnf", list, sec);
+  assert(parsed.ok, parsed.ok ? "" : parsed.error);
+  assertEquals(parsed.items.map((i) => [i.name, i.security]), [
+    ["a", true],
+    ["b", false],
+  ]);
+});
+
+Deno.test("collector (dnf): a failed check ships no list, so the model stores none", async () => {
+  const r = await runDnf("exit 1");
+  assertEquals(pendingOf(r.out), { list: "", sec: "" });
+  assertStringIncludes(r.out, "U=null");
+  assertEquals(
+    fleet.pendingFromCollector({ packageManager: "dnf", updatesCount: null }, "", "")
+      .pendingUpdates,
+    null,
+  );
+});
+
+Deno.test("collector (dnf): no updates is an empty list, not unknown", async () => {
+  const r = await runDnf("exit 0");
+  const { list, sec } = pendingOf(r.out);
+  assertEquals(
+    fleet.pendingFromCollector(
+      { packageManager: "dnf", updatesCount: 0 },
+      list,
+      sec,
+    ).pendingUpdates,
+    [],
+  );
+});
+
+Deno.test("collector (pacman): ships checkupdates' list and arch-audit's names", async () => {
+  const inv = await runCollector({
+    pacman: PACMAN_STUB,
+    checkupdates:
+      "printf 'openssl 3.0.1-1 -> 3.0.2-1\\nlinux 6.9-1 -> 6.10-1\\n'",
+    "arch-audit": "printf 'openssl\\n'",
+  });
+  const p = fleet.pendingFromCollector(
+    inv,
+    inv.pendingB64,
+    inv.pendingSecurityB64,
+  );
+  assertEquals(p.pendingUpdates?.map((i) => [i.name, i.to, i.security]), [
+    ["openssl", "3.0.2-1", true],
+    ["linux", "6.10-1", false],
+  ]);
+});
+
+Deno.test("collector (apk): ships apk version's list; the kernel check reads the same list", async () => {
+  const inv = await runCollector({
+    apk: [
+      'case "$1" in',
+      "  version) printf 'Installed:   Available:\\nmusl-1.2.5-r0   < 1.2.5-r1\\nlinux-lts-6.6.1-r0   < 6.6.2-r0\\n' ;;",
+      "  info) printf 'musl\\nlinux-lts\\nbusybox\\n' ;;",
+      "esac",
+    ].join("\n"),
+  });
+  assertEquals(inv.updatesCount, 2);
+  assertEquals(inv.needsReboot, true);
+  const p = fleet.pendingFromCollector(inv, inv.pendingB64, inv.pendingSecurityB64);
+  assertEquals(p.pendingUpdates?.map((i) => [i.name, i.from, i.to, i.security]), [
+    ["musl", "1.2.5-r0", "1.2.5-r1", null],
+    ["linux-lts", "6.6.1-r0", "6.6.2-r0", null],
+  ]);
+});
+
+Deno.test("pendingFromCollector: no list, a list that does not parse, or one that disagrees with the count is unknown", () => {
+  const b64 = (s: string) => btoa(s);
+  const inv = { packageManager: "dnf", updatesCount: 1 };
+  const unknown = { pendingUpdates: null, pendingUpdatesTruncated: false };
+  // A line from before schemaVersion 6, or a failed count, has no list.
+  assertEquals(fleet.pendingFromCollector(inv, undefined, undefined), unknown);
+  // An empty list for a count of one does not match.
+  assertEquals(fleet.pendingFromCollector(inv, "", ""), unknown);
+  // No updates: the shell ships "" (it drops the only newline), and that is [].
+  assertEquals(
+    fleet.pendingFromCollector({ ...inv, updatesCount: 0 }, "", ""),
+    { pendingUpdates: [], pendingUpdatesTruncated: false },
+  );
+  assertEquals(
+    fleet.pendingFromCollector(
+      { ...inv, updatesCount: null },
+      b64("a.x86_64 1 baseos\n"),
+      "",
+    ),
+    unknown,
+  );
+  // A list that does not parse.
+  assertEquals(fleet.pendingFromCollector(inv, b64("a.x86_64 1\n"), ""), unknown);
+  // Two entries for a count of one: neither is trusted.
+  assertEquals(
+    fleet.pendingFromCollector(
+      inv,
+      b64("a.x86_64 1 baseos\nb.x86_64 1 baseos\n"),
+      "",
+    ),
+    unknown,
+  );
+  // A security count with an empty security list: none of them is a security update.
+  assertEquals(
+    fleet.pendingFromCollector(
+      { ...inv, securityUpdatesCount: 0 },
+      b64("a.x86_64 1 baseos\n"),
+      "",
+    ).pendingUpdates?.[0].security,
+    false,
+  );
+  // The list and the count agree; no security count means security is unknown.
+  assertEquals(
+    fleet.pendingFromCollector(inv, b64("a.x86_64 1 baseos\n"), ""),
+    {
+      pendingUpdates: [{
+        name: "a",
+        arch: "x86_64",
+        from: null,
+        to: "1",
+        source: "baseos",
+        security: null,
+      }],
+      pendingUpdatesTruncated: false,
+    },
+  );
+});
+
+Deno.test("scan: the inventory stores the pending list, never the base64", async () => {
+  const list = btoa(
+    "Inst libssl3 [3.0.11-1] (3.0.13-1 Debian-Security:12/stable-security [amd64])\n" +
+      "Inst tzdata [2024a-0] (2025b-0 Debian:12/stable-updates [all])\n",
+  );
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut(
+      "web1",
+      collectorStdout({
+        schemaVersion: 6,
+        updatesCount: 2,
+        securityUpdatesCount: 1,
+        pendingB64: list,
+        pendingSecurityB64: "",
+      }),
+    ),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    const pending = inv.pendingUpdates as Array<
+      { name: string; from: string; to: string; security: boolean }
+    >;
+    assertEquals(
+      pending.map((i) => [i.name, i.from, i.to, i.security]),
+      [
+        ["libssl3", "3.0.11-1", "3.0.13-1", true],
+        ["tzdata", "2024a-0", "2025b-0", false],
+      ],
+    );
+    assertEquals(inv.pendingUpdatesTruncated, false);
+    assert(!("pendingB64" in inv));
+    assert(!("pendingSecurityB64" in inv));
+  });
+});
+
+Deno.test("scan: an older collector line stores the pending list as unknown", async () => {
+  await withFake({
+    FAKE_SWAMP_MODEL_GET: sshDefinition("ops", [{ name: "web1" }]),
+    FAKE_SWAMP_SCRIPT_1: scriptOut("web1", collectorStdout({ schemaVersion: 5 })),
+  }, async () => {
+    const t = mkCtx({ sshModel: "ssh", machines: [{ host: "web1" }] });
+    await model.methods.scan.execute({}, t.ctx);
+    const inv = t.one("inventory");
+    assertEquals(inv.pendingUpdates, null);
+    assertEquals(inv.updatesCount, 3);
+  });
 });
 
 /** A collector stdout that reports the root-written docker file, base64 as shipped. */

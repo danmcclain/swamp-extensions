@@ -22,6 +22,7 @@ containers) through a single `@swamp/ssh` model.
   - [Accepted risks](#accepted-risks)
   - [Auditing access](#auditing-access)
   - [Recommended setup](#recommended-setup)
+  - [Upgrading from 2026.11.11.1](#upgrading-from-202611111)
   - [Upgrading from 2026.11.07.1](#upgrading-from-202611071)
   - [Upgrading from 2026.10.25.1 and earlier (breaking)](#upgrading-from-202610251-and-earlier-breaking)
 - [Dependencies](#dependencies)
@@ -467,6 +468,14 @@ installs packages). The docker inventory producer needs systemd (OpenRC hosts
 are refused for docker). Private registry images show `updateAvailable: null`
 (the producer has no registry credentials). `osUpdatePolicy: auto` supports apt
 and dnf only.
+
+### Upgrading from 2026.11.11.1
+
+- **No access change:** `provisionAccess` need not run again.
+- **Scan once** to fill `pendingUpdates`; records from earlier scans have none
+  (`null`).
+- **dnf counts may go down:** `updatesCount` and `securityUpdatesCount` no longer
+  count dnf's "Obsoleting Packages" section a second time.
 
 ### Upgrading from 2026.11.07.1
 
@@ -1328,7 +1337,7 @@ All are versioned model data (`swamp data list fleet`, `swamp data query`).
 
 | Spec | Written by | Contents |
 | ---- | ---------- | -------- |
-| `inventory` | scan / safeOsUpdate | Per-host OS status, docker engine + image drift, reachMethod (or the `osUpdater` model that scanned it), **health** verdict. Keyed by host (latest = current). |
+| `inventory` | scan / safeOsUpdate | Per-host OS status, the **pending updates** by name (`pendingUpdates`), docker engine + image drift, reachMethod (or the `osUpdater` model that scanned it), **health** verdict. Keyed by host (latest = current). |
 | `run` | every mutating method | Append-only audit row (`run-<action>-<host>-<ts>`): action, outcome, before/after counts, **package** and **image** diffs, snapshot, rolledBack, needsReboot. |
 | `snapshot` | safeOsUpdate | Lifecycle of a retained snapshot (`snapshotter` that took it, `kind` vm/ct/model, retainUntil, healthConfirmed, rebootConfirmed, status). |
 | `image` | safeUpdate | A retained previous docker image (rollback point) with a retention window. |
@@ -1342,7 +1351,19 @@ Example queries:
 swamp data list fleet
 swamp data query 'modelName == "fleet" && content.action == "osUpdate"' \
   --select '{"host":content.host,"out":content.outcome,"pkgs":content.packagesChanged}' --json
+# What an OS update of web1 would change, from its last scan:
+swamp data query 'modelName == "fleet" && name == "web1"' \
+  --select 'content.pendingUpdates' --json
 ```
+
+Each `pendingUpdates` entry has `name`, `arch`, `from` (the installed version;
+null on dnf, which does not report it), `to`, `source` (the repository or apt
+origin; null on apk and pacman) and `security` (null where the host has no
+security channel: apk, pacman without `arch-audit`, or a failed dnf `--security`
+check). The list holds at most 1000 entries (`pendingUpdatesTruncated` says when
+it was cut; `updatesCount` stays exact). It is `null` when it is unknown: a record
+from before 2026.11.11.2, a failed count, a list that did not parse or did not
+match the count, or a machine scanned by an `osUpdater` model.
 
 ---
 
@@ -1405,6 +1426,16 @@ machine with an `osUpdater` model is scanned by that model instead. It prints **
 pending updates, security updates, held-back / dist-upgrade (apt), total packages,
 `needsReboot` (running-vs-installed kernel + `needs-restarting -r` / apt
 `reboot-required`), and per-container docker image drift.
+
+The pending updates are listed by name as well as counted. The collector ships
+the same lines it counts (apt's simulated `dist-upgrade` `Inst` lines,
+`dnf check-update`, `apk version -l '<'`, `checkupdates` / `pacman -Qu`, and the
+security lists of `dnf --security` and `arch-audit -u -q`) base64 on one line, as
+it does the docker inventory file. It never builds JSON from host text. The model
+parses each line, checks each field against a narrow pattern, and stores only the
+result: a line it cannot read, or a list whose length differs from the count,
+makes the list `null`, never a shorter list. dnf's "Obsoleting Packages" section,
+which repeats packages the list already has, is neither listed nor counted.
 
 On dnf hosts it first runs `dnf -q -C check-update` (and `--security`) as root,
 when `sudo -n -l` shows that the login has that exact grant. `-C` reads only
