@@ -37,7 +37,7 @@ const MANAGED: ProvisionInput = {
   from: ["192.0.2.131"],
   docker: false,
   autoUpdates: null,
-  sudo: { osUpgrade: true, reboot: true, docker: false },
+  sudo: { osUpgrade: true, osCheck: true, reboot: true, docker: false },
   dockerProjects: [],
 };
 const PATHS = {
@@ -68,6 +68,8 @@ const TABLE_IDS = [
   "apt-upgrade",
   "apt-full-upgrade",
   "dnf-upgrade",
+  "dnf-check",
+  "dnf-check-security",
   "apk-upgrade",
   "pacman-upgrade",
   "reboot",
@@ -78,7 +80,11 @@ Deno.test("table: the entries, their ids and their capabilities", () => {
   for (const c of PRIV_COMMANDS) {
     assertEquals(
       c.capability,
-      c.id === "reboot" ? "reboot" : "osUpgrade",
+      c.id === "reboot"
+        ? "reboot"
+        : c.id.startsWith("dnf-check")
+        ? "osCheck"
+        : "osUpgrade",
       c.id,
     );
   }
@@ -108,6 +114,11 @@ Deno.test("table: the exact argv of each entry", () => {
     '"$BIN_ENV" DEBIAN_FRONTEND=noninteractive "$BIN_APT_GET" -y full-upgrade',
   );
   assertEquals(argv("dnf-upgrade"), '"$BIN_DNF" -y upgrade');
+  assertEquals(argv("dnf-check"), '"$BIN_DNF" -q -C check-update');
+  assertEquals(
+    argv("dnf-check-security"),
+    '"$BIN_DNF" -q -C check-update --security',
+  );
   assertEquals(argv("apk-upgrade"), '"$BIN_APK" upgrade');
   assertEquals(argv("pacman-upgrade"), '"$BIN_PACMAN" -Syu --noconfirm');
   assertEquals(
@@ -292,18 +303,37 @@ Deno.test("grantNames: the paths a grant needs, and the family's probes", () => 
 });
 
 Deno.test("requiredCommands: the managed, auto and scan-only matrix", () => {
-  const ids = (caps: { osUpgrade: boolean; reboot: boolean }) =>
-    requiredCommands(caps).map((c) => c.id);
-  assertEquals(ids({ osUpgrade: true, reboot: true }), TABLE_IDS);
-  assertEquals(ids({ osUpgrade: false, reboot: true }), ["reboot"]);
-  assertEquals(ids({ osUpgrade: false, reboot: false }), []);
-  assertEquals(ids({ osUpgrade: true, reboot: false }).length, 6);
+  const ids = (
+    caps: { osUpgrade: boolean; osCheck: boolean; reboot: boolean },
+  ) => requiredCommands(caps).map((c) => c.id);
+  const checks = ["dnf-check", "dnf-check-security"];
+  assertEquals(
+    ids({ osUpgrade: true, osCheck: true, reboot: true }),
+    TABLE_IDS,
+  );
+  assertEquals(
+    ids({ osUpgrade: true, osCheck: false, reboot: true }),
+    TABLE_IDS.filter((id) => !checks.includes(id)),
+  );
+  assertEquals(ids({ osUpgrade: false, osCheck: true, reboot: true }), [
+    ...checks,
+    "reboot",
+  ]);
+  assertEquals(ids({ osUpgrade: false, osCheck: false, reboot: true }), [
+    "reboot",
+  ]);
+  assertEquals(ids({ osUpgrade: false, osCheck: false, reboot: false }), []);
+  assertEquals(
+    ids({ osUpgrade: true, osCheck: false, reboot: false }).length,
+    6,
+  );
 });
 
 Deno.test("validateProvisionInput: sudo must hold two booleans, and is copied", () => {
   const v = validateProvisionInput(MANAGED);
   assertEquals(v.sudo, {
     osUpgrade: true,
+    osCheck: true,
     reboot: true,
     docker: false,
     extra: [],
@@ -316,6 +346,9 @@ Deno.test("validateProvisionInput: sudo must hold two booleans, and is copied", 
       { osUpgrade: true },
       { osUpgrade: "yes", reboot: true },
       { osUpgrade: true, reboot: 1 },
+      // The old shape, without osCheck, is refused: it never grants nothing silently.
+      { osUpgrade: true, reboot: true, docker: false },
+      { osUpgrade: true, osCheck: "yes", reboot: true, docker: false },
     ]
   ) {
     assertThrows(
@@ -324,6 +357,26 @@ Deno.test("validateProvisionInput: sudo must hold two booleans, and is copied", 
       "sudo must be",
     );
   }
+});
+
+Deno.test("validateProvisionInput: osCheck alone is refused, because it would make the host need sudo", () => {
+  assertThrows(
+    () =>
+      validateProvisionInput({
+        ...MANAGED,
+        sudo: { osUpgrade: false, osCheck: true, reboot: false, docker: false },
+      }),
+    Error,
+    "sudo.osCheck needs another grant",
+  );
+  // With any other grant it is accepted: the docker helper here.
+  const v = validateProvisionInput({
+    ...MANAGED,
+    docker: true,
+    sudo: { osUpgrade: false, osCheck: true, reboot: false, docker: true },
+    dockerProjects: [{ name: "app", composeDir: "/srv/app", service: "-" }],
+  });
+  assertEquals(v.sudo.osCheck, true);
 });
 
 // ---- the provision script's sudo section ----
@@ -431,21 +484,21 @@ Deno.test("provisionScript sudo: a managed login gets the apt entries and the re
   );
 });
 
-Deno.test("provisionScript sudo: an auto login grants only the reboot entry", () => {
+Deno.test("provisionScript sudo: an auto login grants the reboot and the dnf check entries", () => {
   const s = provisionScript({
     ...MANAGED,
     autoUpdates: "security",
-    sudo: { osUpgrade: false, reboot: true, docker: false },
+    sudo: { osUpgrade: false, osCheck: true, reboot: true, docker: false },
   });
   const ids = [...s.matchAll(/^ {2}sudo_grant (\S+) /gm)].map((g) => g[1]);
-  assertEquals(ids, ["reboot"]);
+  assertEquals(ids, ["dnf-check", "dnf-check-security", "reboot"]);
   assertStringIncludes(s, 'if [ -n "$sudo_lines" ]; then');
 });
 
 Deno.test("provisionScript sudo: a scan-only login removes the managed file and has no sudo pre-flight", () => {
   const s = provisionScript({
     ...MANAGED,
-    sudo: { osUpgrade: false, reboot: false, docker: false },
+    sudo: { osUpgrade: false, osCheck: false, reboot: false, docker: false },
   });
   assertStringIncludes(s, 'echo "== sudo"');
   assertStringIncludes(s, 'remove_managed "$SUDOERS"');
@@ -468,11 +521,11 @@ Deno.test("provisionScript sudo: the managed, auto and scan-only scripts pass ba
   await assertBashSyntax(provisionScript({
     ...MANAGED,
     autoUpdates: "all",
-    sudo: { osUpgrade: false, reboot: true, docker: false },
+    sudo: { osUpgrade: false, osCheck: true, reboot: true, docker: false },
   }));
   await assertBashSyntax(provisionScript({
     ...MANAGED,
-    sudo: { osUpgrade: false, reboot: false, docker: false },
+    sudo: { osUpgrade: false, osCheck: false, reboot: false, docker: false },
   }));
 });
 
@@ -501,6 +554,7 @@ Deno.test("provisionScript sudo: a scan-only login with plug-in commands gets th
     ...MANAGED,
     sudo: {
       osUpgrade: false,
+      osCheck: false,
       reboot: false,
       docker: false,
       extra: PLUGIN_EXTRA,

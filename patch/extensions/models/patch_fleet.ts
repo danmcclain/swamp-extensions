@@ -37,8 +37,10 @@ import {
   FAMILY_PROBES,
   privCommand,
   RUNTIME_ABS_FN,
+  runtimeCommand,
   runtimeLine,
   runtimeResolveLines,
+  shellPaths,
   sudoersTemplate,
 } from "./lib/access_sudoers.ts";
 import type { PrivCommand } from "./lib/access_sudoers.ts";
@@ -75,6 +77,21 @@ export const PKG_MANIFEST_CMD =
   `elif command -v pacman >/dev/null 2>&1; then pacman -Q | tr ' ' '\\t'; fi`;
 
 /**
+ * The collector's root dnf checks, word for word the table entries the access login is
+ * granted (access_sudoers.ts: dnf-check, dnf-check-security), with dnf's absolute path in
+ * `$BIN_DNF` (the same variable the upgrade script uses). sudo matches the path and the
+ * arguments exactly.
+ */
+const DNF_CHECK_ARGV = runtimeCommand(
+  privCommand("dnf-check"),
+  shellPaths(privCommand("dnf-check")),
+).join(" ");
+const DNF_CHECK_SECURITY_ARGV = runtimeCommand(
+  privCommand("dnf-check-security"),
+  shellPaths(privCommand("dnf-check-security")),
+).join(" ");
+
+/**
  * Bundled agentless collector (bash). Shipped to each host as base64 over ssh/pct.
  * Generated verbatim from the collector script so the package is self-contained.
  */
@@ -93,7 +110,8 @@ export const COLLECTOR_SCRIPT: string = [
   "# that reads stdin (e.g. an interactive dnf prompt) would otherwise swallow the",
   "# rest of the script, so all work runs inside main() with stdin < /dev/null.",
   "#",
-  "# Root is never used. Counts come from read-only or simulate paths and from the",
+  "# Root is used only for dnf's cache-only check, through two exact sudo grants (see",
+  "# dnf_root_check). Counts come from read-only or simulate paths and from the",
   "# existing package cache. Each host refreshes its own cache with its local timers",
   "# (pve-daily-update, apt-daily, dnf-makecache, an apk timer). This collector never",
   "# refreshes the cache: it reports the cache age instead, so a stale cache shows.",
@@ -182,12 +200,39 @@ export const COLLECTOR_SCRIPT: string = [
   "  kernel_compare",
   "}",
   "",
-  "# dnf check-update, read-only. First on the system cache (-C); when that fails, on",
-  "# dnf4's per-user cache, which needs no root. Sets dnf_out (the list) and returns",
-  "# dnf's exit code (0 = none, 100 = updates). dnf_user_cache=1 when the retry answered.",
-  "# It runs in the current shell, never in $(...), so the flag survives the call.",
+  "# dnf check-update as root, on root's system cache (-C: no download, no change), when",
+  "# this login is not root and sudo grants exactly that command. Root's dnf checks each",
+  "# cached repo signature (repo_gpgcheck) with root's keyring; libdnf 4 cannot do that for",
+  "# a login without root (it makes its gpg home under /run/user), so such a repo fails the",
+  "# whole check there. $1 is empty or --security. Sets dnf_out and returns dnf's exit code;",
+  "# returns 1 without running anything when the grant is not there.",
+  "dnf_root_check() {",
+  "  local BIN_DNF rc",
+  '  [ "$(id -u)" -ne 0 ] || return 1',
+  '  BIN_DNF="$(command -v dnf 2>/dev/null)" || return 1',
+  '  case "$BIN_DNF" in /*) ;; *) return 1 ;; esac',
+  '  if [ "${1-}" = "--security" ]; then',
+  `    sudo -n -l ${DNF_CHECK_SECURITY_ARGV} >/dev/null 2>&1 || return 1`,
+  `    dnf_out="$(sudo -n ${DNF_CHECK_SECURITY_ARGV} 2>/dev/null)"`,
+  "    rc=$?",
+  "  else",
+  `    sudo -n -l ${DNF_CHECK_ARGV} >/dev/null 2>&1 || return 1`,
+  `    dnf_out="$(sudo -n ${DNF_CHECK_ARGV} 2>/dev/null)"`,
+  "    rc=$?",
+  "  fi",
+  '  return "$rc"',
+  "}",
+  "",
+  "# dnf check-update, read-only. First as root through dnf_root_check, when granted. Then",
+  "# as this login on the system cache (-C); when that fails, on dnf4's per-user cache,",
+  "# which needs no root. Sets dnf_out (the list) and returns dnf's exit code (0 = none,",
+  "# 100 = updates). dnf_user_cache=1 when the per-user retry answered. It runs in the",
+  "# current shell, never in $(...), so the flag survives the call.",
   "dnf_check() {",
   "  local rc",
+  '  dnf_root_check "${1-}"',
+  "  rc=$?",
+  '  if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then return "$rc"; fi',
   '  dnf_out="$(dnf -q -C check-update "$@" 2>/dev/null)"',
   "  rc=$?",
   '  if [ "$rc" -ne 0 ] && [ "$rc" -ne 100 ]; then',
@@ -3649,6 +3694,7 @@ export function accessTargets(
           autoUpdates: caps.autoUpdates,
           sudo: {
             osUpgrade: caps.osUpgrade,
+            osCheck: caps.osCheck,
             reboot: caps.reboot,
             docker: caps.docker,
           },
@@ -4296,7 +4342,7 @@ export async function checkPrivilegesDeclared(
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.11.07.1",
+  version: "2026.11.11.1",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
@@ -4342,6 +4388,14 @@ export const model = {
         "`unsafe.pctExec` and a root node login), a `service` check name may use only " +
         "A-Za-z0-9@._:+-, and plugged models must declare `privileges` (or the machine " +
         "needs `unsafe.privilegedUpdater`). See the README's upgrade notes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.11.1",
+      description:
+        "Version bump, no globalArguments schema change. dnf hosts get two read-only " +
+        "sudo entries (`dnf -q -C check-update`, with and without `--security`) when the " +
+        "login has another grant, and the scan uses them: re-run provisionAccess.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -6795,7 +6849,11 @@ export const model = {
             return [m.host, {
               policy: effectivePolicy(m, context.globalArgs).policy,
               autoUpdates: caps.autoUpdates,
-              sudo: { osUpgrade: caps.osUpgrade, reboot: caps.reboot },
+              sudo: {
+                osUpgrade: caps.osUpgrade,
+                osCheck: caps.osCheck,
+                reboot: caps.reboot,
+              },
             }];
           }),
         );

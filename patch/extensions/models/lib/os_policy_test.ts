@@ -162,6 +162,8 @@ Deno.test("capabilitiesFor: the matrix over policy, os, docker and pct", () => {
           const want = {
             scan: true,
             osUpgrade: on && p === "managed",
+            // The root update check: os on, and the login has another grant already.
+            osCheck: on && (p !== "scan-only" || docker),
             reboot: p !== "scan-only",
             docker,
             autoUpdates: on && p === "auto" ? policy.osAutoScope! : null,
@@ -176,6 +178,27 @@ Deno.test("capabilitiesFor: the matrix over policy, os, docker and pct", () => {
       }
     }
   }
+});
+
+Deno.test("capabilitiesFor: osCheck only where the login has a grant already, and never with os off", () => {
+  const caps = (m: Partial<PolicyMachine>) =>
+    capabilitiesFor({ host: "a", ...m }, DEFAULTS).osCheck;
+  assertEquals(caps({}), true); // managed: the upgrade and the reboot
+  assertEquals(caps({ osUpdatePolicy: "auto" }), true); // the reboot
+  // scan-only has no grant: the check must not make the host need sudo.
+  assertEquals(caps({ osUpdatePolicy: "scan-only" }), false);
+  // scan-only with docker has the helper grant, so sudo is there already.
+  assertEquals(
+    caps({
+      osUpdatePolicy: "scan-only",
+      docker: { composePath: "/x", service: "app" },
+    }),
+    true,
+  );
+  // os off: the scan reads no OS packages, so there is nothing to check.
+  assertEquals(caps({ os: false }), false);
+  // An osUpdater model scans the OS itself: the collector, which runs the check, never does.
+  assertEquals(caps({ osUpdater: { model: "pacman-os" } }), false);
 });
 
 Deno.test("capabilitiesFor: managed upgrades and reboots; auto only reboots; scan-only does neither", () => {

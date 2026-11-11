@@ -41,8 +41,9 @@ const INPUT: ProvisionInput = {
   from: FROM,
   docker: true,
   autoUpdates: null,
-  // Scan-only except for the docker helper: the one grant, and one project, of a docker host.
-  sudo: { osUpgrade: false, reboot: false, docker: true },
+  // Scan-only except for the docker helper and, because the login then has sudo, the dnf
+  // check (capabilitiesFor). One project, of a docker host.
+  sudo: { osUpgrade: false, osCheck: true, reboot: false, docker: true },
   dockerProjects: [{ name: "app", composeDir: "/srv/app", service: "-" }],
 };
 
@@ -51,7 +52,8 @@ function withDocker(docker: boolean): ProvisionInput {
   return {
     ...INPUT,
     docker,
-    sudo: { ...INPUT.sudo, docker },
+    // As capabilitiesFor: a scan-only host without docker has no grant, so no osCheck either.
+    sudo: { ...INPUT.sudo, docker, osCheck: docker },
     dockerProjects: docker ? INPUT.dockerProjects : [],
   };
 }
@@ -799,7 +801,7 @@ Deno.test("validateProvisionInput: the helper grant follows docker, and every pr
         { ...INPUT, sudo: { osUpgrade: false, reboot: false } } as never,
       ),
     Error,
-    "sudo must be { osUpgrade, reboot, docker }",
+    "sudo must be { osUpgrade, osCheck, reboot, docker }",
   );
   for (
     const bad of [

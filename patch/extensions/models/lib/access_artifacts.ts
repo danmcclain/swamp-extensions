@@ -115,7 +115,8 @@ export interface ProvisionInput {
   autoUpdates: OsAutoScope | null;
   /**
    * Which privileged commands the login needs (see access_sudoers.ts). `osUpgrade` is the
-   * managed upgrade, `reboot` every policy but scan-only, `docker` the helper (docker machines
+   * managed upgrade, `osCheck` the cache-only update check as root (capabilitiesFor()),
+   * `reboot` every policy but scan-only, `docker` the helper (docker machines
    * only, whatever the OS policy). All false grants nothing. `docker` must equal `docker` above.
    * `extra` is what the machine's plugged models declare (lib/plugin_privileges.ts); absent or
    * empty grants nothing more. Every entry is validated again here: the provisioner does not
@@ -123,6 +124,7 @@ export interface ProvisionInput {
    */
   sudo: {
     osUpgrade: boolean;
+    osCheck: boolean;
     reboot: boolean;
     docker: boolean;
     extra?: PrivCommand[];
@@ -162,15 +164,23 @@ export function validateProvisionInput(i: ProvisionInput): ProvisionInput {
   if (
     typeof i.sudo !== "object" || i.sudo === null ||
     typeof i.sudo.osUpgrade !== "boolean" ||
+    typeof i.sudo.osCheck !== "boolean" ||
     typeof i.sudo.reboot !== "boolean" ||
     typeof i.sudo.docker !== "boolean"
   ) {
     throw new Error(
-      "sudo must be { osUpgrade, reboot, docker } with true or false",
+      "sudo must be { osUpgrade, osCheck, reboot, docker } with true or false",
     );
   }
   if (i.sudo.docker !== i.docker) {
     throw new Error("sudo.docker must equal docker");
+  }
+  if (
+    i.sudo.osCheck && !i.sudo.osUpgrade && !i.sudo.reboot && !i.sudo.docker
+  ) {
+    throw new Error(
+      "sudo.osCheck needs another grant (osUpgrade, reboot or docker): alone it would make the host need sudo",
+    );
   }
   const extra = validatePluginCommands(i.sudo.extra ?? []);
   const dockerProjects = validateDockerProjects(i.dockerProjects);
@@ -185,6 +195,7 @@ export function validateProvisionInput(i: ProvisionInput): ProvisionInput {
     autoUpdates: i.autoUpdates,
     sudo: {
       osUpgrade: i.sudo.osUpgrade,
+      osCheck: i.sudo.osCheck,
       reboot: i.sudo.reboot,
       docker: i.sudo.docker,
       extra,

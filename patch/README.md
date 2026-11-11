@@ -22,6 +22,7 @@ containers) through a single `@swamp/ssh` model.
   - [Accepted risks](#accepted-risks)
   - [Auditing access](#auditing-access)
   - [Recommended setup](#recommended-setup)
+  - [Upgrading from 2026.11.07.1](#upgrading-from-202611071)
   - [Upgrading from 2026.10.25.1 and earlier (breaking)](#upgrading-from-202610251-and-earlier-breaking)
 - [Dependencies](#dependencies)
 - [How `@dmc/patch` reaches other models](#how-dmcpatch-reaches-other-models)
@@ -75,8 +76,11 @@ A patch tool that logs in everywhere as root is the most valuable key in the
 fleet. `@dmc/patch` is built so the key it uses for routine work is nearly
 worthless to anyone who steals it:
 
-- **Scans need no root and no sudo.** They run as an unprivileged login
-  (`swamp-patch` by default) that can read package state and nothing more.
+- **Scans need no root.** They run as an unprivileged login
+  (`swamp-patch` by default) that can read package state and nothing more. On
+  dnf hosts, the scan also runs dnf's cache-only update check as root, through
+  two exact sudo entries, when the login has them (see
+  [Root commands](#root-commands-sudo)).
 - **Every root command is an exact sudoers entry.** The upgrade, the reboot,
   the docker helper, and the commands a plug-in declares are each granted as one
   fixed argv. A stolen key can start the normal update or reboot, and cannot
@@ -252,6 +256,7 @@ same table, so what runs is what is allowed.
 | Entry | Granted when | Command |
 | ----- | ------------ | ------- |
 | OS upgrade | `osUpdatePolicy: managed` and `os` on | `apt-get update -qq`, `env DEBIAN_FRONTEND=noninteractive apt-get -y upgrade` / `full-upgrade`; `dnf -y upgrade`; `apk upgrade`; `pacman -Syu --noconfirm` (the families the host has) |
+| OS update check (dnf) | `os` on, no `osUpdater`, and the login gets another entry here (an upgrade, a reboot or the docker helper) | `dnf -q -C check-update`; `dnf -q -C check-update --security` |
 | Reboot | every policy except `scan-only` | `systemd-run --on-active=3 --timer-property=AccuracySec=100ms systemctl reboot` |
 | Docker helper | the machine has `docker` | `swamp-patch-docker` (subcommands `ps`, `inspect`, `update`, `restore`, `prune`) |
 | Plug-in commands | a plugged model declares them | the argvs from its `privileges` method (see [Plug-in privileges](#plug-in-privileges-privileges)) |
@@ -462,6 +467,17 @@ installs packages). The docker inventory producer needs systemd (OpenRC hosts
 are refused for docker). Private registry images show `updateAvailable: null`
 (the producer has no registry credentials). `osUpdatePolicy: auto` supports apt
 and dnf only.
+
+### Upgrading from 2026.11.07.1
+
+- **Re-run `provisionAccess` on dnf hosts** (dry run first). It adds the two
+  read-only `dnf -q -C check-update` entries, so that hosts with a repo that signs
+  its metadata (`repo_gpgcheck=1`) get an update count again. Until then,
+  `auditAccess` reports `privilege-missing:dnf-check` and
+  `privilege-missing:dnf-check-security` (warnings), and the scan uses its
+  unprivileged checks as before.
+- **`provisionAccess` input:** `sudo` now needs `osCheck` (true or false).
+  `osCheck` alone, with no other grant, is refused.
 
 ### Upgrading from 2026.10.25.1 and earlier (breaking)
 
@@ -1389,6 +1405,17 @@ machine with an `osUpdater` model is scanned by that model instead. It prints **
 pending updates, security updates, held-back / dist-upgrade (apt), total packages,
 `needsReboot` (running-vs-installed kernel + `needs-restarting -r` / apt
 `reboot-required`), and per-container docker image drift.
+
+On dnf hosts it first runs `dnf -q -C check-update` (and `--security`) as root,
+when `sudo -n -l` shows that the login has that exact grant. `-C` reads only
+root's existing cache, so the check downloads and changes nothing, and root's
+dnf still checks the signature of each cached repo's metadata
+(`repo_gpgcheck=1`). The login cannot do that check itself on dnf 4 (Rocky / RHEL
+9): libdnf makes its temporary gpg home under `/run/user`, which only root can
+write. Then one repo that signs its metadata (for example Tailscale's) fails the
+whole check, and the count is unknown (`null`). Without the grant, the collector
+uses its unprivileged checks as before: the system cache, then dnf 4's per-user
+cache.
 
 On Arch (pacman) it never runs `pacman -Sy` (syncing the live database without
 upgrading invites partial upgrades). It counts updates with `checkupdates` from

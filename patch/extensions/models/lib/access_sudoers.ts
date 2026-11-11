@@ -21,7 +21,7 @@ import { DOCKER_HELPER_PATH } from "./docker_helper.ts";
  */
 export interface PrivCommand {
   id: string;
-  capability: "osUpgrade" | "reboot" | "plugin";
+  capability: "osUpgrade" | "osCheck" | "reboot" | "plugin";
   family: "apt" | "dnf" | "apk" | "pacman" | "systemd" | "plugin";
   bin: string;
   args: string[];
@@ -59,6 +59,24 @@ export const PRIV_COMMANDS: readonly PrivCommand[] = [
     family: "dnf",
     bin: "dnf",
     args: ["-y", "upgrade"],
+  },
+  // The read-only update check, on root's own cache (-C): no download, no change. Root's
+  // dnf checks each cached repo signature (repo_gpgcheck) with root's keyring. libdnf 4 cannot
+  // do that for a login without root: it makes its gpg home under /run/user, which only root
+  // may write. The scan uses these when granted, and its unprivileged checks otherwise.
+  {
+    id: "dnf-check",
+    capability: "osCheck",
+    family: "dnf",
+    bin: "dnf",
+    args: ["-q", "-C", "check-update"],
+  },
+  {
+    id: "dnf-check-security",
+    capability: "osCheck",
+    family: "dnf",
+    bin: "dnf",
+    args: ["-q", "-C", "check-update", "--security"],
   },
   {
     id: "apk-upgrade",
@@ -278,10 +296,12 @@ export function sudoersTemplate(cmd: PrivCommand): string {
  */
 export function requiredCommands(caps: {
   osUpgrade: boolean;
+  osCheck: boolean;
   reboot: boolean;
 }): PrivCommand[] {
   return PRIV_COMMANDS.filter((c) =>
     (c.capability === "osUpgrade" && caps.osUpgrade) ||
+    (c.capability === "osCheck" && caps.osCheck) ||
     (c.capability === "reboot" && caps.reboot)
   );
 }

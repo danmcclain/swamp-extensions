@@ -39,6 +39,8 @@ export interface PolicyMachine {
   osAutoScope?: OsAutoScope;
   /** Present = the machine has a docker block (an app layer, not an OS action). */
   docker?: unknown;
+  /** Present = a plugged model scans and upgrades the OS, not the built-in collector. */
+  osUpdater?: unknown;
   reach?: "ssh" | "pct";
   unsafe?: UnsafeT;
 }
@@ -62,6 +64,14 @@ export interface Capabilities {
   scan: true;
   /** safeOsUpdate may upgrade the OS packages. */
   osUpgrade: boolean;
+  /**
+   * The scan may run the read-only, cache-only OS update check as root (dnf: root's dnf
+   * checks the cached repo signatures, which libdnf 4 cannot do for the login). Only when os
+   * is on, the built-in collector scans the machine (no osUpdater), and the login already
+   * has a sudo grant (an upgrade, a reboot or the docker helper): it never makes a host
+   * that has no grant need sudo.
+   */
+  osCheck: boolean;
   /** reboot may reboot the host: every policy but scan-only, whatever `os` says. */
   reboot: boolean;
   /** The machine has a docker block (safeUpdate applies). */
@@ -124,11 +134,16 @@ export function capabilitiesFor(
 ): Capabilities {
   const { policy, autoScope } = effectivePolicy(m, g);
   const osOn = m.os !== false;
+  const osUpgrade = osOn && policy === "managed";
+  const reboot = policy !== "scan-only";
+  const docker = m.docker !== undefined && m.docker !== null;
   return {
     scan: true,
-    osUpgrade: osOn && policy === "managed",
-    reboot: policy !== "scan-only",
-    docker: m.docker !== undefined && m.docker !== null,
+    osUpgrade,
+    // The collector runs the check; a machine with an osUpdater model never runs the collector.
+    osCheck: osOn && m.osUpdater == null && (osUpgrade || reboot || docker),
+    reboot,
+    docker,
     autoUpdates: osOn && policy === "auto" ? autoScope : null,
     pctExec: m.reach === "pct" && unsafeRecord(m, "pctExec") !== null,
   };

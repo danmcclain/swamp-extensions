@@ -428,7 +428,7 @@ const DEFAULTS_LINES = [
 ];
 const APT_IDS = ["apt-update", "apt-upgrade", "apt-full-upgrade"];
 const ALL_IDS = [...APT_IDS, "reboot"];
-const OS_BOTH = { osUpgrade: true, reboot: true };
+const OS_BOTH = { osUpgrade: true, osCheck: true, reboot: true };
 
 /** The sudoers line that grants the table entry `id` to USER, each binary at its HOST_PATHS path. */
 function grantLine(id: string): string {
@@ -738,7 +738,7 @@ Deno.test("evaluateAudit: sudo that runs true for the login gives privilege-unre
 Deno.test("evaluateAudit: a may-run list that a required grant in our sudoers file explains gives no finding", async () => {
   const r = await evaluateAudit(grantsInput(grantFile(APT_IDS), {
     families: ["apt"],
-    machine: { sudo: { osUpgrade: true, reboot: false } },
+    machine: { sudo: { osUpgrade: true, osCheck: true, reboot: false } },
     userProbe: userFacts({
       sudoList: { rc: 0, out: "User x may run the following commands" },
     }),
@@ -1403,6 +1403,33 @@ Deno.test("evaluateAudit grants: one missing apt entry gives privilege-missing f
   }
 });
 
+Deno.test("evaluateAudit grants: a dnf host with the upgrade, both checks and the reboot is clean; a missing check names the scan", async () => {
+  const dnfIds = ["dnf-upgrade", "dnf-check", "dnf-check-security", "reboot"];
+  const clean = await evaluateAudit(
+    grantsInput(grantFile(dnfIds), { families: ["dnf", "systemd"] }),
+  );
+  expectFindings(clean);
+  const noCheck = await evaluateAudit(
+    grantsInput(grantFile(dnfIds.filter((id) => id !== "dnf-check")), {
+      families: ["dnf", "systemd"],
+    }),
+  );
+  expectFindings(noCheck, "privilege-missing:dnf-check warning");
+  const f = noCheck.findings.find((x) =>
+    x.id === "privilege-missing:dnf-check"
+  );
+  assertStringIncludes(f?.message ?? "", "scan cannot count updates");
+  // Without osCheck (a login with no other grant), the checks are not expected, and a
+  // check line is an extra privilege.
+  const extra = await evaluateAudit(
+    grantsInput(grantFile(["dnf-upgrade", "dnf-check", "reboot"]), {
+      families: ["dnf", "systemd"],
+      machine: { sudo: { osUpgrade: true, osCheck: false, reboot: true } },
+    }),
+  );
+  expectFindings(extra, `privilege-extra:${grantLine("dnf-check")} critical`);
+});
+
 Deno.test("evaluateAudit grants: entries of a family the host lacks are not missing, and the other families' are", async () => {
   // Only apt is on the host, so reboot (systemd) is not expected either.
   const apt = await evaluateAudit(
@@ -1410,7 +1437,12 @@ Deno.test("evaluateAudit grants: entries of a family the host lacks are not miss
   );
   expectFindings(apt);
   const dnf = await evaluateAudit(grantsInput([], { families: ["dnf"] }));
-  expectFindings(dnf, "privilege-missing:dnf-upgrade warning");
+  expectFindings(
+    dnf,
+    "privilege-missing:dnf-upgrade warning",
+    "privilege-missing:dnf-check warning",
+    "privilege-missing:dnf-check-security warning",
+  );
   const apkPacman = await evaluateAudit(
     grantsInput([], { families: ["apk", "pacman"] }),
   );
@@ -1508,7 +1540,7 @@ Deno.test("evaluateAudit grants: grants without both Defaults lines give privile
 Deno.test("evaluateAudit grants: a reboot line on a host whose policy does not allow reboot gives privilege-extra", async () => {
   const reboot = grantLine("reboot");
   const r = await evaluateAudit(grantsInput([...grantFile(APT_IDS), reboot], {
-    machine: { sudo: { osUpgrade: true, reboot: false } },
+    machine: { sudo: { osUpgrade: true, osCheck: true, reboot: false } },
   }));
   expectFindings(r, `privilege-extra:${reboot} critical`);
 });

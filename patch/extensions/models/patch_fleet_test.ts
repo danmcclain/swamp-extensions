@@ -21,6 +21,7 @@ import { createModelTestContext } from "jsr:@systeminit/swamp-testing@0.20260604
 import { authorizedKeysLine, PATHS } from "./lib/access_artifacts.ts";
 import {
   PRIV_COMMANDS,
+  privCommand,
   runtimeCommand,
   shellPaths,
 } from "./lib/access_sudoers.ts";
@@ -5570,6 +5571,8 @@ Deno.test("contract: every privileged line of the upgrade and reboot scripts is 
     for (const l of sudoLines(fleet.osUpgradeScript(mode))) emitted.add(l);
   }
   for (const l of sudoLines(fleet.SSH_REBOOT_CMD)) emitted.add(l);
+  // The collector runs the osCheck entries itself, with a literal `sudo -n` (it has no $SUDO).
+  for (const l of collectorSudoLines(fleet.COLLECTOR_SCRIPT)) emitted.add(l);
   const table = new Set(PRIV_COMMANDS.map(argvOf));
   for (const l of emitted) {
     assert(table.has(l), `a privileged line is not a table entry: ${l}`);
@@ -5579,6 +5582,18 @@ Deno.test("contract: every privileged line of the upgrade and reboot scripts is 
   }
   assertEquals(emitted.size, PRIV_COMMANDS.length);
 });
+
+/**
+ * The argv after each `sudo -n` of the collector, `sudo -n -l` (the grant check) included:
+ * the words up to the first redirection.
+ */
+function collectorSudoLines(script: string): string[] {
+  const out: string[] = [];
+  for (const m of script.matchAll(/sudo -n (?:-l )?([^>\n]*?) (?:>|2>)/g)) {
+    out.push(m[1].trim());
+  }
+  return out;
+}
 
 Deno.test("contract: the runtime runs each privileged binary by its resolved absolute path, never by a bare name", () => {
   for (
@@ -5643,10 +5658,10 @@ Deno.test("accessTargets: each machine's sudo flags follow its capabilities", ()
   } as never);
   const sudo = Object.fromEntries(targets.map((t) => [t.host, t.input.sudo]));
   assertEquals(sudo, {
-    managed: { osUpgrade: true, reboot: true, docker: false },
-    auto: { osUpgrade: false, reboot: true, docker: false },
-    scan: { osUpgrade: false, reboot: false, docker: false },
-    noos: { osUpgrade: false, reboot: true, docker: false },
+    managed: { osUpgrade: true, osCheck: true, reboot: true, docker: false },
+    auto: { osUpgrade: false, osCheck: true, reboot: true, docker: false },
+    scan: { osUpgrade: false, osCheck: false, reboot: false, docker: false },
+    noos: { osUpgrade: false, osCheck: false, reboot: true, docker: false },
   });
   const auto = targets.find((t) => t.host === "auto")!;
   assertEquals(auto.input.autoUpdates, "security");
@@ -5954,9 +5969,23 @@ Deno.test("globalArguments: unsafe, acceptedRisks and access parse; a boolean pc
   }).success, "a boolean pctExec must be rejected");
 });
 
-Deno.test("collector: never uses root or sudo, and never refreshes the package cache", () => {
+Deno.test("collector: sudo only for the two granted dnf checks, and never refreshes the package cache", () => {
   const s = fleet.COLLECTOR_SCRIPT;
-  assert(!s.includes("sudo"), "no sudo, not even in a comment");
+  // Each check runs only after `sudo -n -l` confirms that exact grant, and only as non-root.
+  const argv = (id: string) =>
+    runtimeCommand(privCommand(id), shellPaths(privCommand(id))).join(" ");
+  const allowed: string[] = [];
+  for (const id of ["dnf-check", "dnf-check-security"]) {
+    const a = argv(id);
+    allowed.push(`sudo -n -l ${a} >/dev/null 2>&1 || return 1`);
+    allowed.push(`dnf_out="$(sudo -n ${a} 2>/dev/null)"`);
+  }
+  for (const line of allowed) assertStringIncludes(s, line);
+  // No other line of code runs sudo: comments may name it, nothing else may.
+  const code = s.split("\n").filter((l) => !/^\s*#/.test(l));
+  const sudoCode = code.filter((l) => l.includes("sudo"));
+  assertEquals(sudoCode.map((l) => l.trim()).sort(), [...allowed].sort());
+  assertStringIncludes(s, '[ "$(id -u)" -ne 0 ] || return 1');
   assert(!s.includes("apt-get update"));
   assert(!s.includes("apk update"));
   assertStringIncludes(s, '"schemaVersion":5');
@@ -5966,15 +5995,28 @@ Deno.test("collector: never uses root or sudo, and never refreshes the package c
 });
 
 /**
- * Run collect_dnf from the bundled collector with a fake `dnf` (a sh body) and a fake
- * `rpm` first on PATH. Returns the echoed counts (stdout) and the log (stderr).
+ * Run collect_dnf from the bundled collector with a fake `dnf` (a sh body), a fake `sudo`
+ * (a sh body; by default it grants nothing, as `sudo -n` without a grant) and a fake `rpm`
+ * first on PATH, as a login that is not root. Returns the echoed counts (stdout) and the
+ * log (stderr). The test runner's own sudo is never reached.
  */
-async function runDnf(dnf: string): Promise<{ out: string; err: string }> {
+async function runDnf(
+  dnf: string,
+  sudo = "exit 1",
+): Promise<{ out: string; err: string; sudoLog: string }> {
   const dir = await Deno.makeTempDir();
   try {
     await Deno.writeTextFile(`${dir}/dnf`, `#!/bin/sh\n${dnf}\n`);
+    // The collector sends sudo's output to /dev/null, so the fake logs each call to a file.
+    await Deno.writeTextFile(
+      `${dir}/sudo`,
+      `#!/bin/sh\necho "SUDO $*" >>"${dir}/sudo.log"\n${sudo}\n`,
+    );
+    await Deno.writeTextFile(`${dir}/id`, "#!/bin/sh\necho 1000\n");
     await Deno.writeTextFile(`${dir}/rpm`, "#!/bin/sh\nexit 0\n");
     await Deno.chmod(`${dir}/dnf`, 0o755);
+    await Deno.chmod(`${dir}/sudo`, 0o755);
+    await Deno.chmod(`${dir}/id`, 0o755);
     await Deno.chmod(`${dir}/rpm`, 0o755);
     const body = fleet.COLLECTOR_SCRIPT.split("\n")
       .filter((l) => l !== "main </dev/null")
@@ -5987,9 +6029,16 @@ async function runDnf(dnf: string): Promise<{ out: string; err: string }> {
       stdout: "piped",
       stderr: "piped",
     }).output();
+    let sudoLog = "";
+    try {
+      sudoLog = await Deno.readTextFile(`${dir}/sudo.log`);
+    } catch {
+      // sudo was never called.
+    }
     return {
       out: new TextDecoder().decode(out.stdout),
       err: new TextDecoder().decode(out.stderr),
+      sudoLog,
     };
   } finally {
     await Deno.remove(dir, { recursive: true });
@@ -6014,6 +6063,44 @@ Deno.test("collector (dnf): an error on the system cache falls back to the per-u
 Deno.test("collector (dnf): no updates (rc 0) is 0, not null", async () => {
   const r = await runDnf("exit 0");
   assertStringIncludes(r.out, "U=0 S=0 C=0");
+});
+
+/** A fake sudo that grants both dnf checks and answers them as root's dnf would. */
+const SUDO_GRANTS_CHECKS = `case "$*" in
+  "-n -l "*" -q -C check-update"|"-n -l "*" -q -C check-update --security") exit 0 ;;
+  "-n "*" -q -C check-update --security") printf 'a.x86_64 1 baseos\\n'; exit 100 ;;
+  "-n "*" -q -C check-update") printf 'a.x86_64 1 baseos\\nb.noarch 2 appstream\\n'; exit 100 ;;
+esac
+exit 1`;
+
+Deno.test("collector (dnf): with the grant, root's cache-only check answers, even when the login's own check fails", async () => {
+  // The login's dnf fails as on Rocky 9 with a repo_gpgcheck repo (libdnf cannot make its gpg
+  // home under /run/user); root's check through the grant still counts.
+  const r = await runDnf("exit 1", SUDO_GRANTS_CHECKS);
+  assertStringIncludes(r.out, "U=2 S=1 C=0");
+});
+
+Deno.test("collector (dnf): with the grant, a failing root check falls back to the login's own checks", async () => {
+  const sudo = `case "$*" in "-n -l "*) exit 0 ;; esac\nexit 1`;
+  const r = await runDnf("exit 0", sudo);
+  assertStringIncludes(r.out, "U=0 S=0 C=0");
+});
+
+Deno.test("collector (dnf): without the grant, sudo never runs the command: only sudo -l is asked", async () => {
+  // The default fake grants nothing: each sudo call is a refused `sudo -n -l`.
+  const r = await runDnf("exit 0");
+  assertStringIncludes(r.out, "U=0 S=0 C=0");
+  const calls = r.sudoLog.split("\n").filter((l) => l !== "");
+  assertEquals(calls.length, 2, r.sudoLog);
+  for (const c of calls) assert(c.startsWith("SUDO -n -l "), c);
+});
+
+Deno.test("collector (dnf): sudo gets dnf by its absolute path and exactly the table's arguments", async () => {
+  const r = await runDnf("exit 0");
+  const asked = r.sudoLog.split("\n").filter((l) => l.startsWith("SUDO "));
+  assertEquals(asked.length, 2, r.sudoLog);
+  assertMatch(asked[0], /^SUDO -n -l \/\S+\/dnf -q -C check-update$/);
+  assertMatch(asked[1], /^SUDO -n -l \/\S+\/dnf -q -C check-update --security$/);
 });
 
 /** A collector stdout that reports the root-written docker file, base64 as shipped. */
@@ -8799,7 +8886,12 @@ Deno.test("accessTargets: a docker machine gets its compose project and the help
     ],
   } as never);
   const by = Object.fromEntries(targets.map((t) => [t.host, t.input]));
-  assertEquals(by.dock.sudo, { osUpgrade: false, reboot: false, docker: true });
+  assertEquals(by.dock.sudo, {
+    osUpgrade: false,
+    osCheck: true,
+    reboot: false,
+    docker: true,
+  });
   assertEquals(by.dock.dockerProjects, [{
     name: "app",
     composeDir: "/srv/app",

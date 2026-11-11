@@ -474,7 +474,7 @@ export interface AuditInput {
      * The sudo capabilities the access provisioning grants (capabilitiesFor()): with
      * pluginCommands, the required set our sudoers file is compared with. None when absent.
      */
-    sudo?: { osUpgrade: boolean; reboot: boolean };
+    sudo?: { osUpgrade: boolean; osCheck: boolean; reboot: boolean };
     /**
      * The Proxmox API tokens this machine uses, one entry per node model: the one behind
      * its snapshots (vm.proxmoxNode or ct.nodeModel) and the ones its proxmox-cluster
@@ -752,12 +752,15 @@ interface RequiredGrant {
  * docker helper when it has docker, and the plugged models' declared commands.
  */
 function requiredGrants(i: AuditInput): RequiredGrant[] {
-  const caps = i.machine.sudo ?? { osUpgrade: false, reboot: false };
+  const caps = i.machine.sudo ??
+    { osUpgrade: false, osCheck: false, reboot: false };
   const commands = requiredCommands(caps).map((c): RequiredGrant => ({
     id: c.id,
     family: c.family,
     blocks: c.capability === "reboot"
       ? "safeOsUpdate cannot reboot"
+      : c.capability === "osCheck"
+      ? "scan cannot count updates from repos that sign their metadata (repo_gpgcheck)"
       : "safeOsUpdate cannot update the OS",
     matches: templateMatcher(sudoersTemplate(c)),
   }));
