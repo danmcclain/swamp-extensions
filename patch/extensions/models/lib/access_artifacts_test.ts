@@ -467,7 +467,12 @@ case "$1" in
   ps) printf '%s\\n' "$FAKE_NAMES" ;;
   inspect) echo "nginx:1.27" ;;
   image) echo "nginx@${DIGEST_LOCAL}" ;;
-  buildx) echo "${DIGEST_REG}" ;;
+  # Like the real buildx: it makes its state directory under DOCKER_CONFIG (default
+  # ~/.docker) first, and fails when it cannot.
+  buildx)
+    mkdir -p "\${DOCKER_CONFIG:-\$HOME/.docker}/buildx" 2>/dev/null || { echo "ERROR: read-only file system" >&2; exit 1; }
+    printf "%s\\n" "\${DOCKER_CONFIG:-}" >> "\${FAKE_LOG:-/dev/null}"
+    echo "${DIGEST_REG}" ;;
 esac
 `,
   );
@@ -475,7 +480,10 @@ esac
   return bin;
 }
 
-/** Run the producer written for `outPath` with the fake docker first on PATH. */
+/**
+ * Run the producer written for `outPath` with the fake docker first on PATH. HOME is a
+ * read-only directory, as the unit's ProtectHome=yes makes /root.
+ */
 async function runProducer(
   dir: string,
   outPath: string,
@@ -483,10 +491,12 @@ async function runProducer(
 ): Promise<Deno.CommandOutput> {
   const bin = await writeFakeDocker(dir);
   const file = `${dir}/producer.sh`;
+  const home = `${dir}/home`;
+  await Deno.mkdir(home, { mode: 0o555 });
   await Deno.writeTextFile(file, dockerProducerScript(outPath));
   return await new Deno.Command("bash", {
     args: [file],
-    env: { ...env, PATH: `${bin}:${Deno.env.get("PATH") ?? ""}` },
+    env: { HOME: home, ...env, PATH: `${bin}:${Deno.env.get("PATH") ?? ""}` },
   }).output();
 }
 
@@ -508,6 +518,36 @@ Deno.test("dockerProducerScript: two containers give a valid inventory file", as
       registryDigest: DIGEST_REG,
       updateAvailable: true,
     });
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("dockerProducerScript: buildx gets a fresh DOCKER_CONFIG in /tmp, removed afterwards", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    const out = `${dir}/docker-inventory.json`;
+    const log = `${dir}/buildx.log`;
+    const r = await runProducer(dir, out, {
+      FAKE_NAMES: "web\ndb",
+      FAKE_LOG: log,
+      DOCKER_CONFIG: `${dir}/home/.docker`,
+    });
+    assertEquals(r.code, 0, new TextDecoder().decode(r.stderr));
+    const used = (await Deno.readTextFile(log)).trim().split("\n");
+    assertEquals(used.length, 2);
+    // One directory for the run, not the inherited (read-only) one.
+    assertEquals(used[0], used[1]);
+    assert(/^\/tmp\/swamp-patch-docker\.[A-Za-z0-9]+$/.test(used[0]), used[0]);
+    let gone = false;
+    try {
+      await Deno.stat(used[0]);
+    } catch (e) {
+      gone = e instanceof Deno.errors.NotFound;
+    }
+    assert(gone, `${used[0]} was not removed`);
+    const json = JSON.parse(await Deno.readTextFile(out));
+    assertEquals(json.dockerImages[0].registryDigest, DIGEST_REG);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }

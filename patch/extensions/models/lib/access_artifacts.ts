@@ -334,6 +334,13 @@ umask 022
 
 OUT=${shQuote(outPath)}
 
+# buildx writes its state under DOCKER_CONFIG (default ~/.docker) before it reads a
+# registry, and the unit runs with ProtectHome=yes, so /root is read-only. A fresh, empty
+# directory in the unit's private /tmp takes its place. It holds no registry credentials.
+DOCKER_CONFIG="$(mktemp -d /tmp/swamp-patch-docker.XXXXXX)" || exit 1
+export DOCKER_CONFIG
+trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+
 # Minimal JSON string escaper (backslash, double-quote, strip control chars).
 jesc() { printf '%s' "\${1-}" | sed -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g' | tr -d '\\000-\\037'; }
 

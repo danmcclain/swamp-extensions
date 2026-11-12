@@ -4439,7 +4439,7 @@ export async function checkPrivilegesDeclared(
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.11.11.2",
+  version: "2026.11.11.3",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
@@ -4501,6 +4501,14 @@ export const model = {
         "Version bump, no globalArguments schema change. The inventory lists the pending " +
         "updates by name (pendingUpdates); earlier records have none (null) until the next " +
         "scan. dnf counts no longer include the Obsoleting Packages section twice.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.11.3",
+      description:
+        "Version bump, no globalArguments schema change. The root docker inventory producer " +
+        "gives buildx a temporary DOCKER_CONFIG, so the registry check works under the " +
+        "unit's ProtectHome=yes. Re-run provisionAccess on docker hosts to install it.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

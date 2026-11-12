@@ -22,6 +22,7 @@ containers) through a single `@swamp/ssh` model.
   - [Accepted risks](#accepted-risks)
   - [Auditing access](#auditing-access)
   - [Recommended setup](#recommended-setup)
+  - [Upgrading from 2026.11.11.2](#upgrading-from-202611112)
   - [Upgrading from 2026.11.11.1](#upgrading-from-202611111)
   - [Upgrading from 2026.11.07.1](#upgrading-from-202611071)
   - [Upgrading from 2026.10.25.1 and earlier (breaking)](#upgrading-from-202610251-and-earlier-breaking)
@@ -468,6 +469,18 @@ installs packages). The docker inventory producer needs systemd (OpenRC hosts
 are refused for docker). Private registry images show `updateAvailable: null`
 (the producer has no registry credentials). `osUpdatePolicy: auto` supports apt
 and dnf only.
+
+### Upgrading from 2026.11.11.2
+
+- **Re-run `provisionAccess` on docker hosts.** The root docker inventory producer
+  failed every registry check: its unit runs with `ProtectHome=yes`, and buildx must
+  write `~/.docker` first, so `updateAvailable` was always `null` (`?` in the
+  reports). The producer now gives buildx an empty `DOCKER_CONFIG` in the unit's
+  private `/tmp`, removed when it exits; `ProtectHome=yes` stays.
+- **Until then** `auditAccess` reports `managed-file-drift` (high) for
+  `/usr/local/libexec/swamp-patch/docker-inventory`, and the registry checks stay
+  `null`. After it, the new producer first runs at the next hourly timer run
+  (within about 65 minutes); `provisionAccess` does not run it.
 
 ### Upgrading from 2026.11.11.1
 
