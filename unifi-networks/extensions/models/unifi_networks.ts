@@ -239,6 +239,64 @@ const DnsRecordChangeSchema = z.object({
   records: z.array(DnsRecordResultSchema),
 });
 
+const PortNetworkSchema = z.object({
+  networkId: z.string(),
+  networkName: z.string(),
+  vlanId: z.number().describe("1 for the untagged Default network"),
+});
+
+const SwitchPortSchema = z.object({
+  deviceName: z.string(),
+  deviceMac: z.string(),
+  deviceModel: z.string().optional(),
+  portIdx: z.number(),
+  portName: z.string().optional(),
+  up: z.boolean(),
+  speedMbps: z.number().optional(),
+  media: z.string().optional(),
+  isUplink: z.boolean(),
+  source: z.enum(["override", "profile", "port"]).describe(
+    "Where the VLAN settings come from: a per-port override, a port profile, " +
+      "or the port's own defaults",
+  ),
+  profileName: z.string().optional(),
+  forward: z.string().describe("all | native | customize | disabled"),
+  native: PortNetworkSchema.optional().describe(
+    "Untagged network; absent when the port is disabled or has none",
+  ),
+  taggedMode: z.enum(["all", "none", "custom"]).describe(
+    "all = every VLAN network tagged; none = tagged blocked; custom = a subset",
+  ),
+  tagged: z.array(PortNetworkSchema).describe(
+    "VLAN networks the port carries tagged (the native network excluded)",
+  ),
+  excluded: z.array(PortNetworkSchema).describe(
+    "Networks excluded from tagging (custom mode)",
+  ),
+  clients: z.array(z.object({
+    name: z.string().optional(),
+    mac: z.string(),
+    ip: z.string().optional(),
+  })).describe("Wired clients the controller last saw on this port"),
+  lldpNeighbors: z.array(z.object({
+    chassisId: z.string(),
+    portId: z.string().optional(),
+  })),
+});
+
+const SiteSwitchPortsSchema = z.object({
+  scannedAt: z.string(),
+  mode: z.enum(["local", "cloud"]),
+  target: z.string(),
+  consoleId: z.string().optional(),
+  consoleShortname: z.string().optional(),
+  siteId: z.string(),
+  siteName: z.string(),
+  deviceCount: z.number(),
+  portCount: z.number(),
+  ports: z.array(SwitchPortSchema),
+});
+
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 interface RequestOptions {
@@ -967,6 +1025,249 @@ function mapConsole(h: Record<string, unknown>): z.infer<typeof ConsoleSchema> {
   };
 }
 
+// ── switch ports (classic controller API) ────────────────────────────────────
+//
+// The integration API reports a switch port's state, speed and PoE but not its
+// VLANs. The classic controller API (/proxy/network/api/s/<site>/...) has the
+// port table, per-port overrides, port profiles and network VLAN ids, and it
+// accepts the same X-API-KEY.
+
+type PortNetwork = z.infer<typeof PortNetworkSchema>;
+
+/** Networks a switch port can carry tagged. */
+const TAGGABLE_PURPOSES = new Set(["corporate", "guest", "vlan-only"]);
+
+export interface ClassicNetworks {
+  byId: Record<string, PortNetwork & { purpose?: string }>;
+  /** The untagged Default LAN, native on a port that forwards "all". */
+  defaultId?: string;
+}
+
+/** Index rest/networkconf by id, with the VLAN id each network uses. */
+export function mapClassicNetworks(raw: Obj[]): ClassicNetworks {
+  const byId: ClassicNetworks["byId"] = {};
+  let defaultId: string | undefined;
+  for (const n of raw) {
+    const id = n._id as string;
+    const purpose = n.purpose as string | undefined;
+    const vlan = Number(n.vlan);
+    const vlanId = n.vlan_enabled === true && Number.isInteger(vlan) && vlan > 0
+      ? vlan
+      : 1;
+    byId[id] = {
+      networkId: id,
+      networkName: n.name as string,
+      vlanId,
+      purpose,
+    };
+    if (
+      purpose === "corporate" && vlanId === 1 &&
+      (defaultId === undefined || n.attr_no_delete === true)
+    ) {
+      defaultId = id;
+    }
+  }
+  return { byId, defaultId };
+}
+
+export interface PortVlans {
+  source: "override" | "profile" | "port";
+  profileName?: string;
+  forward: string;
+  native?: PortNetwork;
+  taggedMode: "all" | "none" | "custom";
+  tagged: PortNetwork[];
+  excluded: PortNetwork[];
+}
+
+const VLAN_KEYS = [
+  "forward",
+  "native_networkconf_id",
+  "tagged_vlan_mgmt",
+  "excluded_networkconf_ids",
+  "tagged_networkconf_ids",
+];
+
+/**
+ * The VLANs a switch port carries. Each setting comes from the per-port
+ * override first, then the port profile it names, then the port table entry.
+ */
+export function resolvePortVlans(
+  port: Obj,
+  override: Obj | undefined,
+  profiles: Record<string, Obj>,
+  nets: ClassicNetworks,
+): PortVlans {
+  const profileId = (override?.portconf_id ?? port.portconf_id) as
+    | string
+    | undefined;
+  const profile = profileId ? profiles[profileId] : undefined;
+  const pick = (k: string): unknown => override?.[k] ?? profile?.[k] ?? port[k];
+  const source = override && VLAN_KEYS.some((k) => override[k] !== undefined)
+    ? "override"
+    : profile
+    ? "profile"
+    : "port";
+  const net = (id: unknown): PortNetwork | undefined => {
+    if (typeof id !== "string" || id === "") return undefined;
+    const n = nets.byId[id];
+    return n
+      ? { networkId: n.networkId, networkName: n.networkName, vlanId: n.vlanId }
+      : { networkId: id, networkName: id, vlanId: 0 };
+  };
+  const ids = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  const taggable = (nativeId?: string, skip: string[] = []) =>
+    Object.values(nets.byId)
+      .filter((n) =>
+        TAGGABLE_PURPOSES.has(n.purpose ?? "") && n.vlanId !== 1 &&
+        n.networkId !== nativeId && !skip.includes(n.networkId)
+      )
+      .map((n) => net(n.networkId)!)
+      .sort((a, b) => a.vlanId - b.vlanId);
+
+  const forward = (pick("forward") as string | undefined) ?? "all";
+  const base = {
+    source,
+    profileName: profile?.name as string | undefined,
+    forward,
+  } as const;
+  if (forward === "disabled") {
+    return { ...base, taggedMode: "none", tagged: [], excluded: [] };
+  }
+  if (forward === "all") {
+    const native = net(nets.defaultId);
+    return {
+      ...base,
+      native,
+      taggedMode: "all",
+      tagged: taggable(native?.networkId),
+      excluded: [],
+    };
+  }
+  const native = net(pick("native_networkconf_id") ?? nets.defaultId);
+  if (forward === "native") {
+    return { ...base, native, taggedMode: "none", tagged: [], excluded: [] };
+  }
+  // customize: tagged_vlan_mgmt auto | block_all | custom (with exclusions).
+  // Older controllers list the tagged networks in tagged_networkconf_ids.
+  const mgmt = pick("tagged_vlan_mgmt") as string | undefined;
+  const explicit = ids(pick("tagged_networkconf_ids"));
+  if (mgmt === "block_all") {
+    return { ...base, native, taggedMode: "none", tagged: [], excluded: [] };
+  }
+  if (mgmt === "custom") {
+    const skip = ids(pick("excluded_networkconf_ids"));
+    return {
+      ...base,
+      native,
+      taggedMode: "custom",
+      tagged: taggable(native?.networkId, skip),
+      excluded: skip.map((id) => net(id)!),
+    };
+  }
+  if (mgmt === undefined && explicit.length > 0) {
+    return {
+      ...base,
+      native,
+      taggedMode: "custom",
+      tagged: explicit.map((id) => net(id)!).sort((a, b) =>
+        a.vlanId - b.vlanId
+      ),
+      excluded: [],
+    };
+  }
+  return {
+    ...base,
+    native,
+    taggedMode: "all",
+    tagged: taggable(native?.networkId),
+    excluded: [],
+  };
+}
+
+/**
+ * Every port of every device that has a port table (switches, and gateways
+ * with switch ports), with its VLANs, its wired clients and LLDP neighbours.
+ */
+export function mapSwitchPorts(
+  devices: Obj[],
+  portconfs: Obj[],
+  networkconfs: Obj[],
+  clients: Obj[],
+): z.infer<typeof SwitchPortSchema>[] {
+  const nets = mapClassicNetworks(networkconfs);
+  const profiles: Record<string, Obj> = {};
+  for (const p of portconfs) profiles[p._id as string] = p;
+  const out: z.infer<typeof SwitchPortSchema>[] = [];
+  for (const d of devices) {
+    const table = d.port_table;
+    if (!Array.isArray(table) || table.length === 0) continue;
+    const mac = d.mac as string;
+    const overrides =
+      (Array.isArray(d.port_overrides) ? d.port_overrides : []) as Obj[];
+    const lldp = (Array.isArray(d.lldp_table) ? d.lldp_table : []) as Obj[];
+    for (const p of table as Obj[]) {
+      const idx = p.port_idx as number;
+      const vlans = resolvePortVlans(
+        p,
+        overrides.find((o) => o.port_idx === idx),
+        profiles,
+        nets,
+      );
+      out.push({
+        deviceName: (d.name as string | undefined) ?? mac,
+        deviceMac: mac,
+        deviceModel: d.model as string | undefined,
+        portIdx: idx,
+        portName: p.name as string | undefined,
+        up: p.up === true,
+        speedMbps: typeof p.speed === "number" ? p.speed : undefined,
+        media: p.media as string | undefined,
+        isUplink: p.is_uplink === true,
+        ...vlans,
+        clients: clients
+          .filter((c) => c.sw_mac === mac && c.sw_port === idx)
+          .map((c) => ({
+            name: (c.name ?? c.hostname) as string | undefined,
+            mac: c.mac as string,
+            ip: c.ip as string | undefined,
+          })),
+        lldpNeighbors: lldp
+          .filter((l) => l.local_port_idx === idx)
+          .map((l) => ({
+            chassisId: l.chassis_id as string,
+            portId: l.port_id as string | undefined,
+          })),
+      });
+    }
+  }
+  return out;
+}
+
+/** Classic API base for a target: the integration base with /api in its place. */
+export function classicBase(integrationBase: string): string {
+  return integrationBase.replace(/\/integration$/, "/api");
+}
+
+/** GET a classic API list ({meta: {rc}, data: [...]}) and return its data. */
+async function classicList(
+  url: string,
+  apiKey: string,
+  caCert: string | undefined,
+): Promise<Obj[]> {
+  const r = await apiGet(url, apiKey, caCert);
+  const rc = (r.meta as Obj | undefined)?.rc;
+  if (rc !== "ok") {
+    throw new Error(
+      `GET ${url} returned rc=${String(rc)}: ${
+        String((r.meta as Obj | undefined)?.msg ?? "")
+      }`,
+    );
+  }
+  return Array.isArray(r.data) ? r.data as Obj[] : [];
+}
+
 /** A console to scan: its proxy base URL plus identity for labelling output. */
 interface Target {
   base: string;
@@ -1096,7 +1397,7 @@ interface Ctx {
 
 export const model = {
   type: "@dmc/unifi-networks",
-  version: "2026.11.09.1",
+  version: "2026.11.12.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1109,6 +1410,12 @@ export const model = {
         const { verifyTls: _verifyTls, ...rest } = old;
         return rest;
       },
+    },
+    {
+      toVersion: "2026.11.12.1",
+      description:
+        "Adds scanPorts: switch port VLANs from the classic controller API.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
   resources: {
@@ -1141,6 +1448,14 @@ export const model = {
       description:
         "WiFi broadcasts (SSIDs) per UniFi site, mapped to VLAN by network",
       schema: SiteWifiSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    siteSwitchPorts: {
+      description:
+        "Switch ports per UniFi site with their native and tagged VLANs, " +
+        "wired clients and LLDP neighbours",
+      schema: SiteSwitchPortsSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -1531,6 +1846,85 @@ export const model = {
 
         context.logger.info("{method}: wrote {count} site snapshot(s)", {
           method: "scanClients",
+          count: dataHandles.length,
+        });
+        return { dataHandles };
+      },
+    },
+
+    scanPorts: {
+      description:
+        "Fetch every switch port per site with its VLANs (native network, " +
+        "tagged mode and tagged/excluded networks, resolved from the port " +
+        "override, then its port profile, then the port defaults), its wired " +
+        "clients and LLDP neighbours. Reads the classic controller API with " +
+        "the same key, because the integration API has no port VLANs. Read-" +
+        "only. Same mode/fan-out rules as scan.",
+      arguments: z.object({}),
+      execute: async (_args: Record<string, never>, context: Ctx) => {
+        const g = context.globalArgs;
+        const targets = await resolveTargets(g);
+        context.logger.info("{method}: scanning {count} console(s)", {
+          method: "scanPorts",
+          count: targets.length,
+        });
+        const disambiguate = targets.length > 1;
+        const dataHandles = [];
+
+        for (const t of targets) {
+          const sites = await fetchAllPages(
+            t.base,
+            "/v1/sites",
+            g.apiKey,
+            t.caCert,
+          );
+          for (const site of sites) {
+            const siteId = site.id as string;
+            const siteName = (site.name as string) ?? siteId;
+            // The classic API names a site by its short name ("default").
+            const ref = site.internalReference as string | undefined;
+            if (!ref) {
+              throw new Error(
+                `Site ${siteName} (${siteId}) has no internalReference, so ` +
+                  "its classic API path is unknown",
+              );
+            }
+            const api = `${classicBase(t.base)}/s/${encodeURIComponent(ref)}`;
+            const [devices, portconfs, networkconfs, clients] = await Promise
+              .all([
+                classicList(`${api}/stat/device`, g.apiKey, t.caCert),
+                classicList(`${api}/rest/portconf`, g.apiKey, t.caCert),
+                classicList(`${api}/rest/networkconf`, g.apiKey, t.caCert),
+                classicList(`${api}/stat/sta`, g.apiKey, t.caCert),
+              ]);
+            const ports = mapSwitchPorts(
+              devices,
+              portconfs,
+              networkconfs,
+              clients,
+            );
+            const handle = await context.writeResource(
+              "siteSwitchPorts",
+              instanceName(t, siteName, disambiguate),
+              {
+                scannedAt: new Date().toISOString(),
+                mode: g.mode,
+                target: t.target,
+                consoleId: t.consoleId,
+                consoleShortname: t.consoleShortname,
+                siteId,
+                siteName,
+                deviceCount: new Set(ports.map((p) => p.deviceMac)).size,
+                portCount: ports.length,
+                ports,
+              },
+            );
+            dataHandles.push(handle);
+          }
+        }
+
+        context.logger.info("{method}: wrote {count} site snapshot(s)", {
+          method: "scanPorts",
           count: dataHandles.length,
         });
         return { dataHandles };

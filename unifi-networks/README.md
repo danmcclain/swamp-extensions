@@ -70,10 +70,27 @@ set `caCert`.
 | `scanFirewall`     | Firewall zones + policies, joined to zone names with flattened rule detail |
 | `scanClients`      | Connected clients, mapped to VLAN by IP-subnet match                       |
 | `scanWifi`         | WiFi SSIDs, mapped to VLAN via their network reference                     |
+| `scanPorts`        | Switch ports with native/tagged VLANs, wired clients and LLDP neighbours   |
 | `consoles`         | List consoles visible to a cloud key (cloud mode)                          |
 | `deletePolicy`     | Delete one user-defined firewall policy (verifies it is user-defined)      |
 | `setNetworkDomain` | Set the DHCP domain name on named networks (dry run by default)            |
 | `setDnsRecords`    | Create or update local DNS A records (dry run by default)                  |
+
+### Switch port VLANs
+
+The integration API reports a switch port's state, speed and PoE, but not its
+VLANs. `scanPorts` reads them from the classic controller API
+(`/proxy/network/api/s/<site>/stat/device`, `rest/portconf`,
+`rest/networkconf`, `stat/sta`) with the same API key. It is read-only. Each
+setting comes from the per-port override first, then the port profile it names,
+then the port's own defaults (`source` says which). `taggedMode` is `all`,
+`none` or `custom`; `tagged` lists the VLAN networks the port carries tagged,
+without the native one.
+
+```bash
+swamp model method run my-unifi scanPorts
+swamp data query 'specName == "siteSwitchPorts"' --select content
+```
 
 ### Setting a network's domain name
 

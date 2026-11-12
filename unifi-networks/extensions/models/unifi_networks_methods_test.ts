@@ -67,6 +67,8 @@ interface FakeConsole {
   onNetworkPut?: (stored: Obj) => void;
   /** Called on a DNS POST/PUT; may alter what the console stores. */
   onDnsWrite?: (stored: Obj) => void;
+  /** Classic API lists by path under /proxy/network/api/s/default. */
+  classic?: Record<string, Obj[]>;
 }
 
 function fakeConsole(): FakeConsole {
@@ -95,13 +97,26 @@ const page = (data: Obj[]) =>
 function handler(c: FakeConsole) {
   let nextId = 1;
   return async (req: Request): Promise<Response> => {
-    const path = new URL(req.url).pathname.replace(
+    const full = new URL(req.url).pathname;
+    const classic = full.match(/^\/proxy\/network\/api\/s\/default\/(.+)$/);
+    if (classic && req.method === "GET") {
+      const data = c.classic?.[classic[1]];
+      if (!data) {
+        return new Response(`unexpected ${classic[1]}`, { status: 500 });
+      }
+      return Response.json({ meta: { rc: "ok" }, data });
+    }
+    const path = full.replace(
       `/proxy/network/integration`,
       "",
     );
     const m = req.method;
     if (m === "GET" && path === "/v1/sites") {
-      return page([{ id: SITE, name: "Default" }]);
+      return page([{
+        id: SITE,
+        name: "Default",
+        internalReference: "default",
+      }]);
     }
     if (m === "GET" && path === `/v1/sites/${SITE}/networks`) {
       return page([...c.networks.values()].map((n) => ({
@@ -595,8 +610,7 @@ Deno.test("deletePolicy: refuses a system-defined policy", async () => {
 // ── upgrades ──────────────────────────────────────────────────────────────────
 
 Deno.test("upgrade 2026.11.09.1: drops verifyTls, keeps the rest", () => {
-  const [upgrade] = model.upgrades;
-  assertEquals(upgrade.toVersion, model.version);
+  const upgrade = model.upgrades.find((u) => u.toVersion === "2026.11.09.1")!;
   assertEquals(
     upgrade.upgradeAttributes({
       mode: "local",
@@ -609,4 +623,115 @@ Deno.test("upgrade 2026.11.09.1: drops verifyTls, keeps the rest", () => {
   // Arguments that never had verifyTls pass through unchanged.
   const cloud = { mode: "cloud", apiKey: "k", consoleId: "c1" };
   assertEquals(upgrade.upgradeAttributes(cloud), cloud);
+});
+
+// ── scanPorts ─────────────────────────────────────────────────────────────────
+
+function classicConsole(): FakeConsole {
+  const c = fakeConsole();
+  c.classic = {
+    "stat/device": [{
+      name: "Core",
+      mac: "aa:aa",
+      model: "SW24A",
+      port_table: [
+        { port_idx: 19, name: "Port 19", up: true, forward: "all" },
+        { port_idx: 25, name: "Port 25", up: true, forward: "all" },
+      ],
+      port_overrides: [{
+        port_idx: 19,
+        forward: "customize",
+        native_networkconf_id: "n-10",
+        tagged_vlan_mgmt: "auto",
+      }],
+      lldp_table: [],
+    }],
+    "rest/portconf": [],
+    "rest/networkconf": [
+      {
+        _id: "n-1",
+        name: "Default",
+        purpose: "corporate",
+        attr_no_delete: true,
+      },
+      {
+        _id: "n-10",
+        name: "Servers",
+        purpose: "corporate",
+        vlan: 10,
+        vlan_enabled: true,
+      },
+      {
+        _id: "n-20",
+        name: "Services",
+        purpose: "corporate",
+        vlan: 20,
+        vlan_enabled: true,
+      },
+    ],
+    "stat/sta": [{
+      mac: "11:11",
+      name: "hv-2",
+      ip: "192.0.2.52",
+      sw_mac: "aa:aa",
+      sw_port: 19,
+    }],
+  };
+  return c;
+}
+
+Deno.test("scanPorts: reads the classic API read-only and writes one site snapshot", async () => {
+  const c = classicConsole();
+  const { context, getWrittenResources } = ctx("scanPorts");
+  const { calls } = await withMockedFetch(
+    handler(c),
+    () => model.methods.scanPorts.execute({}, context as never),
+  );
+  assertEquals(writes(calls), []);
+  assertEquals(
+    calls.map((k) => new URL(k.url).pathname).filter((p) => p.includes("/api/"))
+      .sort(),
+    [
+      "/proxy/network/api/s/default/rest/networkconf",
+      "/proxy/network/api/s/default/rest/portconf",
+      "/proxy/network/api/s/default/stat/device",
+      "/proxy/network/api/s/default/stat/sta",
+    ],
+  );
+  const [res] = getWrittenResources();
+  assertEquals([res.specName, res.name], ["siteSwitchPorts", "Default"]);
+  assertEquals([res.data.deviceCount, res.data.portCount], [1, 2]);
+  const [p19, p25] = res.data.ports as Obj[];
+  assertEquals((p19.native as Obj).vlanId, 10);
+  assertEquals((p19.tagged as Obj[]).map((t) => t.vlanId), [20]);
+  assertEquals((p19.clients as Obj[]).map((k) => k.name), ["hv-2"]);
+  assertEquals((p25.native as Obj).networkName, "Default");
+  assertEquals((p25.tagged as Obj[]).map((t) => t.vlanId), [10, 20]);
+});
+
+Deno.test("scanPorts: a classic error rc fails the run", async () => {
+  const c = classicConsole();
+  const { context } = ctx("scanPorts");
+  await assertRejects(
+    () =>
+      withMockedFetch(
+        (req) =>
+          new URL(req.url).pathname.endsWith("/stat/sta")
+            ? Response.json({
+              meta: { rc: "error", msg: "api.err.NoPermission" },
+              data: [],
+            })
+            : handler(c)(req),
+        () => model.methods.scanPorts.execute({}, context as never),
+      ),
+    Error,
+    "rc=error: api.err.NoPermission",
+  );
+});
+
+Deno.test("upgrade 2026.11.12.1: the latest upgrade reaches the model version and keeps arguments", () => {
+  const last = model.upgrades[model.upgrades.length - 1];
+  assertEquals(last.toVersion, model.version);
+  const args = { mode: "local", host: HOST, apiKey: "k" };
+  assertEquals(last.upgradeAttributes(args), args);
 });
