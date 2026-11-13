@@ -45,6 +45,10 @@ this type.
 - `ensureSnapshotAccess` — make a least-privilege API token for snapshots and,
   optionally, cluster health. See
   [A limited token for snapshots and health](#a-limited-token-for-snapshots-and-health).
+- `ensureRunnerPoolAccess` — make a least-privilege API token for a CI runner
+  pool: it may clone, power and delete the guests in one pool, and clone only
+  into that pool. See
+  [A limited token for a CI runner pool](#a-limited-token-for-a-ci-runner-pool).
 
 **Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, `caCert`, and auth (see
 [Authentication](#authentication) and [TLS](#tls)).
@@ -59,6 +63,16 @@ QEMU VM (and LXC) lifecycle: `lookup`, `start`, `stop`, `create`, `delete`,
 `setBootOrder`, `setConfig`, `sync` (adapted from `@keeb/proxmox`, MIT; no
 `spiceConnect`), plus every method and check listed under
 [the VM/LXC methods](#vmlxc-methods) below.
+
+- `clone` — clone a VM or template by name into a new VM (`vmName`). It is a
+  linked clone by default (`linked: true`): the new disks are copy-on-write on
+  the template's base disks, so the source must be a template. `linked: false`
+  makes a full copy, optionally on another `storage`. `pool` puts the new VM in
+  a pool, and `newid` picks its id (default: the next free id). It does nothing
+  when a VM with that name exists. The `vm` resource records `durationMs`, the
+  time from the request to the end of the clone task (polled each second).
+- `convertToTemplate` — turn a stopped VM into a template. It does nothing for a
+  template, and refuses a VM that is not stopped (it never stops one).
 
 **Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, `caCert`, and auth (see
 [Authentication](#authentication) and [TLS](#tls)).
@@ -506,6 +520,44 @@ swamp model method run proxmox-admin ensureSnapshotAccess \
 Point a second `@dmc/proxmox/node` model at that token
 (`tokenId: swamp-patch@pve!patch`), and use it as the `nodeModel` of a
 community-script, or as a `@dmc/patch` snapshot or health-check model.
+
+### A limited token for a CI runner pool
+
+A runner pool (for example, ephemeral Forgejo Actions runners as linked clones
+of a template) needs a token that can make and delete VMs, but only its own.
+`ensureRunnerPoolAccess` on a `@dmc/proxmox/node` model with an admin token
+makes one. With the default arguments (`user`, `tokenName`, `pool`, `role`,
+`storageRole` and `netRole` change the names) it makes:
+
+- role `SwampCiPool` with exactly `VM.Allocate`, `VM.Audit`, `VM.Clone` and
+  `VM.PowerMgmt`, granted on `/pool/ci`. Proxmox lets a token that holds
+  `VM.Allocate` on a pool create a VM in that pool (a clone with `pool: ci`),
+  and pool grants reach every guest in the pool, so the token can clone, start,
+  stop and delete the pool's guests, and no other guest;
+- with `storage`, role `SwampCiStorage` with exactly `Datastore.AllocateSpace`
+  on `/storage/{storage}`, for the clone disks;
+- with `bridge`, role `SwampCiNet` with exactly `SDN.Use` on
+  `/sdn/zones/{sdnZone}/{bridge}` (`sdnZone` defaults to `localnetwork`, the
+  plain Linux bridges; `vlan` adds the tag to the path for a VLAN-aware bridge);
+- user `swamp-ci@pve`, pool `ci` with the `members` you list (the templates), and
+  a privilege-separated token `runner-pool`.
+
+Each grant goes to the user and the token with propagate 0, so the token holds
+nothing on any other path. The role has no `VM.Config.*`, snapshot or console
+privilege. The checks, the dry run and the token secret work as for
+`ensureSnapshotAccess` (vault key `runner-pool-token`). Clones in the pool are
+reported as `extraMembers` and never removed. A run that adds `storage` or
+`bridge` later adds only those grants.
+
+```bash
+# Plan (dry run), then apply
+swamp model method run proxmox-admin ensureRunnerPoolAccess \
+  --input storage=mrrobot-nfs --input bridge=vmbr1v10 \
+  --input 'members:json=[9000]'
+swamp model method run proxmox-admin ensureRunnerPoolAccess \
+  --input storage=mrrobot-nfs --input bridge=vmbr1v10 \
+  --input 'members:json=[9000]' --input dryRun=false
+```
 
 ## Upgrading to 2026.11.07.1
 

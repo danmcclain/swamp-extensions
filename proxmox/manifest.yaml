@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@dmc/proxmox"
-version: "2026.11.07.1"
+version: "2026.11.13.1"
 description: "Proxmox VE extensions with API-token auth and TLS verification — node status, cluster health and guest discovery, VM and CT snapshots through a least-privilege token, VM/LXC lifecycle (provisioning from cloud images, snapshots, migration), cloud image storage, and safe snapshot-guarded updates for community-scripts LXCs"
 repository: "https://github.com/danmcclain/swamp-extensions"
 license: MIT

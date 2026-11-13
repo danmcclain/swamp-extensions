@@ -1,7 +1,7 @@
 /**
  * `@dmc/proxmox/vm` — QEMU VM (and LXC) lifecycle against the Proxmox VE API
- * with API-token auth: lookup, create, start, stop, delete, boot order,
- * config, fleet sync, plus every `proxmox_vm_extras.ts` method
+ * with API-token auth: lookup, create, clone, convertToTemplate, start, stop,
+ * delete, boot order, config, fleet sync, plus every `proxmox_vm_extras.ts` method
  * (createFromImage, snapshots, disk/node migration, LXC control).
  *
  * Replaces `@keeb/proxmox/vm`. The base methods are adapted from
@@ -82,6 +82,45 @@ const CreateArgs = z.object({
   osType: z.string().optional().describe("OS type (default 'l26')"),
 });
 
+/** A Proxmox VM name: a DNS name. */
+const VM_DNS_NAME_RE = /^[A-Za-z0-9]([A-Za-z0-9.-]{0,61}[A-Za-z0-9])?$/;
+
+/** Pool name: no `/`, so no nested pools. */
+const POOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/;
+
+/** Proxmox storage id. */
+const STORAGE_ID_RE = /^[A-Za-z][A-Za-z0-9._-]{0,98}[A-Za-z0-9]$/;
+
+const CloneArgs = z.object({
+  source: z.string().describe("Name of the VM or template to clone"),
+  vmName: z.string()
+    .regex(VM_DNS_NAME_RE, "vmName must be a DNS name (letters, digits, . -)")
+    .describe("Name of the new VM"),
+  newid: z.number().int().min(100).optional().describe(
+    "VM id of the new VM (default: the next free id)",
+  ),
+  pool: z.string()
+    .regex(POOL_NAME_RE, "pool must be one pool name")
+    .optional()
+    .describe("Pool to put the new VM in"),
+  linked: z.boolean().default(true).describe(
+    "Linked clone (default): the new disks are copy-on-write on the template's base disks; the source must be a template. False makes a full copy",
+  ),
+  storage: z.string()
+    .regex(STORAGE_ID_RE, "storage must be a Proxmox storage id")
+    .optional()
+    .describe("Target storage of a full clone (default: the source's)"),
+}).refine(
+  (a) => !(a.linked && a.storage !== undefined),
+  {
+    message:
+      "storage is only for a full clone: a linked clone stays on the template's storage",
+    path: ["storage"],
+  },
+);
+
+const ConvertToTemplateArgs = z.object({ vmName: VmNameArg });
+
 const SetBootOrderArgs = z.object({
   vmName: VmNameArg,
   boot: z.string().describe("Boot order string (e.g. 'order=scsi0;net0')"),
@@ -106,6 +145,15 @@ const VmDataSchema = z.object({
   wasStarted: z.boolean().optional(),
   boot: z.string().optional(),
   config: z.record(z.string(), z.string()).optional(),
+  template: z.boolean().optional().describe("True when the VM is a template"),
+  source: z.string().optional().describe(
+    "The VM or template it was cloned from",
+  ),
+  pool: z.string().optional().describe("The pool a clone was put in"),
+  linked: z.boolean().optional().describe("True for a linked clone"),
+  durationMs: z.number().optional().describe(
+    "How long the clone task took, from the request to the task end (1 s polls)",
+  ),
   logs: z.string().optional(),
   timestamp: z.string(),
 });
@@ -117,6 +165,8 @@ export interface PveVm {
   status?: string;
   maxmem?: number;
   maxcpu?: number;
+  /** 1 for a template. */
+  template?: number;
 }
 
 /** Validate and normalise the /qemu list payload. */
@@ -138,6 +188,21 @@ export function findVm(vms: PveVm[], vmName: string): PveVm {
     throw new Error(`VM "${vmName}" not found. Available: ${names}`);
   }
   return vm;
+}
+
+/** Build the POST /qemu/{vmid}/clone form for `clone`. */
+export function buildCloneParams(
+  newid: number,
+  args: z.infer<typeof CloneArgs>,
+): URLSearchParams {
+  const params = new URLSearchParams({
+    newid: String(newid),
+    name: args.vmName,
+    full: args.linked ? "0" : "1",
+  });
+  if (args.pool) params.set("pool", args.pool);
+  if (args.storage) params.set("storage", args.storage);
+  return params;
 }
 
 /** Build the POST /qemu form for `create`, applying defaults. */
@@ -201,7 +266,7 @@ function runTask(g: VmGlobalArgs, auth: PveAuth, upid: unknown) {
 /** Swamp model definition for `@dmc/proxmox/vm`. */
 export const model = {
   type: "@dmc/proxmox/vm",
-  version: "2026.11.07.1",
+  version: "2026.11.13.1",
   globalArguments: ProxmoxConnectionArgs,
   upgrades: [
     {
@@ -214,6 +279,12 @@ export const model = {
       toVersion: "2026.11.07.1",
       description:
         "Breaking: API tokens are the only auth. The upgrade drops the ticket, csrfToken, username, password and realm global args; a definition that used them needs tokenId and tokenSecret. The @keeb/proxmox/vm extension is removed: move those definitions to @dmc/proxmox/vm. Additive: optional caCert (verify a self-signed API certificate). Set skipTlsVerify false or caCert, so the token is not sent unverified",
+      upgradeAttributes: dropRemovedAuthArgs,
+    },
+    {
+      toVersion: "2026.11.13.1",
+      description:
+        "Additive: new methods clone (linked by default, optionally into a pool, records the clone time) and convertToTemplate. The vm resource gains optional template, source, pool, linked and durationMs fields. No argument changes",
       upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
@@ -596,6 +667,169 @@ export const model = {
           vmName,
           status: "deleted",
           ip: null,
+          success: true,
+          logs: log.text(),
+          timestamp: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    clone: {
+      description:
+        "Clone a VM or template by name into a new VM, linked by default (the source must then be a template), optionally into a pool. No-op when a VM with the new name exists. Records how long the clone task took (durationMs). Needs: VM.Clone on the source; VM.Allocate on /vms/{newid} or on /pool/{pool}; Datastore.AllocateSpace on the target storage; SDN.Use on the bridge when Proxmox checks it.",
+      arguments: CloneArgs,
+      execute: async (args: z.infer<typeof CloneArgs>, context: Ctx) => {
+        const { vmName, source } = args;
+        const g = context.globalArgs;
+        const log = createMethodLogger(context);
+        log.info("Cloning {source} to {vmName} on node {node} ({kind})", {
+          source,
+          vmName,
+          node: g.node,
+          kind: args.linked ? "linked" : "full",
+        });
+
+        const auth = await vmAuth(g);
+        const vms = await listVms(g, auth);
+        // Idempotent: Proxmox allows duplicate names, so never make a second
+        // VM with the same name.
+        const existing = vms.find((v) => v.name === vmName);
+        if (existing) {
+          log.info("VM {vmName} already exists as vmid {vmid}, skipping", {
+            vmName,
+            vmid: existing.vmid,
+          });
+          const handle = await context.writeResource("vm", vmName, {
+            vmid: existing.vmid,
+            vmName,
+            status: existing.status,
+            success: true,
+            logs: log.text(),
+            timestamp: new Date().toISOString(),
+          });
+          return { dataHandles: [handle] };
+        }
+
+        const src = findVm(vms, source);
+        if (args.linked && src.template !== 1) {
+          throw new Error(
+            `"${source}" (vmid ${src.vmid}) is not a template; a linked clone needs one (convertToTemplate), or set linked false`,
+          );
+        }
+
+        let newid = args.newid;
+        if (newid === undefined) {
+          newid = parseInt(
+            String(
+              await pveCall(
+                g,
+                auth,
+                "GET",
+                `${g.apiUrl}/api2/json/cluster/nextid`,
+                "Fetching next available VM ID",
+              ),
+            ),
+            10,
+          );
+          if (!Number.isInteger(newid)) {
+            throw new Error("Proxmox returned an invalid next VM ID");
+          }
+        }
+
+        const started = Date.now();
+        const upid = await pveCall(
+          g,
+          auth,
+          "POST",
+          nodePath(g, `/qemu/${src.vmid}/clone`),
+          `Cloning "${source}" (vmid ${src.vmid}) to "${vmName}" (vmid ${newid})`,
+          buildCloneParams(newid, args).toString(),
+        );
+        const taskResult = await runTask(g, auth, upid);
+        const durationMs = Date.now() - started;
+        if (!taskResult.success) {
+          throw new Error(
+            `Cloning "${source}" to "${vmName}" (vmid ${newid}) failed: ${taskResult.exitstatus}`,
+          );
+        }
+        log.info("Cloned {source} to {vmName} (vmid {vmid}) in {ms} ms", {
+          source,
+          vmName,
+          vmid: newid,
+          ms: durationMs,
+        });
+
+        const handle = await context.writeResource("vm", vmName, {
+          vmid: newid,
+          vmName,
+          status: "stopped",
+          ip: null,
+          success: true,
+          source,
+          ...(args.pool ? { pool: args.pool } : {}),
+          linked: args.linked,
+          durationMs,
+          logs: log.text(),
+          timestamp: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    convertToTemplate: {
+      description:
+        "Turn a stopped VM into a template (no-op when it is one). Refuses a VM that is not stopped; it never stops it. Needs: VM.Allocate, VM.Audit.",
+      arguments: ConvertToTemplateArgs,
+      execute: async (
+        args: z.infer<typeof ConvertToTemplateArgs>,
+        context: Ctx,
+      ) => {
+        const { vmName } = args;
+        const g = context.globalArgs;
+        const log = createMethodLogger(context);
+        log.info("Making VM {vmName} a template on node {node}", {
+          vmName,
+          node: g.node,
+        });
+
+        const auth = await vmAuth(g);
+        const vm = await resolveVm(g, auth, vmName);
+        if (vm.template === 1) {
+          log.info("VM {vmName} (vmid {vmid}) is already a template", {
+            vmName,
+            vmid: vm.vmid,
+          });
+        } else {
+          if (vm.status !== "stopped") {
+            throw new Error(
+              `VM "${vmName}" (vmid ${vm.vmid}) is ${vm.status}; stop it before it becomes a template`,
+            );
+          }
+          const upid = await pveCall(
+            g,
+            auth,
+            "POST",
+            nodePath(g, `/qemu/${vm.vmid}/template`),
+            `Making VM "${vmName}" (vmid ${vm.vmid}) a template`,
+          );
+          // Newer Proxmox runs this as a task (UPID); older versions finish it inline.
+          if (typeof upid === "string" && upid.startsWith("UPID:")) {
+            const taskResult = await runTask(g, auth, upid);
+            if (!taskResult.success) {
+              throw new Error(
+                `Making VM "${vmName}" (vmid ${vm.vmid}) a template failed: ${taskResult.exitstatus}`,
+              );
+            }
+          }
+          log.info("VM {vmid} is now a template", { vmid: vm.vmid });
+        }
+
+        const handle = await context.writeResource("vm", vmName, {
+          vmid: vm.vmid,
+          vmName,
+          status: "stopped",
+          template: true,
           success: true,
           logs: log.text(),
           timestamp: new Date().toISOString(),
