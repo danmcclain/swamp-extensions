@@ -900,6 +900,8 @@ interface FakeGuest {
   type: string;
   node: string;
   pool?: string;
+  /** 1 for a template. */
+  template?: number;
 }
 interface FakePve {
   roles: FakeRole[];
@@ -997,15 +999,26 @@ function tokenPrivileges(st: FakePve, path: string, tokenId: string): string[] {
     return grant && role ? [...role.privs.split(","), ...extra] : [];
   }
   const vmid = Number(/^\/vms\/(\d+)$/.exec(path)?.[1]);
+  // A grant on the guest's own path adds to what its pool gives.
+  const own = Number.isInteger(vmid)
+    ? st.acl.filter((a) =>
+      a.type === "token" && a.ugid === tokenId && a.path === path
+    ).flatMap((a) =>
+      st.roles.find((r) => r.roleid === a.roleid)?.privs.split(",") ?? []
+    )
+    : [];
   const pool = /^\/pool\/(.+)$/.exec(path)?.[1] ??
     st.guests.find((g) => g.vmid === vmid)?.pool;
-  if (!pool) return [];
-  const grant = st.acl.find((a) =>
-    a.type === "token" && a.ugid === tokenId && a.path === `/pool/${pool}`
-  );
+  const grant = pool
+    ? st.acl.find((a) =>
+      a.type === "token" && a.ugid === tokenId && a.path === `/pool/${pool}`
+    )
+    : undefined;
   const role = st.roles.find((r) => r.roleid === grant?.roleid);
-  if (!grant || !role) return [];
-  return [...role.privs.split(","), ...st.tokenExtra];
+  const fromPool = grant && role
+    ? [...role.privs.split(","), ...st.tokenExtra]
+    : [];
+  return [...new Set([...fromPool, ...own])];
 }
 
 /** The `/access/permissions` payload for the caller, or for a token when `userid` is set. */
@@ -2244,39 +2257,42 @@ const RUNNER_COMMENT = "managed by @dmc/proxmox ensureRunnerPoolAccess";
 const RUNNER_PRIVS = ["VM.Allocate", "VM.Audit", "VM.Clone", "VM.PowerMgmt"];
 const STORAGE_PATH = "/storage/mrrobot-nfs";
 const BRIDGE_PATH = "/sdn/zones/localnetwork/vmbr1v10";
+const TEMPLATE_PATH = "/vms/9000";
+const TEMPLATE_PRIVS = ["VM.Audit", "VM.Clone"];
 
 /** Arguments as ensureRunnerPoolAccess sees them, with schema defaults applied. */
 function runnerArgs(input: Record<string, unknown>): Record<string, unknown> {
   return model.methods.ensureRunnerPoolAccess.arguments.parse(input);
 }
 
-/** Storage and bridge set, template 9000 requested. */
+/** Storage, bridge and template 9000 set. */
 function fullRunnerArgs(over: Record<string, unknown> = {}) {
   return runnerArgs({
     storage: "mrrobot-nfs",
     bridge: "vmbr1v10",
-    members: [9000],
+    templates: [9000],
     ...over,
   });
 }
 
-/** An empty cluster with an unpooled template 9000 and serve (300) in no pool. */
+/** An empty cluster with template 9000 and serve (300), both in no pool. */
 function runnerState(over: Partial<FakePve> = {}): FakePve {
   return pveState({
     guests: [
-      { vmid: 9000, type: "qemu", node: "pve" },
+      { vmid: 9000, type: "qemu", node: "pve", template: 1 },
       { vmid: 300, type: "qemu", node: "pve" },
     ],
     ...over,
   });
 }
 
-/** A finished runner-pool run: three roles, user, token, pool, six ACLs, template pooled. */
+/** A finished runner-pool run: four roles, user, token, pool, eight ACLs; template out of the pool. */
 function runnerPresentState(over: Partial<FakePve> = {}): FakePve {
   const grants: Array<[string, string]> = [
     ["/pool/ci", "SwampCiPool"],
     [STORAGE_PATH, "SwampCiStorage"],
     [BRIDGE_PATH, "SwampCiNet"],
+    [TEMPLATE_PATH, "SwampCiTemplate"],
   ];
   return runnerState({
     roles: [
@@ -2287,6 +2303,7 @@ function runnerPresentState(over: Partial<FakePve> = {}): FakePve {
         special: 0,
       },
       { roleid: "SwampCiNet", privs: "SDN.Use", special: 0 },
+      { roleid: "SwampCiTemplate", privs: "VM.Clone,VM.Audit", special: 0 },
     ],
     users: [{
       userid: "swamp-ci@pve",
@@ -2299,7 +2316,7 @@ function runnerPresentState(over: Partial<FakePve> = {}): FakePve {
     ]),
     pools: [{ poolid: "ci" }],
     guests: [
-      { vmid: 9000, type: "qemu", node: "pve", pool: "ci" },
+      { vmid: 9000, type: "qemu", node: "pve", template: 1 },
       { vmid: 300, type: "qemu", node: "pve" },
     ],
     ...over,
@@ -2316,7 +2333,8 @@ Deno.test("ensureRunnerPoolAccess arguments default to a dry run of the ci pool 
   assertEquals(a.storage, undefined);
   assertEquals(a.bridge, undefined);
   assertEquals(a.sdnZone, "localnetwork");
-  assertEquals(a.members, []);
+  assertEquals(a.templates, []);
+  assertEquals(a.templateRole, "SwampCiTemplate");
 });
 
 Deno.test("ensureRunnerPoolAccess arguments refuse unsafe or clashing values", () => {
@@ -2336,8 +2354,11 @@ Deno.test("ensureRunnerPoolAccess arguments refuse unsafe or clashing values", (
     { storage: "nfs", storageRole: "SwampCiPool" },
     { bridge: "vmbr0", netRole: "SwampCiPool" },
     { storage: "nfs", bridge: "vmbr0", netRole: "SwampCiStorage" },
-    { members: [9000, 9000] },
-    { members: [0] },
+    { templates: [9000, 9000] },
+    { templates: [0] },
+    { templates: [9000], templateRole: "SwampCiPool" },
+    { templates: [9000], storage: "nfs", templateRole: "SwampCiStorage" },
+    { templates: [9000], templateRole: "PVETemplateUser" },
   ];
   for (const input of bad) {
     assertThrows(
@@ -2348,7 +2369,11 @@ Deno.test("ensureRunnerPoolAccess arguments refuse unsafe or clashing values", (
     );
   }
   // A role name only clashes when its grant is used.
-  runnerArgs({ storageRole: "SwampCiPool", netRole: "SwampCiPool" });
+  runnerArgs({
+    storageRole: "SwampCiPool",
+    netRole: "SwampCiPool",
+    templateRole: "SwampCiPool",
+  });
 });
 
 Deno.test("bridgeAclPath adds the VLAN tag only when one is given", () => {
@@ -2374,16 +2399,19 @@ Deno.test("ensureRunnerPoolAccess dry run on an empty cluster plans a role and t
     { action: "createRole", target: "SwampCiPool", state: "planned" },
     { action: "createRole", target: "SwampCiStorage", state: "planned" },
     { action: "createRole", target: "SwampCiNet", state: "planned" },
+    { action: "createRole", target: "SwampCiTemplate", state: "planned" },
     { action: "createUser", target: "swamp-ci@pve", state: "planned" },
     { action: "createPool", target: "ci", state: "planned" },
-    { action: "addMembers", target: "9000", state: "planned" },
+    { action: "addMembers", target: "", state: "present" },
     { action: "aclUser", target: "/pool/ci", state: "planned" },
     { action: "aclUser", target: STORAGE_PATH, state: "planned" },
     { action: "aclUser", target: BRIDGE_PATH, state: "planned" },
+    { action: "aclUser", target: TEMPLATE_PATH, state: "planned" },
     { action: "createToken", target: RUNNER_TOKEN_ID, state: "planned" },
     { action: "aclToken", target: "/pool/ci", state: "planned" },
     { action: "aclToken", target: STORAGE_PATH, state: "planned" },
     { action: "aclToken", target: BRIDGE_PATH, state: "planned" },
+    { action: "aclToken", target: TEMPLATE_PATH, state: "planned" },
   ]);
   assertEquals(rec.grants, [
     { path: "/pool/ci", role: "SwampCiPool", privileges: RUNNER_PRIVS },
@@ -2393,7 +2421,14 @@ Deno.test("ensureRunnerPoolAccess dry run on an empty cluster plans a role and t
       privileges: ["Datastore.AllocateSpace"],
     },
     { path: BRIDGE_PATH, role: "SwampCiNet", privileges: ["SDN.Use"] },
+    {
+      path: TEMPLATE_PATH,
+      role: "SwampCiTemplate",
+      privileges: TEMPLATE_PRIVS,
+    },
   ]);
+  assertEquals(rec.templates, [9000]);
+  assertFalse("members" in rec);
   assertEquals(rec.blockers, []);
   assertEquals(rec.callerMissing, []);
   assertEquals(rec.verified, []);
@@ -2414,9 +2449,10 @@ Deno.test("ensureRunnerPoolAccess live writes each role, ACL (propagate 0) and t
     "POST /api2/json/access/roles",
     "POST /api2/json/access/roles",
     "POST /api2/json/access/roles",
+    "POST /api2/json/access/roles",
     "POST /api2/json/access/users",
     "POST /api2/json/pools",
-    "PUT /api2/json/pools",
+    "PUT /api2/json/access/acl",
     "PUT /api2/json/access/acl",
     "PUT /api2/json/access/acl",
     "PUT /api2/json/access/acl",
@@ -2424,44 +2460,51 @@ Deno.test("ensureRunnerPoolAccess live writes each role, ACL (propagate 0) and t
     "PUT /api2/json/access/acl",
     "PUT /api2/json/access/acl",
     "PUT /api2/json/access/acl",
+    "PUT /api2/json/access/acl",
   ]);
+  // The template is never put in the pool.
+  assertFalse(
+    writes.some((w) => w.method === "PUT" && w.url.endsWith("/pools")),
+  );
   const bodies = writes.map((w) => formOf(w.body));
-  assertEquals(bodies.slice(0, 3), [
+  assertEquals(bodies.slice(0, 4), [
     { roleid: "SwampCiPool", privs: RUNNER_PRIVS.join(",") },
     { roleid: "SwampCiStorage", privs: "Datastore.AllocateSpace" },
     { roleid: "SwampCiNet", privs: "SDN.Use" },
+    { roleid: "SwampCiTemplate", privs: TEMPLATE_PRIVS.join(",") },
   ]);
-  assertEquals(bodies[3], {
+  assertEquals(bodies[4], {
     userid: "swamp-ci@pve",
     enable: "1",
     comment: RUNNER_COMMENT,
   });
-  assertEquals(bodies[4], { poolid: "ci", comment: RUNNER_COMMENT });
-  assertEquals(bodies[5], { poolid: "ci", vms: "9000" });
-  const acls = [6, 7, 8, 10, 11, 12].map((i) => bodies[i]);
+  assertEquals(bodies[5], { poolid: "ci", comment: RUNNER_COMMENT });
+  const acls = [6, 7, 8, 9, 11, 12, 13, 14].map((i) => bodies[i]);
   assertEquals(acls.map((b) => [b.path, b.roles, b.users ?? b.tokens]), [
     ["/pool/ci", "SwampCiPool", "swamp-ci@pve"],
     [STORAGE_PATH, "SwampCiStorage", "swamp-ci@pve"],
     [BRIDGE_PATH, "SwampCiNet", "swamp-ci@pve"],
+    [TEMPLATE_PATH, "SwampCiTemplate", "swamp-ci@pve"],
     ["/pool/ci", "SwampCiPool", RUNNER_TOKEN_ID],
     [STORAGE_PATH, "SwampCiStorage", RUNNER_TOKEN_ID],
     [BRIDGE_PATH, "SwampCiNet", RUNNER_TOKEN_ID],
+    [TEMPLATE_PATH, "SwampCiTemplate", RUNNER_TOKEN_ID],
   ]);
   assert(acls.every((b) => b.propagate === "0"));
-  assertEquals(bodies[9], { privsep: "1", comment: RUNNER_COMMENT });
+  assertEquals(bodies[10], { privsep: "1", comment: RUNNER_COMMENT });
 
   const rec = writtenData(r.written, "runnerPoolAccess");
   assertEquals(rec.status, "applied");
   assertEquals(rec.tokenSecretIssued, true);
   assertEquals(rec.verified, [
     { path: "/pool/ci", privileges: RUNNER_PRIVS, ok: true },
-    { path: "/vms/9000", privileges: RUNNER_PRIVS, ok: true },
     {
       path: STORAGE_PATH,
       privileges: ["Datastore.AllocateSpace"],
       ok: true,
     },
     { path: BRIDGE_PATH, privileges: ["SDN.Use"], ok: true },
+    { path: TEMPLATE_PATH, privileges: TEMPLATE_PRIVS, ok: true },
   ]);
   const token = writtenData(r.written, "runnerPoolToken");
   assertEquals(token.tokenId, RUNNER_TOKEN_ID);
@@ -2478,10 +2521,10 @@ Deno.test("runnerPoolToken tokenSecret is marked sensitive", () => {
   );
 });
 
-Deno.test("ensureRunnerPoolAccess with no storage or bridge grants the pool role only", async () => {
+Deno.test("ensureRunnerPoolAccess with no storage, bridge or template grants the pool role only", async () => {
   const r = await ensure(
     runnerState(),
-    runnerArgs({ dryRun: false, members: [9000] }),
+    runnerArgs({ dryRun: false }),
     "ensureRunnerPoolAccess",
   );
   assertEquals(r.error, null);
@@ -2495,7 +2538,6 @@ Deno.test("ensureRunnerPoolAccess with no storage or bridge grants the pool role
   );
   assertEquals(rec.verified.map((v: { path: string }) => v.path), [
     "/pool/ci",
-    "/vms/9000",
   ]);
 });
 
@@ -2553,9 +2595,9 @@ Deno.test("ensureRunnerPoolAccess with everything in place writes nothing and re
       rec.verified.map((v: { path: string; ok: boolean }) => [v.path, v.ok]),
       [
         ["/pool/ci", true],
-        ["/vms/9000", true],
         [STORAGE_PATH, true],
         [BRIDGE_PATH, true],
+        [TEMPLATE_PATH, true],
       ],
     );
   }
@@ -2627,11 +2669,33 @@ const runnerBlockerCases: Array<[string, (s: FakePve) => void, string]> = [
     "role SwampCiPool is granted to user other@pve on /pool/ci",
   ],
   [
-    "the template is in another pool",
+    "the template is in the ci pool",
     (s) => {
-      s.guests.find((x) => x.vmid === 9000)!.pool = "patch";
+      s.guests.find((x) => x.vmid === 9000)!.pool = "ci";
     },
-    "guest 9000 is in pool patch; guests are never moved between pools",
+    "template 9000 is in pool ci, where the token could delete it",
+  ],
+  [
+    "the template is not a template",
+    (s) => {
+      delete s.guests.find((x) => x.vmid === 9000)!.template;
+    },
+    "guest 9000 is not a template",
+  ],
+  [
+    "the template does not exist",
+    (s) => {
+      s.guests = s.guests.filter((x) => x.vmid !== 9000);
+    },
+    "template 9000 does not exist on the cluster",
+  ],
+  [
+    "the template role holds VM.Allocate",
+    (s) => {
+      s.roles.find((x) => x.roleid === "SwampCiTemplate")!.privs =
+        "VM.Clone,VM.Audit,VM.Allocate";
+    },
+    "role SwampCiTemplate has extra privileges: VM.Allocate",
   ],
 ];
 
@@ -2689,4 +2753,59 @@ Deno.test("ensureRunnerPoolAccess with a VLAN grants SDN.Use on the tag path onl
     role: "SwampCiNet",
     privileges: ["SDN.Use"],
   });
+});
+
+Deno.test("ensureRunnerPoolAccess grants one template role on each template path and creates the role once", async () => {
+  const st = runnerState();
+  st.guests.push({ vmid: 9001, type: "qemu", node: "pve", template: 1 });
+  const r = await ensure(
+    st,
+    runnerArgs({ dryRun: false, templates: [9001, 9000] }),
+    "ensureRunnerPoolAccess",
+  );
+  assertEquals(r.error, null);
+  const writes = writesOf(r.seen).map((w) => formOf(w.body));
+  assertEquals(
+    writes.filter((b) => b.roleid === "SwampCiTemplate"),
+    [{ roleid: "SwampCiTemplate", privs: TEMPLATE_PRIVS.join(",") }],
+  );
+  assertEquals(
+    writes.filter((b) => b.roles === "SwampCiTemplate").map((b) => [
+      b.path,
+      b.users ?? b.tokens,
+    ]),
+    [
+      ["/vms/9000", "swamp-ci@pve"],
+      ["/vms/9001", "swamp-ci@pve"],
+      ["/vms/9000", RUNNER_TOKEN_ID],
+      ["/vms/9001", RUNNER_TOKEN_ID],
+    ],
+  );
+  const rec = writtenData(r.written, "runnerPoolAccess");
+  assertEquals(rec.templates, [9000, 9001]);
+  assertEquals(
+    rec.verified.map((v: { path: string; ok: boolean }) => [v.path, v.ok]),
+    [["/pool/ci", true], ["/vms/9000", true], ["/vms/9001", true]],
+  );
+});
+
+Deno.test("ensureRunnerPoolAccess fails when the token gets VM.Allocate on a template", async () => {
+  // A pool grant that reaches the template (e.g. it was moved into ci after the run) shows up
+  // as extra privileges on its path.
+  const st = runnerPresentState();
+  st.acl.push({
+    path: TEMPLATE_PATH,
+    type: "token",
+    ugid: RUNNER_TOKEN_ID,
+    roleid: "SwampCiPool",
+    propagate: 0,
+  });
+  const r = await ensure(
+    st,
+    fullRunnerArgs({ dryRun: true }),
+    "ensureRunnerPoolAccess",
+  );
+  assert(r.error);
+  assertStringIncludes(r.error.message, "has role SwampCiPool on /vms/9000");
+  assertEquals(writesOf(r.seen), []);
 });

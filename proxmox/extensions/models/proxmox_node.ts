@@ -114,6 +114,10 @@ const RUNNER_POOL_PRIVILEGES = [
   "VM.PowerMgmt",
 ];
 
+/** Privileges of the runner template role on each `/vms/{template}`: read and clone it, but
+ *  not delete, change or power it. The templates stay out of the pool for this reason. */
+const RUNNER_TEMPLATE_PRIVILEGES = ["VM.Audit", "VM.Clone"];
+
 /** Privileges of the runner storage role on `/storage/{storage}`: room for clone disks. */
 const RUNNER_STORAGE_PRIVILEGES = ["Datastore.AllocateSpace"];
 
@@ -334,15 +338,21 @@ const EnsureRunnerPoolAccessArgs = z.object({
     "SwampCiNet",
     "Custom role on the bridge path: exactly SDN.Use",
   ),
-  members: z.array(VmidArg)
+  templates: z.array(VmidArg)
     .refine(
       (ids) => new Set(ids).size === ids.length,
-      "members must not repeat a vmid",
+      "templates must not repeat a vmid",
     )
     .default([])
     .describe(
-      "Guests to put in the pool (the runner templates); never moved from another pool",
+      "Templates the token may clone: each gets templateRole on /vms/{vmid}. They must be templates outside the pool, so the token cannot delete or change them",
     ),
+  templateRole: roleArg(
+    "SwampCiTemplate",
+    `Custom role on each /vms/{template}: exactly ${
+      RUNNER_TEMPLATE_PRIVILEGES.join(", ")
+    }`,
+  ),
 })
   .refine(
     (a) => a.vlan === undefined || a.bridge !== undefined,
@@ -354,11 +364,13 @@ const EnsureRunnerPoolAccessArgs = z.object({
         a.role,
         ...(a.storage ? [a.storageRole] : []),
         ...(a.bridge ? [a.netRole] : []),
+        ...(a.templates.length > 0 ? [a.templateRole] : []),
       ];
       return new Set(roles).size === roles.length;
     },
     {
-      message: "role, storageRole and netRole must be different roles",
+      message:
+        "role, storageRole, netRole and templateRole must be different roles",
       path: ["role"],
     },
   );
@@ -426,11 +438,13 @@ const RunnerPoolAccessSchema = z.object({
     role: z.string(),
     privileges: z.array(z.string()),
   })).describe(
-    "Each grant (propagate 0): the pool first, then the storage and the bridge when given",
+    "Each grant (propagate 0): the pool first, then the storage, the bridge and each template when given",
   ),
-  members: z.array(z.number()),
+  templates: z.array(z.number()).describe(
+    "Templates the token may clone; outside the pool",
+  ),
   extraMembers: z.array(z.number()).describe(
-    "Guests in the pool that were not requested (the clones); reported, never removed",
+    "Guests in the pool (the clones); reported, never removed",
   ),
   callerMissing: z.array(
     z.object({ path: z.string(), privilege: z.string() }),
@@ -443,7 +457,7 @@ const RunnerPoolAccessSchema = z.object({
   blockers: z.array(z.string()),
   verified: z.array(z.object({
     path: z.string().describe(
-      "/pool/{pool}, /vms/{vmid}, /storage/{storage} or the bridge path",
+      "/pool/{pool}, /storage/{storage}, the bridge path or /vms/{template}",
     ),
     privileges: z.array(z.string()),
     ok: z.boolean(),
@@ -487,6 +501,7 @@ function snapshotAccessSpec(args: EnsureArgs): AccessSpec {
     pool: args.pool,
     members: [...args.members].sort((a, b) => a - b),
     grants,
+    templates: [],
   };
 }
 
@@ -528,14 +543,25 @@ function runnerPoolAccessSpec(args: RunnerPoolArgs): AccessSpec {
       names,
     });
   }
+  const templates = [...args.templates].sort((a, b) => a - b);
+  for (const vmid of templates) {
+    grants.push({
+      path: `/vms/${vmid}`,
+      role: args.templateRole,
+      privileges: RUNNER_TEMPLATE_PRIVILEGES,
+      names,
+    });
+  }
   return {
     method: "ensureRunnerPoolAccess",
     comment: RUNNER_POOL_ACCESS_COMMENT,
     user: args.user,
     tokenName: args.tokenName,
     pool: args.pool,
-    members: [...args.members].sort((a, b) => a - b),
+    // Nothing is added to the pool: the templates stay out, and clones join it themselves.
+    members: [],
     grants,
+    templates,
   };
 }
 
@@ -683,6 +709,8 @@ interface AccessState {
   pools: string[];
   /** vmid -> pool name; "" when the guest is in no pool. */
   guestPools: Map<number, string>;
+  /** vmids of the guests that are templates. */
+  templates: Set<number>;
 }
 
 /** A privilege a check needs; `A|B` is met by either one. */
@@ -805,6 +833,18 @@ function parseGuestPools(data: unknown): Map<number, string> {
   return pools;
 }
 
+/** Parse `/cluster/resources?type=vm` into the vmids of the templates. */
+function parseTemplateIds(data: unknown): Set<number> {
+  const what = "/cluster/resources";
+  const ids = new Set<number>();
+  for (const item of asList(data, what)) {
+    const guest = asRecord(item, what);
+    const vmid = Number(guest.vmid);
+    if (Number.isInteger(vmid) && guest.template === 1) ids.add(vmid);
+  }
+  return ids;
+}
+
 /** Read everything the plan needs. GET only. */
 async function readAccessState(
   g: NodeGlobalArgs,
@@ -812,14 +852,21 @@ async function readAccessState(
 ): Promise<AccessState> {
   const read = (path: string, what: string) =>
     pveCall(g, auth, "GET", `${g.apiUrl}/api2/json${path}`, what);
+  const roles = parseRoles(await read("/access/roles", "Listing roles"));
+  const users = parseUsers(await read("/access/users?full=1", "Listing users"));
+  const acl = parseAcl(await read("/access/acl", "Listing ACLs"));
+  const pools = parsePoolIds(await read("/pools", "Listing pools"));
+  const guests = await read(
+    "/cluster/resources?type=vm",
+    "Listing cluster guests",
+  );
   return {
-    roles: parseRoles(await read("/access/roles", "Listing roles")),
-    users: parseUsers(await read("/access/users?full=1", "Listing users")),
-    acl: parseAcl(await read("/access/acl", "Listing ACLs")),
-    pools: parsePoolIds(await read("/pools", "Listing pools")),
-    guestPools: parseGuestPools(
-      await read("/cluster/resources?type=vm", "Listing cluster guests"),
-    ),
+    roles,
+    users,
+    acl,
+    pools,
+    guestPools: parseGuestPools(guests),
+    templates: parseTemplateIds(guests),
   };
 }
 
@@ -874,6 +921,8 @@ interface AccessSpec {
   members: number[];
   /** grants[0] is the pool grant on `/pool/{pool}`; its privileges hold on each pool guest. */
   grants: AccessGrant[];
+  /** Guests that must exist, be templates and stay out of `pool` (each has its own grant). */
+  templates: number[];
 }
 
 /** One planned or present action, with what it needs to run. */
@@ -979,7 +1028,11 @@ function planAccess(
   }
 
   // An existing role must hold exactly its set: never more, never less.
-  const roleInfos = grants.map((grant) => {
+  // One role may back several grants (one per template); check and create it once.
+  const roleGrants = grants.filter((grant, i) =>
+    grants.findIndex((x) => x.role === grant.role) === i
+  );
+  const roleInfos = roleGrants.map((grant) => {
     const info = state.roles.find((r) => r.roleid === grant.role);
     if (!info) return undefined;
     const name = grant.role;
@@ -1052,6 +1105,19 @@ function planAccess(
     }
   }
 
+  for (const vmid of spec.templates) {
+    const current = state.guestPools.get(vmid);
+    if (current === undefined) {
+      blockers.push(`template ${vmid} does not exist on the cluster`);
+    } else if (!state.templates.has(vmid)) {
+      blockers.push(`guest ${vmid} is not a template`);
+    } else if (current === pool) {
+      blockers.push(
+        `template ${vmid} is in pool ${pool}, where the token could delete it; move it out of the pool`,
+      );
+    }
+  }
+
   const granted = (type: string, ugid: string, grant: AccessGrant) =>
     state.acl.some((a) =>
       a.type === type && a.ugid === ugid && a.path === grant.path &&
@@ -1070,7 +1136,7 @@ function planAccess(
   });
 
   const steps: AccessStep[] = [
-    ...grants.map((grant, i) =>
+    ...roleGrants.map((grant, i) =>
       step("role", grant.names.role, grant.role, !!roleInfos[i], grant)
     ),
     step("user", "createUser", user, !!userInfo),
@@ -1991,7 +2057,7 @@ export const model = {
     {
       toVersion: "2026.11.13.1",
       description:
-        "Additive: new method ensureRunnerPoolAccess (a least-privilege token that may clone, power and delete the guests of one CI pool and clone only into it) with the runnerPoolAccess and runnerPoolToken resources. No argument changes",
+        "Additive: new method ensureRunnerPoolAccess (a least-privilege token that may clone its templates, clone only into one CI pool, and power and delete only that pool's guests) with the runnerPoolAccess and runnerPoolToken resources. No argument changes",
       upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
@@ -2317,10 +2383,10 @@ export const model = {
 
     ensureRunnerPoolAccess: {
       description:
-        "Make a least-privilege Proxmox API token for a CI runner pool: it may clone, start, stop and delete the guests in one pool, and make new guests (linked clones) only in that pool. It also gets Datastore.AllocateSpace on one storage (the clone disks) and, when a bridge is given, SDN.Use on that bridge. Each grant is its own custom role with propagate 0, so the token holds nothing on any other path. " +
-        "Dry run by default. Reads everything first and writes nothing if any blocker exists. Creates only what is missing: it never changes or removes an existing role, user, token, ACL, pool or guest membership, and never moves a guest out of another pool. Clones in the pool are reported as extra members, never removed. " +
+        "Make a least-privilege Proxmox API token for a CI runner pool: it may clone, start, stop and delete the guests in one pool, and make new guests (linked clones) only in that pool. It may only read and clone the templates it is given (VM.Audit and VM.Clone on each /vms/{template}); the templates must stay outside the pool, so the token cannot delete or change them. It also gets Datastore.AllocateSpace on one storage (the clone disks) and, when a bridge is given, SDN.Use on that bridge. Each kind of grant is its own custom role with propagate 0, so the token holds nothing on any other path. " +
+        "Dry run by default. Reads everything first and writes nothing if any blocker exists. Creates only what is missing: it never changes or removes an existing role, user, token, ACL, pool or guest membership, and never moves a guest out of another pool. It never adds a guest to the pool: a clone joins it when it is made. Clones in the pool are reported as extra members, never removed. " +
         "The new token secret is a sensitive output, stored in the vault as runner-pool-token and never in data. " +
-        "Needs: Sys.Audit and Sys.Modify on /access; User.Modify on /access/groups; Realm.AllocateUser on /access/realm/pve (new user only); Pool.Allocate, Pool.Audit and Permissions.Modify on /pool/{pool}; Permissions.Modify on /storage/{storage} and, with a bridge, on its /sdn/zones path; Permissions.Modify or VM.Allocate on each guest added.",
+        "Needs: Sys.Audit and Sys.Modify on /access; User.Modify on /access/groups; Realm.AllocateUser on /access/realm/pve (new user only); Pool.Allocate, Pool.Audit and Permissions.Modify on /pool/{pool}; Permissions.Modify on /storage/{storage}, with a bridge on its /sdn/zones path, and on each /vms/{template}.",
       arguments: EnsureRunnerPoolAccessArgs,
       execute: (args: RunnerPoolArgs, context: Ctx) => {
         const spec = runnerPoolAccessSpec(args);
@@ -2333,8 +2399,9 @@ export const model = {
             tokenSpec: "runnerPoolToken",
             tokenName: "runner-pool-token",
             label: "Runner pool access",
-            record: (base) => ({
+            record: ({ members: _members, ...base }) => ({
               ...base,
+              templates: spec.templates,
               grants: spec.grants.map(({ path, role, privileges }) => ({
                 path,
                 role,

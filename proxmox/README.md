@@ -46,8 +46,8 @@ this type.
   optionally, cluster health. See
   [A limited token for snapshots and health](#a-limited-token-for-snapshots-and-health).
 - `ensureRunnerPoolAccess` — make a least-privilege API token for a CI runner
-  pool: it may clone, power and delete the guests in one pool, and clone only
-  into that pool. See
+  pool: it may clone the templates it is given, clone only into one pool, and
+  power and delete only the guests in that pool. See
   [A limited token for a CI runner pool](#a-limited-token-for-a-ci-runner-pool).
 
 **Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, `caCert`, and auth (see
@@ -534,29 +534,33 @@ makes one. With the default arguments (`user`, `tokenName`, `pool`, `role`,
   `VM.Allocate` on a pool create a VM in that pool (a clone with `pool: ci`),
   and pool grants reach every guest in the pool, so the token can clone, start,
   stop and delete the pool's guests, and no other guest;
+- with `templates`, role `SwampCiTemplate` with exactly `VM.Audit` and
+  `VM.Clone` on each `/vms/{template}`. The templates must be templates and
+  must stay out of the pool, so the token can clone them but cannot delete,
+  change or start them. A template in the pool blocks the run;
 - with `storage`, role `SwampCiStorage` with exactly `Datastore.AllocateSpace`
   on `/storage/{storage}`, for the clone disks;
 - with `bridge`, role `SwampCiNet` with exactly `SDN.Use` on
   `/sdn/zones/{sdnZone}/{bridge}` (`sdnZone` defaults to `localnetwork`, the
   plain Linux bridges; `vlan` adds the tag to the path for a VLAN-aware bridge);
-- user `swamp-ci@pve`, pool `ci` with the `members` you list (the templates), and
-  a privilege-separated token `runner-pool`.
+- user `swamp-ci@pve`, pool `ci` (empty: each clone joins it when it is made),
+  and a privilege-separated token `runner-pool`.
 
 Each grant goes to the user and the token with propagate 0, so the token holds
 nothing on any other path. The role has no `VM.Config.*`, snapshot or console
 privilege. The checks, the dry run and the token secret work as for
 `ensureSnapshotAccess` (vault key `runner-pool-token`). Clones in the pool are
-reported as `extraMembers` and never removed. A run that adds `storage` or
-`bridge` later adds only those grants.
+reported as `extraMembers` and never removed. A run that adds `storage`,
+`bridge` or a template later adds only those grants.
 
 ```bash
 # Plan (dry run), then apply
 swamp model method run proxmox-admin ensureRunnerPoolAccess \
   --input storage=mrrobot-nfs --input bridge=vmbr1v10 \
-  --input 'members:json=[9000]'
+  --input 'templates:json=[9000]'
 swamp model method run proxmox-admin ensureRunnerPoolAccess \
   --input storage=mrrobot-nfs --input bridge=vmbr1v10 \
-  --input 'members:json=[9000]' --input dryRun=false
+  --input 'templates:json=[9000]' --input dryRun=false
 ```
 
 ## Upgrading to 2026.11.07.1
