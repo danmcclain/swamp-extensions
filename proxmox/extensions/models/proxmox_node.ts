@@ -3,7 +3,8 @@
  * node status, cluster health (clusterHealth), guest discovery for `@dmc/patch`, VM and CT snapshot guarding
  * (snapshot / rollback / list / delete, on the node each guest runs on now),
  * effective-privilege checks
- * (permissions), and the least-privilege snapshot token (ensureSnapshotAccess).
+ * (permissions), the least-privilege snapshot token (ensureSnapshotAccess), and
+ * the least-privilege CI runner-pool token (ensureRunnerPoolAccess).
  *
  * Replaces `@keeb/proxmox/node` plus the ai-infra `proxmox_node_guests.ts`
  * extension. The method names and argument/output shapes of the guest methods
@@ -102,6 +103,45 @@ const ACCESS_ACTIONS = [
   "createToken",
   "aclToken",
   "aclTokenAudit",
+] as const;
+
+/** Privileges of the runner-pool role on `/pool/{pool}`: make (clone into the pool), clone,
+ *  read, power and delete the pool's guests. No VM.Config.*, no snapshot, no console. */
+const RUNNER_POOL_PRIVILEGES = [
+  "VM.Allocate",
+  "VM.Audit",
+  "VM.Clone",
+  "VM.PowerMgmt",
+];
+
+/** Privileges of the runner storage role on `/storage/{storage}`: room for clone disks. */
+const RUNNER_STORAGE_PRIVILEGES = ["Datastore.AllocateSpace"];
+
+/** Privileges of the runner network role on the bridge's `/sdn/zones/...` path. */
+const RUNNER_NET_PRIVILEGES = ["SDN.Use"];
+
+/** Comment stamped on each object `ensureRunnerPoolAccess` creates. */
+const RUNNER_POOL_ACCESS_COMMENT =
+  "managed by @dmc/proxmox ensureRunnerPoolAccess";
+
+/** Proxmox storage id. */
+const STORAGE_ID_RE = /^[A-Za-z][A-Za-z0-9._-]{0,98}[A-Za-z0-9]$/;
+
+/** Linux bridge or SDN VNet name (an interface name, max 15 chars). */
+const BRIDGE_NAME_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,14}$/;
+
+/** SDN zone id; `localnetwork` holds the plain Linux bridges. */
+const SDN_ZONE_RE = /^[A-Za-z][A-Za-z0-9]{0,31}$/;
+
+/** Actions `ensureRunnerPoolAccess` records. Each grant adds a createRole, aclUser and aclToken. */
+const RUNNER_ACCESS_ACTIONS = [
+  "createRole",
+  "createUser",
+  "createPool",
+  "addMembers",
+  "aclUser",
+  "createToken",
+  "aclToken",
 ] as const;
 
 const NodeStatusSchema = z.object({
@@ -239,6 +279,92 @@ const EnsureSnapshotAccessArgs = z.object({
 
 type EnsureArgs = z.infer<typeof EnsureSnapshotAccessArgs>;
 
+const EnsureRunnerPoolAccessArgs = z.object({
+  dryRun: z.boolean().default(true).describe(
+    "Plan and check only; write nothing (default true)",
+  ),
+  user: z.string()
+    .regex(PVE_USER_RE, "user must be name@pve (only the pve realm)")
+    .default("swamp-ci@pve")
+    .describe("Proxmox user that owns the runner-pool token"),
+  tokenName: z.string()
+    .regex(
+      TOKEN_NAME_RE,
+      "tokenName must start with a letter and use only letters, digits, . _ or - (2 to 64 chars)",
+    )
+    .default("runner-pool")
+    .describe("API token name under that user"),
+  pool: z.string()
+    .regex(
+      POOL_NAME_RE,
+      "pool must be one name (letters, digits, _ or -, max 40; no /)",
+    )
+    .default("ci")
+    .describe(
+      "Pool whose guests the token may clone, power and delete, and the only pool it may clone into",
+    ),
+  role: roleArg(
+    "SwampCiPool",
+    `Custom role on /pool/{pool}: exactly ${RUNNER_POOL_PRIVILEGES.join(", ")}`,
+  ),
+  storage: z.string()
+    .regex(STORAGE_ID_RE, "storage must be a Proxmox storage id")
+    .optional()
+    .describe(
+      "Storage that holds the clone disks: the token gets Datastore.AllocateSpace on /storage/{storage}. Omit to grant no storage right",
+    ),
+  storageRole: roleArg(
+    "SwampCiStorage",
+    "Custom role on /storage/{storage}: exactly Datastore.AllocateSpace",
+  ),
+  bridge: z.string()
+    .regex(BRIDGE_NAME_RE, "bridge must be an interface name (max 15 chars)")
+    .optional()
+    .describe(
+      "Bridge (or SDN VNet) the clones use: the token gets SDN.Use on /sdn/zones/{sdnZone}/{bridge}[/{vlan}]. Omit to grant no network right",
+    ),
+  sdnZone: z.string()
+    .regex(SDN_ZONE_RE, "sdnZone must be an SDN zone id")
+    .default("localnetwork")
+    .describe("SDN zone of the bridge; localnetwork for a plain Linux bridge"),
+  vlan: z.number().int().min(1).max(4094).optional().describe(
+    "VLAN tag the clones use on a VLAN-aware bridge; the grant is then on that tag only",
+  ),
+  netRole: roleArg(
+    "SwampCiNet",
+    "Custom role on the bridge path: exactly SDN.Use",
+  ),
+  members: z.array(VmidArg)
+    .refine(
+      (ids) => new Set(ids).size === ids.length,
+      "members must not repeat a vmid",
+    )
+    .default([])
+    .describe(
+      "Guests to put in the pool (the runner templates); never moved from another pool",
+    ),
+})
+  .refine(
+    (a) => a.vlan === undefined || a.bridge !== undefined,
+    { message: "vlan needs a bridge", path: ["vlan"] },
+  )
+  .refine(
+    (a) => {
+      const roles = [
+        a.role,
+        ...(a.storage ? [a.storageRole] : []),
+        ...(a.bridge ? [a.netRole] : []),
+      ];
+      return new Set(roles).size === roles.length;
+    },
+    {
+      message: "role, storageRole and netRole must be different roles",
+      path: ["role"],
+    },
+  );
+
+type RunnerPoolArgs = z.infer<typeof EnsureRunnerPoolAccessArgs>;
+
 const SnapshotAccessSchema = z.object({
   dryRun: z.boolean().describe("True when the run only planned and checked"),
   status: z.enum(["planned", "unchanged", "applied", "blocked", "failed"]),
@@ -288,10 +414,141 @@ const SnapshotTokenSchema = z.object({
   createdAt: z.string(),
 });
 
+const RunnerPoolAccessSchema = z.object({
+  dryRun: z.boolean().describe("True when the run only planned and checked"),
+  status: z.enum(["planned", "unchanged", "applied", "blocked", "failed"]),
+  user: z.string(),
+  tokenId: z.string(),
+  pool: z.string(),
+  aclPath: z.string(),
+  grants: z.array(z.object({
+    path: z.string(),
+    role: z.string(),
+    privileges: z.array(z.string()),
+  })).describe(
+    "Each grant (propagate 0): the pool first, then the storage and the bridge when given",
+  ),
+  members: z.array(z.number()),
+  extraMembers: z.array(z.number()).describe(
+    "Guests in the pool that were not requested (the clones); reported, never removed",
+  ),
+  callerMissing: z.array(
+    z.object({ path: z.string(), privilege: z.string() }),
+  ).describe("Privileges the caller lacks (`A|B` means either one)"),
+  actions: z.array(z.object({
+    action: z.enum(RUNNER_ACCESS_ACTIONS),
+    target: z.string(),
+    state: z.enum(["present", "planned", "applied", "failed"]),
+  })),
+  blockers: z.array(z.string()),
+  verified: z.array(z.object({
+    path: z.string().describe(
+      "/pool/{pool}, /vms/{vmid}, /storage/{storage} or the bridge path",
+    ),
+    privileges: z.array(z.string()),
+    ok: z.boolean(),
+  })),
+  tokenSecretIssued: z.boolean(),
+  checkedAt: z.string(),
+});
+
+const RunnerPoolTokenSchema = z.object({
+  tokenId: z.string(),
+  tokenSecret: z.string().describe("Token secret, shown once by Proxmox")
+    .meta({ sensitive: true }),
+  createdAt: z.string(),
+});
+
+/** The snapshot role on the pool and, with clusterAudit, the audit role on `/`. */
+function snapshotAccessSpec(args: EnsureArgs): AccessSpec {
+  const grants: AccessGrant[] = [{
+    path: `/pool/${args.pool}`,
+    role: args.role,
+    privileges: SNAPSHOT_ROLE_PRIVILEGES,
+    names: { role: "createRole", userAcl: "aclUser", tokenAcl: "aclToken" },
+  }];
+  if (args.clusterAudit) {
+    grants.push({
+      path: AUDIT_ACL_PATH,
+      role: args.auditRole,
+      privileges: AUDIT_ROLE_PRIVILEGES,
+      names: {
+        role: "createAuditRole",
+        userAcl: "aclUserAudit",
+        tokenAcl: "aclTokenAudit",
+      },
+    });
+  }
+  return {
+    method: "ensureSnapshotAccess",
+    comment: SNAPSHOT_ACCESS_COMMENT,
+    user: args.user,
+    tokenName: args.tokenName,
+    pool: args.pool,
+    members: [...args.members].sort((a, b) => a - b),
+    grants,
+  };
+}
+
+/** The ACL path of SDN.Use for a bridge, with the VLAN tag when one is given. */
+export function bridgeAclPath(
+  zone: string,
+  bridge: string,
+  vlan?: number,
+): string {
+  return `/sdn/zones/${zone}/${bridge}${vlan === undefined ? "" : `/${vlan}`}`;
+}
+
+/** The runner role on the pool, then the storage role and the bridge role when given. */
+function runnerPoolAccessSpec(args: RunnerPoolArgs): AccessSpec {
+  const names = {
+    role: "createRole",
+    userAcl: "aclUser",
+    tokenAcl: "aclToken",
+  };
+  const grants: AccessGrant[] = [{
+    path: `/pool/${args.pool}`,
+    role: args.role,
+    privileges: RUNNER_POOL_PRIVILEGES,
+    names,
+  }];
+  if (args.storage) {
+    grants.push({
+      path: `/storage/${args.storage}`,
+      role: args.storageRole,
+      privileges: RUNNER_STORAGE_PRIVILEGES,
+      names,
+    });
+  }
+  if (args.bridge) {
+    grants.push({
+      path: bridgeAclPath(args.sdnZone, args.bridge, args.vlan),
+      role: args.netRole,
+      privileges: RUNNER_NET_PRIVILEGES,
+      names,
+    });
+  }
+  return {
+    method: "ensureRunnerPoolAccess",
+    comment: RUNNER_POOL_ACCESS_COMMENT,
+    user: args.user,
+    tokenName: args.tokenName,
+    pool: args.pool,
+    members: [...args.members].sort((a, b) => a - b),
+    grants,
+  };
+}
+
 type AccessRecord = z.infer<typeof SnapshotAccessSchema>;
-type AccessAction = AccessRecord["actions"][number];
 type AccessStatus = AccessRecord["status"];
 type VerifiedPath = AccessRecord["verified"][number];
+
+/** One action of an ensure-access run; each method's record narrows `action` to its own names. */
+interface AccessAction {
+  action: string;
+  target: string;
+  state: "present" | "planned" | "applied" | "failed";
+}
 
 /** Map the /nodes/{node}/status payload onto the `status` resource shape. */
 export function parseNodeStatus(d: unknown) {
@@ -432,14 +689,6 @@ interface AccessState {
 interface PrivilegeNeed {
   path: string;
   privilege: string;
-}
-
-/** What `planAccess` decided. */
-interface AccessPlan {
-  blockers: string[];
-  actions: AccessAction[];
-  toAdd: number[];
-  extraMembers: number[];
 }
 
 /** A Proxmox object payload; throws unless `value` is a plain object. */
@@ -601,6 +850,59 @@ async function readPrivileges(
     .sort(codeOrder);
 }
 
+/** One custom role granted on one ACL path, to the user and to the token, with propagate 0. */
+interface AccessGrant {
+  /** The ACL path, e.g. `/pool/patch`, `/` or `/storage/nfs`. */
+  path: string;
+  /** The custom role; it must hold exactly `privileges`. */
+  role: string;
+  privileges: string[];
+  /** The action names this grant records for its role, user ACL and token ACL. */
+  names: { role: string; userAcl: string; tokenAcl: string };
+}
+
+/** What one ensure-access run makes: a user, its token, one pool and the grants. */
+interface AccessSpec {
+  /** The method name, for messages. */
+  method: string;
+  /** Comment stamped on each object the run creates. */
+  comment: string;
+  user: string;
+  tokenName: string;
+  pool: string;
+  /** Requested pool members, sorted. */
+  members: number[];
+  /** grants[0] is the pool grant on `/pool/{pool}`; its privileges hold on each pool guest. */
+  grants: AccessGrant[];
+}
+
+/** One planned or present action, with what it needs to run. */
+interface AccessStep {
+  record: AccessAction;
+  kind:
+    | "role"
+    | "user"
+    | "pool"
+    | "members"
+    | "userAcl"
+    | "token"
+    | "tokenAcl";
+  grant?: AccessGrant;
+}
+
+/** What `planAccess` decided. */
+interface AccessPlan {
+  blockers: string[];
+  steps: AccessStep[];
+  toAdd: number[];
+  extraMembers: number[];
+}
+
+/** The grant on the pool path. */
+function poolGrant(spec: AccessSpec): AccessGrant {
+  return spec.grants[0];
+}
+
 /** Requested guests that exist and are in no pool yet: the ones `addMembers` adds. */
 function guestsToAdd(
   members: number[],
@@ -610,12 +912,8 @@ function guestsToAdd(
 }
 
 /** The privileges the caller must hold before any write. */
-function callerNeeds(
-  args: EnsureArgs,
-  members: number[],
-  state: AccessState,
-): PrivilegeNeed[] {
-  const aclPath = `/pool/${args.pool}`;
+function callerNeeds(spec: AccessSpec, state: AccessState): PrivilegeNeed[] {
+  const aclPath = poolGrant(spec).path;
   const needs: PrivilegeNeed[] = [
     { path: "/access", privilege: "Sys.Audit" },
     { path: "/access", privilege: "Sys.Modify" },
@@ -624,13 +922,13 @@ function callerNeeds(
     { path: aclPath, privilege: "Pool.Audit" },
     { path: aclPath, privilege: "Permissions.Modify" },
   ];
-  if (args.clusterAudit) {
-    needs.push({ path: AUDIT_ACL_PATH, privilege: "Permissions.Modify" });
+  for (const grant of spec.grants.slice(1)) {
+    needs.push({ path: grant.path, privilege: "Permissions.Modify" });
   }
-  if (!state.users.some((u) => u.userid === args.user)) {
+  if (!state.users.some((u) => u.userid === spec.user)) {
     needs.push({ path: "/access/realm/pve", privilege: "Realm.AllocateUser" });
   }
-  for (const vmid of guestsToAdd(members, state.guestPools)) {
+  for (const vmid of guestsToAdd(spec.members, state.guestPools)) {
     needs.push({
       path: `/vms/${vmid}`,
       privilege: "Permissions.Modify|VM.Allocate",
@@ -662,18 +960,16 @@ async function missingCallerPrivileges(
 
 /**
  * Compare the state with the wanted one. Pure: makes no calls. Returns every
- * blocker, the ordered actions (`present` or `planned`), the guests to add and
+ * blocker, the ordered steps (`present` or `planned`), the guests to add and
  * the guests in the pool that were not requested.
  */
 function planAccess(
-  args: EnsureArgs,
-  members: number[],
+  spec: AccessSpec,
   state: AccessState,
   callerMissing: PrivilegeNeed[],
 ): AccessPlan {
-  const { user, role, pool } = args;
-  const tokenId = `${user}!${args.tokenName}`;
-  const aclPath = `/pool/${pool}`;
+  const { user, pool, members, grants } = spec;
+  const tokenId = `${user}!${spec.tokenName}`;
   const blockers: string[] = [];
 
   for (const m of callerMissing) {
@@ -683,12 +979,14 @@ function planAccess(
   }
 
   // An existing role must hold exactly its set: never more, never less.
-  const checkRole = (name: string, wanted: string[]) => {
-    const info = state.roles.find((r) => r.roleid === name);
+  const roleInfos = grants.map((grant) => {
+    const info = state.roles.find((r) => r.roleid === grant.role);
     if (!info) return undefined;
+    const name = grant.role;
     if (info.special) blockers.push(`role ${name} is a built-in role`);
-    const extra = info.privs.filter((p) => !wanted.includes(p)).sort(codeOrder);
-    const missing = wanted.filter((p) => !info.privs.includes(p));
+    const extra = info.privs.filter((p) => !grant.privileges.includes(p))
+      .sort(codeOrder);
+    const missing = grant.privileges.filter((p) => !info.privs.includes(p));
     if (extra.length > 0) {
       blockers.push(`role ${name} has extra privileges: ${extra.join(", ")}`);
     }
@@ -698,11 +996,7 @@ function planAccess(
       );
     }
     return info;
-  };
-  const roleInfo = checkRole(role, SNAPSHOT_ROLE_PRIVILEGES);
-  const auditRoleInfo = args.clusterAudit
-    ? checkRole(args.auditRole, AUDIT_ROLE_PRIVILEGES)
-    : undefined;
+  });
 
   const userInfo = state.users.find((u) => u.userid === user);
   if (userInfo?.disabled) blockers.push(`user ${user} is disabled`);
@@ -720,29 +1014,22 @@ function planAccess(
     );
   }
 
-  // The user and the token may hold only these grants, each with propagate 0: the snapshot
-  // role on the pool and, with clusterAudit, the audit role on / itself. Any other grant to
-  // them, and any grant of our roles to someone else, blocks the run.
-  const allowedGrants: Array<{ path: string; roleid: string }> = [
-    { path: aclPath, roleid: role },
-  ];
-  if (args.clusterAudit) {
-    allowedGrants.push({ path: AUDIT_ACL_PATH, roleid: args.auditRole });
-  }
-  const allowedText = allowedGrants
-    .map((x) => `role ${x.roleid} on ${x.path}`)
+  // The user and the token may hold only the spec's grants, each with propagate 0. Any other
+  // grant to them, and any grant of our roles to someone else, blocks the run.
+  const allowedText = grants
+    .map((x) => `role ${x.role} on ${x.path}`)
     .join(" and ");
-  const ourRoles = allowedGrants.map((x) => x.roleid);
+  const ourRoles = grants.map((x) => x.role);
   for (const a of state.acl) {
     const isOurs = (a.type === "user" && a.ugid === user) ||
       (a.type === "token" && a.ugid === tokenId);
     if (isOurs) {
       const allowed = a.propagate === 0 &&
-        allowedGrants.some((x) => x.path === a.path && x.roleid === a.roleid);
+        grants.some((x) => x.path === a.path && x.role === a.roleid);
       if (!allowed) {
         blockers.push(
           `${a.type} ${a.ugid} has role ${a.roleid} on ${a.path} with propagate ${a.propagate}; the only allowed ${
-            allowedGrants.length > 1 ? "grants are" : "grant is"
+            grants.length > 1 ? "grants are" : "grant is"
           } ${allowedText}, with propagate 0`,
         );
       }
@@ -765,69 +1052,49 @@ function planAccess(
     }
   }
 
-  const granted = (
-    type: string,
-    ugid: string,
-    path = aclPath,
-    roleid = role,
-  ) =>
+  const granted = (type: string, ugid: string, grant: AccessGrant) =>
     state.acl.some((a) =>
-      a.type === type && a.ugid === ugid && a.path === path &&
-      a.roleid === roleid && a.propagate === 0
+      a.type === type && a.ugid === ugid && a.path === grant.path &&
+      a.roleid === grant.role && a.propagate === 0
     );
-  const stateFor = (present: boolean): AccessAction["state"] =>
-    present ? "present" : "planned";
-  const audit = args.clusterAudit;
+  const step = (
+    kind: AccessStep["kind"],
+    action: string,
+    target: string,
+    present: boolean,
+    grant?: AccessGrant,
+  ): AccessStep => ({
+    record: { action, target, state: present ? "present" : "planned" },
+    kind,
+    grant,
+  });
 
-  const actions: AccessAction[] = [
-    { action: "createRole", target: role, state: stateFor(!!roleInfo) },
-    ...(audit
-      ? [{
-        action: "createAuditRole" as const,
-        target: args.auditRole,
-        state: stateFor(!!auditRoleInfo),
-      }]
-      : []),
-    { action: "createUser", target: user, state: stateFor(!!userInfo) },
-    {
-      action: "createPool",
-      target: pool,
-      state: stateFor(state.pools.includes(pool)),
-    },
-    {
-      action: "addMembers",
-      target: toAdd.join(","),
-      state: stateFor(toAdd.length === 0),
-    },
-    {
-      action: "aclUser",
-      target: aclPath,
-      state: stateFor(granted("user", user)),
-    },
-    ...(audit
-      ? [{
-        action: "aclUserAudit" as const,
-        target: AUDIT_ACL_PATH,
-        state: stateFor(
-          granted("user", user, AUDIT_ACL_PATH, args.auditRole),
-        ),
-      }]
-      : []),
-    { action: "createToken", target: tokenId, state: stateFor(!!tokenInfo) },
-    {
-      action: "aclToken",
-      target: aclPath,
-      state: stateFor(granted("token", tokenId)),
-    },
-    ...(audit
-      ? [{
-        action: "aclTokenAudit" as const,
-        target: AUDIT_ACL_PATH,
-        state: stateFor(
-          granted("token", tokenId, AUDIT_ACL_PATH, args.auditRole),
-        ),
-      }]
-      : []),
+  const steps: AccessStep[] = [
+    ...grants.map((grant, i) =>
+      step("role", grant.names.role, grant.role, !!roleInfos[i], grant)
+    ),
+    step("user", "createUser", user, !!userInfo),
+    step("pool", "createPool", pool, state.pools.includes(pool)),
+    step("members", "addMembers", toAdd.join(","), toAdd.length === 0),
+    ...grants.map((grant) =>
+      step(
+        "userAcl",
+        grant.names.userAcl,
+        grant.path,
+        granted("user", user, grant),
+        grant,
+      )
+    ),
+    step("token", "createToken", tokenId, !!tokenInfo),
+    ...grants.map((grant) =>
+      step(
+        "tokenAcl",
+        grant.names.tokenAcl,
+        grant.path,
+        granted("token", tokenId, grant),
+        grant,
+      )
+    ),
   ];
 
   const extraMembers = [...state.guestPools.entries()]
@@ -835,7 +1102,7 @@ function planAccess(
     .map(([vmid]) => vmid)
     .sort((a, b) => a - b);
 
-  return { blockers, actions, toAdd, extraMembers };
+  return { blockers, steps, toAdd, extraMembers };
 }
 
 /** True when `privs` is exactly `wanted`. */
@@ -851,19 +1118,20 @@ interface VerifyTarget {
 }
 
 /** The pool path (always, so a run with no members still proves the grant) and each guest
- *  in `vmids`, each with exactly the snapshot set; with `audit`, also `/` with exactly the
- *  audit set. A propagated grant on `/` shows up as extra privileges on the pool. */
+ *  in `vmids`, each with exactly the pool grant's set; then each other grant in `others`
+ *  with exactly its own set. A propagated grant above shows up as extra privileges. */
 function verifyTargets(
-  aclPath: string,
+  spec: AccessSpec,
   vmids: number[],
-  audit: boolean,
+  others: AccessGrant[],
 ): VerifyTarget[] {
+  const pool = poolGrant(spec);
   return [
-    ...[aclPath, ...vmids.map((vmid) => `/vms/${vmid}`)].map((path) => ({
+    ...[pool.path, ...vmids.map((vmid) => `/vms/${vmid}`)].map((path) => ({
       path,
-      wanted: SNAPSHOT_ROLE_PRIVILEGES,
+      wanted: pool.privileges,
     })),
-    ...(audit ? [{ path: AUDIT_ACL_PATH, wanted: AUDIT_ROLE_PRIVILEGES }] : []),
+    ...others.map((grant) => ({ path: grant.path, wanted: grant.privileges })),
   ];
 }
 
@@ -873,23 +1141,348 @@ async function verifyAccess(
   auth: ProxmoxAuth,
   tokenId: string,
   targets: VerifyTarget[],
-): Promise<VerifiedPath[]> {
-  const verified: VerifiedPath[] = [];
+): Promise<Array<VerifiedPath & { wanted: string[] }>> {
+  const verified: Array<VerifiedPath & { wanted: string[] }> = [];
   for (const { path, wanted } of targets) {
     const privileges = await readPrivileges(g, auth, path, tokenId);
-    verified.push({ path, privileges, ok: isExactSet(privileges, wanted) });
+    verified.push({
+      path,
+      privileges,
+      ok: isExactSet(privileges, wanted),
+      wanted,
+    });
   }
   return verified;
 }
 
 /** The blocker or error text for a verified path that is not exact. */
-function notExactText(tokenId: string, v: VerifiedPath): string {
-  const wanted = v.path === AUDIT_ACL_PATH
-    ? AUDIT_ROLE_PRIVILEGES
-    : SNAPSHOT_ROLE_PRIVILEGES;
+function notExactText(
+  tokenId: string,
+  v: VerifiedPath & { wanted: string[] },
+): string {
   return `${tokenId} does not have exactly ${
-    wanted.join(", ")
+    v.wanted.join(", ")
   } on ${v.path} (has ${v.privileges.join(", ") || "none"})`;
+}
+
+/** The fields every ensure-access record has. */
+interface AccessRecordBase {
+  dryRun: boolean;
+  status: AccessStatus;
+  user: string;
+  tokenId: string;
+  pool: string;
+  aclPath: string;
+  members: number[];
+  extraMembers: number[];
+  callerMissing: PrivilegeNeed[];
+  actions: AccessAction[];
+  blockers: string[];
+  verified: VerifiedPath[];
+  tokenSecretIssued: boolean;
+  checkedAt: string;
+}
+
+/** Where one ensure-access method writes its record and its token secret. */
+interface AccessOutput {
+  recordSpec: string;
+  recordName: string;
+  tokenSpec: string;
+  tokenName: string;
+  /** Log label, e.g. "Snapshot access". */
+  label: string;
+  /** The full record from the common fields. */
+  record: (base: AccessRecordBase) => Record<string, unknown>;
+}
+
+/**
+ * Run one ensure-access method: read, plan, block on any problem, then (live) create what is
+ * missing in order and verify the token's exact privileges on every path. Dry runs write nothing
+ * to Proxmox. Never changes or removes an existing object.
+ */
+async function ensureAccess(
+  spec: AccessSpec,
+  dryRun: boolean,
+  out: AccessOutput,
+  context: Ctx,
+): Promise<{ dataHandles: Array<{ name: string }> }> {
+  const g = context.globalArgs;
+  const log = createMethodLogger(context);
+  const api = `${g.apiUrl}/api2/json`;
+  const tokenId = `${spec.user}!${spec.tokenName}`;
+  const pool = poolGrant(spec);
+  const aclPath = pool.path;
+  log.info(
+    "Checking {label} for {tokenId} on {aclPath} ({mode})",
+    {
+      label: out.label.toLowerCase(),
+      tokenId,
+      aclPath,
+      mode: dryRun ? "dry run" : "live",
+    },
+  );
+  const auth = await resolveAuth(g);
+  const state = await readAccessState(g, auth);
+  const callerMissing = await missingCallerPrivileges(
+    g,
+    auth,
+    callerNeeds(spec, state),
+  );
+  const plan = planAccess(spec, state, callerMissing);
+  const { steps, blockers } = plan;
+  const actions = steps.map((s) => s.record);
+  const handles: Array<{ name: string }> = [];
+  let verified: Array<VerifiedPath & { wanted: string[] }> = [];
+  let tokenSecretIssued = false;
+
+  const writeRecord = (status: AccessStatus) =>
+    context.writeResource(
+      out.recordSpec,
+      out.recordName,
+      out.record({
+        dryRun,
+        status,
+        user: spec.user,
+        tokenId,
+        pool: spec.pool,
+        aclPath,
+        members: spec.members,
+        extraMembers: plan.extraMembers,
+        callerMissing,
+        actions,
+        blockers,
+        verified: verified.map(({ path, privileges, ok }) => ({
+          path,
+          privileges,
+          ok,
+        })),
+        tokenSecretIssued,
+        checkedAt: new Date().toISOString(),
+      }),
+    );
+
+  const failIfBlocked = async () => {
+    if (blockers.length === 0) return;
+    await writeRecord("blocked");
+    throw new Error(`${spec.method} blocked: ${blockers.join("; ")}`);
+  };
+  await failIfBlocked();
+
+  const tokenAclPresent = (grant: AccessGrant) =>
+    steps.some((s) =>
+      s.kind === "tokenAcl" && s.grant === grant &&
+      s.record.state === "present"
+    );
+
+  if (dryRun) {
+    // A token whose ACLs are already in place is checked now. A planned
+    // ACL cannot be checked until the live run has made it.
+    const tokenPresent = steps.some((s) =>
+      s.kind === "token" && s.record.state === "present"
+    );
+    if (tokenPresent && tokenAclPresent(pool)) {
+      verified = await verifyAccess(
+        g,
+        auth,
+        tokenId,
+        verifyTargets(
+          spec,
+          spec.members.filter((vmid) =>
+            state.guestPools.get(vmid) === spec.pool
+          ),
+          spec.grants.slice(1).filter(tokenAclPresent),
+        ),
+      );
+      for (const v of verified) {
+        if (!v.ok) blockers.push(notExactText(tokenId, v));
+      }
+      await failIfBlocked();
+    }
+    const status: AccessStatus = actions.some((a) => a.state === "planned")
+      ? "planned"
+      : "unchanged";
+    const handle = await writeRecord(status);
+    log.info("{label} {status} for {tokenId}", {
+      label: out.label,
+      status,
+      tokenId,
+    });
+    return { dataHandles: [handle] };
+  }
+
+  // Always propagate 0: a grant never reaches below its path.
+  const grant = (
+    path: string,
+    roleid: string,
+    who: { users: string } | { tokens: string },
+  ) =>
+    pveCall(
+      g,
+      auth,
+      "PUT",
+      `${api}/access/acl`,
+      `Granting ${roleid} on ${path} to ${
+        "users" in who ? who.users : who.tokens
+      }`,
+      formBody({ path, roles: roleid, ...who, propagate: "0" }),
+    );
+
+  const createToken = async () => {
+    const lost =
+      `the token may now exist without a stored secret: delete ${tokenId} in Proxmox and run again`;
+    let data: unknown;
+    try {
+      data = await pveCall(
+        g,
+        auth,
+        "POST",
+        `${api}/access/users/${encodeURIComponent(spec.user)}/token/${
+          encodeURIComponent(spec.tokenName)
+        }`,
+        `Creating token ${tokenId}`,
+        formBody({ privsep: "1", comment: spec.comment }),
+      );
+    } catch (err) {
+      // A JSON parse error quotes the body, and a 2xx body holds the
+      // secret: never pass its message on.
+      if (err instanceof SyntaxError) {
+        throw new Error(
+          `Proxmox answered the token request with a body that is not JSON; ${lost}`,
+        );
+      }
+      throw err;
+    }
+    // The secret is returned once: store it before any other check or call.
+    const created: Record<string, unknown> = isPlainObject(data) ? data : {};
+    const secret = created.value;
+    if (typeof secret !== "string" || secret === "") {
+      throw new Error(`Proxmox returned no secret; ${lost}`);
+    }
+    try {
+      handles.push(
+        await context.writeResource(out.tokenSpec, out.tokenName, {
+          tokenId,
+          tokenSecret: secret,
+          createdAt: new Date().toISOString(),
+        }),
+      );
+    } catch {
+      // The vault error could echo what it was given; keep only the cause.
+      throw new Error(`Could not store the token secret; ${lost}`);
+    }
+    tokenSecretIssued = true;
+    if (created["full-tokenid"] !== tokenId) {
+      throw new Error(`Proxmox created a token that is not ${tokenId}`);
+    }
+    const info: Record<string, unknown> = isPlainObject(created.info)
+      ? created.info
+      : {};
+    if (!privsepOn(info.privsep)) {
+      throw new Error(
+        `token ${tokenId} was not created with privilege separation`,
+      );
+    }
+  };
+
+  const apply = async (s: AccessStep) => {
+    switch (s.kind) {
+      case "role":
+        await pveCall(
+          g,
+          auth,
+          "POST",
+          `${api}/access/roles`,
+          `Creating role ${s.grant!.role}`,
+          formBody({
+            roleid: s.grant!.role,
+            privs: s.grant!.privileges.join(","),
+          }),
+        );
+        return;
+      case "user":
+        await pveCall(
+          g,
+          auth,
+          "POST",
+          `${api}/access/users`,
+          `Creating user ${spec.user}`,
+          formBody({ userid: spec.user, enable: "1", comment: spec.comment }),
+        );
+        return;
+      case "pool":
+        await pveCall(
+          g,
+          auth,
+          "POST",
+          `${api}/pools`,
+          `Creating pool ${spec.pool}`,
+          formBody({ poolid: spec.pool, comment: spec.comment }),
+        );
+        return;
+      case "members":
+        await pveCall(
+          g,
+          auth,
+          "PUT",
+          `${api}/pools`,
+          `Adding guests to pool ${spec.pool}`,
+          formBody({ poolid: spec.pool, vms: plan.toAdd.join(",") }),
+        );
+        return;
+      case "userAcl":
+        await grant(s.grant!.path, s.grant!.role, { users: spec.user });
+        return;
+      case "token":
+        await createToken();
+        return;
+      case "tokenAcl":
+        await grant(s.grant!.path, s.grant!.role, { tokens: tokenId });
+        return;
+    }
+  };
+
+  let current: AccessAction | undefined;
+  try {
+    for (const s of steps) {
+      if (s.record.state !== "planned") continue;
+      current = s.record;
+      await apply(s);
+      s.record.state = "applied";
+      log.info("Applied {action} on {target}", {
+        action: s.record.action,
+        target: s.record.target,
+      });
+    }
+    verified = await verifyAccess(
+      g,
+      auth,
+      tokenId,
+      verifyTargets(spec, spec.members, spec.grants.slice(1)),
+    );
+    const bad = verified.filter((v) => !v.ok);
+    if (bad.length > 0) {
+      throw new Error(
+        `${spec.method} verification failed: ${
+          bad.map((v) => notExactText(tokenId, v)).join("; ")
+        }`,
+      );
+    }
+  } catch (err) {
+    if (current?.state === "planned") current.state = "failed";
+    await writeRecord("failed");
+    throw err;
+  }
+
+  const status: AccessStatus = actions.some((a) => a.state === "applied")
+    ? "applied"
+    : "unchanged";
+  const handle = await writeRecord(status);
+  log.info("{label} {status} for {tokenId}", {
+    label: out.label,
+    status,
+    tokenId,
+  });
+  return { dataHandles: [handle, ...handles] };
 }
 
 /** A form-encoded request body. */
@@ -1380,7 +1973,7 @@ const CT_SNAPSHOTS = snapshotMethods("lxc");
 /** Swamp model definition for `@dmc/proxmox/node`. */
 export const model = {
   type: "@dmc/proxmox/node",
-  version: "2026.11.07.1",
+  version: "2026.11.13.1",
   globalArguments: ProxmoxConnectionArgs,
   upgrades: [
     {
@@ -1393,6 +1986,12 @@ export const model = {
       toVersion: "2026.11.07.1",
       description:
         "Breaking: API tokens are the only auth. The upgrade drops the ticket, csrfToken, username, password and realm global args; a definition that used them needs tokenId and tokenSecret. Additive: optional caCert (verify a self-signed API certificate). New methods: CT snapshots, permissions, clusterHealth and ensureSnapshotAccess. Set skipTlsVerify false or caCert, so the token is not sent unverified",
+      upgradeAttributes: dropRemovedAuthArgs,
+    },
+    {
+      toVersion: "2026.11.13.1",
+      description:
+        "Additive: new method ensureRunnerPoolAccess (a least-privilege token that may clone, power and delete the guests of one CI pool and clone only into it) with the runnerPoolAccess and runnerPoolToken resources. No argument changes",
       upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
@@ -1440,6 +2039,20 @@ export const model = {
       description:
         "One-time secret of a snapshot API token created by ensureSnapshotAccess (sensitive)",
       schema: SnapshotTokenSchema,
+      lifetime: "infinite",
+      garbageCollection: 5,
+    },
+    runnerPoolAccess: {
+      description:
+        "Plan, blockers, actions and verification of an ensureRunnerPoolAccess run",
+      schema: RunnerPoolAccessSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    runnerPoolToken: {
+      description:
+        "One-time secret of a runner-pool API token created by ensureRunnerPoolAccess (sensitive)",
+      schema: RunnerPoolTokenSchema,
       lifetime: "infinite",
       garbageCollection: 5,
     },
@@ -1677,310 +2290,60 @@ export const model = {
         "The new token secret is a sensitive output, stored in the vault as snapshot-token and never in data. " +
         "Needs: Sys.Audit and Sys.Modify on /access; User.Modify on /access/groups; Realm.AllocateUser on /access/realm/pve (new user only); Pool.Allocate, Pool.Audit and Permissions.Modify on /pool/{pool}; Permissions.Modify or VM.Allocate on each guest added; with clusterAudit, Permissions.Modify on /.",
       arguments: EnsureSnapshotAccessArgs,
-      execute: async (args: EnsureArgs, context: Ctx) => {
-        const g = context.globalArgs;
-        const log = createMethodLogger(context);
-        const api = `${g.apiUrl}/api2/json`;
-        const members = [...args.members].sort((a, b) => a - b);
-        const tokenId = `${args.user}!${args.tokenName}`;
-        const aclPath = `/pool/${args.pool}`;
-        log.info(
-          "Checking snapshot access for {tokenId} on {aclPath} ({mode})",
+      execute: (args: EnsureArgs, context: Ctx) =>
+        ensureAccess(
+          snapshotAccessSpec(args),
+          args.dryRun,
           {
-            tokenId,
-            aclPath,
-            mode: args.dryRun ? "dry run" : "live",
+            recordSpec: "snapshotAccess",
+            recordName: "snapshot-access",
+            tokenSpec: "snapshotToken",
+            tokenName: "snapshot-token",
+            label: "Snapshot access",
+            record: (base) => ({
+              ...base,
+              role: args.role,
+              privileges: [...SNAPSHOT_ROLE_PRIVILEGES],
+              clusterAudit: args.clusterAudit,
+              auditRole: args.clusterAudit ? args.auditRole : null,
+              auditPrivileges: args.clusterAudit
+                ? [...AUDIT_ROLE_PRIVILEGES]
+                : [],
+            }),
           },
+          context,
+        ),
+    },
+
+    ensureRunnerPoolAccess: {
+      description:
+        "Make a least-privilege Proxmox API token for a CI runner pool: it may clone, start, stop and delete the guests in one pool, and make new guests (linked clones) only in that pool. It also gets Datastore.AllocateSpace on one storage (the clone disks) and, when a bridge is given, SDN.Use on that bridge. Each grant is its own custom role with propagate 0, so the token holds nothing on any other path. " +
+        "Dry run by default. Reads everything first and writes nothing if any blocker exists. Creates only what is missing: it never changes or removes an existing role, user, token, ACL, pool or guest membership, and never moves a guest out of another pool. Clones in the pool are reported as extra members, never removed. " +
+        "The new token secret is a sensitive output, stored in the vault as runner-pool-token and never in data. " +
+        "Needs: Sys.Audit and Sys.Modify on /access; User.Modify on /access/groups; Realm.AllocateUser on /access/realm/pve (new user only); Pool.Allocate, Pool.Audit and Permissions.Modify on /pool/{pool}; Permissions.Modify on /storage/{storage} and, with a bridge, on its /sdn/zones path; Permissions.Modify or VM.Allocate on each guest added.",
+      arguments: EnsureRunnerPoolAccessArgs,
+      execute: (args: RunnerPoolArgs, context: Ctx) => {
+        const spec = runnerPoolAccessSpec(args);
+        return ensureAccess(
+          spec,
+          args.dryRun,
+          {
+            recordSpec: "runnerPoolAccess",
+            recordName: "runner-pool-access",
+            tokenSpec: "runnerPoolToken",
+            tokenName: "runner-pool-token",
+            label: "Runner pool access",
+            record: (base) => ({
+              ...base,
+              grants: spec.grants.map(({ path, role, privileges }) => ({
+                path,
+                role,
+                privileges: [...privileges],
+              })),
+            }),
+          },
+          context,
         );
-        const auth = await resolveAuth(g);
-        const state = await readAccessState(g, auth);
-        const callerMissing = await missingCallerPrivileges(
-          g,
-          auth,
-          callerNeeds(args, members, state),
-        );
-        const plan = planAccess(args, members, state, callerMissing);
-        const { actions, blockers } = plan;
-        const stateOf = (name: AccessAction["action"]) =>
-          actions.find((a) => a.action === name)?.state;
-        const handles: Array<{ name: string }> = [];
-        let verified: VerifiedPath[] = [];
-        let tokenSecretIssued = false;
-
-        const writeRecord = (status: AccessStatus) =>
-          context.writeResource("snapshotAccess", "snapshot-access", {
-            dryRun: args.dryRun,
-            status,
-            user: args.user,
-            tokenId,
-            role: args.role,
-            privileges: [...SNAPSHOT_ROLE_PRIVILEGES],
-            clusterAudit: args.clusterAudit,
-            auditRole: args.clusterAudit ? args.auditRole : null,
-            auditPrivileges: args.clusterAudit
-              ? [...AUDIT_ROLE_PRIVILEGES]
-              : [],
-            pool: args.pool,
-            aclPath,
-            members,
-            extraMembers: plan.extraMembers,
-            callerMissing,
-            actions,
-            blockers,
-            verified,
-            tokenSecretIssued,
-            checkedAt: new Date().toISOString(),
-          });
-
-        const failIfBlocked = async () => {
-          if (blockers.length === 0) return;
-          await writeRecord("blocked");
-          throw new Error(
-            `ensureSnapshotAccess blocked: ${blockers.join("; ")}`,
-          );
-        };
-        await failIfBlocked();
-
-        if (args.dryRun) {
-          // A token whose ACL is already in place is checked now. A planned
-          // ACL cannot be checked until the live run has made it.
-          if (
-            stateOf("createToken") === "present" &&
-            stateOf("aclToken") === "present"
-          ) {
-            verified = await verifyAccess(
-              g,
-              auth,
-              tokenId,
-              verifyTargets(
-                aclPath,
-                members.filter((vmid) =>
-                  state.guestPools.get(vmid) === args.pool
-                ),
-                stateOf("aclTokenAudit") === "present",
-              ),
-            );
-            for (const v of verified) {
-              if (!v.ok) blockers.push(notExactText(tokenId, v));
-            }
-            await failIfBlocked();
-          }
-          const status: AccessStatus = actions.some((a) =>
-              a.state === "planned"
-            )
-            ? "planned"
-            : "unchanged";
-          const handle = await writeRecord(status);
-          log.info("Snapshot access {status} for {tokenId}", {
-            status,
-            tokenId,
-          });
-          return { dataHandles: [handle] };
-        }
-
-        const createRole = (roleid: string, privs: string[]) =>
-          pveCall(
-            g,
-            auth,
-            "POST",
-            `${api}/access/roles`,
-            `Creating role ${roleid}`,
-            formBody({ roleid, privs: privs.join(",") }),
-          );
-        // Always propagate 0: a grant never reaches below its path.
-        const grant = (
-          path: string,
-          roleid: string,
-          who: { users: string } | { tokens: string },
-        ) =>
-          pveCall(
-            g,
-            auth,
-            "PUT",
-            `${api}/access/acl`,
-            `Granting ${roleid} on ${path} to ${
-              "users" in who ? who.users : who.tokens
-            }`,
-            formBody({ path, roles: roleid, ...who, propagate: "0" }),
-          );
-
-        const apply = async (name: AccessAction["action"]) => {
-          switch (name) {
-            case "createRole":
-              await createRole(args.role, SNAPSHOT_ROLE_PRIVILEGES);
-              return;
-            case "createAuditRole":
-              await createRole(args.auditRole, AUDIT_ROLE_PRIVILEGES);
-              return;
-            case "aclUserAudit":
-              await grant(AUDIT_ACL_PATH, args.auditRole, { users: args.user });
-              return;
-            case "aclTokenAudit":
-              await grant(AUDIT_ACL_PATH, args.auditRole, { tokens: tokenId });
-              return;
-            case "createUser":
-              await pveCall(
-                g,
-                auth,
-                "POST",
-                `${api}/access/users`,
-                `Creating user ${args.user}`,
-                formBody({
-                  userid: args.user,
-                  enable: "1",
-                  comment: SNAPSHOT_ACCESS_COMMENT,
-                }),
-              );
-              return;
-            case "createPool":
-              await pveCall(
-                g,
-                auth,
-                "POST",
-                `${api}/pools`,
-                `Creating pool ${args.pool}`,
-                formBody({
-                  poolid: args.pool,
-                  comment: SNAPSHOT_ACCESS_COMMENT,
-                }),
-              );
-              return;
-            case "addMembers":
-              await pveCall(
-                g,
-                auth,
-                "PUT",
-                `${api}/pools`,
-                `Adding guests to pool ${args.pool}`,
-                formBody({ poolid: args.pool, vms: plan.toAdd.join(",") }),
-              );
-              return;
-            case "aclUser":
-              await grant(aclPath, args.role, { users: args.user });
-              return;
-            case "createToken": {
-              const lost =
-                `the token may now exist without a stored secret: delete ${tokenId} in Proxmox and run again`;
-              let data: unknown;
-              try {
-                data = await pveCall(
-                  g,
-                  auth,
-                  "POST",
-                  `${api}/access/users/${encodeURIComponent(args.user)}/token/${
-                    encodeURIComponent(args.tokenName)
-                  }`,
-                  `Creating token ${tokenId}`,
-                  formBody({ privsep: "1", comment: SNAPSHOT_ACCESS_COMMENT }),
-                );
-              } catch (err) {
-                // A JSON parse error quotes the body, and a 2xx body holds the
-                // secret: never pass its message on.
-                if (err instanceof SyntaxError) {
-                  throw new Error(
-                    `Proxmox answered the token request with a body that is not JSON; ${lost}`,
-                  );
-                }
-                throw err;
-              }
-              // The secret is returned once: store it before any other check or call.
-              const created: Record<string, unknown> = isPlainObject(data)
-                ? data
-                : {};
-              const secret = created.value;
-              if (typeof secret !== "string" || secret === "") {
-                throw new Error(`Proxmox returned no secret; ${lost}`);
-              }
-              try {
-                handles.push(
-                  await context.writeResource(
-                    "snapshotToken",
-                    "snapshot-token",
-                    {
-                      tokenId,
-                      tokenSecret: secret,
-                      createdAt: new Date().toISOString(),
-                    },
-                  ),
-                );
-              } catch {
-                // The vault error could echo what it was given; keep only the cause.
-                throw new Error(`Could not store the token secret; ${lost}`);
-              }
-              tokenSecretIssued = true;
-              if (created["full-tokenid"] !== tokenId) {
-                throw new Error(
-                  `Proxmox created a token that is not ${tokenId}`,
-                );
-              }
-              const info: Record<string, unknown> = isPlainObject(
-                  created.info,
-                )
-                ? created.info
-                : {};
-              if (!privsepOn(info.privsep)) {
-                throw new Error(
-                  `token ${tokenId} was not created with privilege separation`,
-                );
-              }
-              return;
-            }
-            case "aclToken":
-              await pveCall(
-                g,
-                auth,
-                "PUT",
-                `${api}/access/acl`,
-                `Granting ${args.role} on ${aclPath} to ${tokenId}`,
-                formBody({
-                  path: aclPath,
-                  roles: args.role,
-                  tokens: tokenId,
-                  propagate: "0",
-                }),
-              );
-              return;
-          }
-        };
-
-        let current: AccessAction | undefined;
-        try {
-          for (const action of actions) {
-            if (action.state !== "planned") continue;
-            current = action;
-            await apply(action.action);
-            action.state = "applied";
-            log.info("Applied {action} on {target}", {
-              action: action.action,
-              target: action.target,
-            });
-          }
-          verified = await verifyAccess(
-            g,
-            auth,
-            tokenId,
-            verifyTargets(aclPath, members, args.clusterAudit),
-          );
-          const bad = verified.filter((v) => !v.ok);
-          if (bad.length > 0) {
-            throw new Error(
-              `ensureSnapshotAccess verification failed: ${
-                bad.map((v) => notExactText(tokenId, v)).join("; ")
-              }`,
-            );
-          }
-        } catch (err) {
-          if (current?.state === "planned") current.state = "failed";
-          await writeRecord("failed");
-          throw err;
-        }
-
-        const status: AccessStatus = actions.some((a) => a.state === "applied")
-          ? "applied"
-          : "unchanged";
-        const handle = await writeRecord(status);
-        log.info("Snapshot access {status} for {tokenId}", { status, tokenId });
-        return { dataHandles: [handle, ...handles] };
       },
     },
   },
