@@ -556,10 +556,10 @@ reported as `extraMembers` and never removed. A run that adds `storage`,
 ```bash
 # Plan (dry run), then apply
 swamp model method run proxmox-admin ensureRunnerPoolAccess \
-  --input storage=mrrobot-nfs --input bridge=vmbr1v10 \
+  --input storage=vm-nfs --input bridge=vmbr0 \
   --input 'templates:json=[9000]'
 swamp model method run proxmox-admin ensureRunnerPoolAccess \
-  --input storage=mrrobot-nfs --input bridge=vmbr1v10 \
+  --input storage=vm-nfs --input bridge=vmbr0 \
   --input 'templates:json=[9000]' --input dryRun=false
 ```
 

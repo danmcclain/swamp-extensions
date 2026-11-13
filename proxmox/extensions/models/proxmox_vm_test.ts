@@ -425,7 +425,7 @@ Deno.test("clone with linked false makes a full copy on the given storage and id
     vmName: "serve-copy",
     newid: 9200,
     linked: false,
-    storage: "mrrobot-nfs",
+    storage: "vm-nfs",
   });
   assertEquals(r.error, null);
   assertFalse(r.seen.some((s) => s.url.endsWith("/cluster/nextid")));
@@ -434,7 +434,7 @@ Deno.test("clone with linked false makes a full copy on the given storage and id
     newid: "9200",
     name: "serve-copy",
     full: "1",
-    storage: "mrrobot-nfs",
+    storage: "vm-nfs",
   });
 });
 
@@ -492,8 +492,8 @@ Deno.test("clone arguments refuse a storage on a linked clone and unsafe names",
       ...input,
     }).success;
   assert(parse({}));
-  assertFalse(parse({ storage: "mrrobot-nfs" }));
-  assert(parse({ storage: "mrrobot-nfs", linked: false }));
+  assertFalse(parse({ storage: "vm-nfs" }));
+  assert(parse({ storage: "vm-nfs", linked: false }));
   assertFalse(parse({ vmName: "bad name" }));
   assertFalse(parse({ vmName: "-bad" }));
   assertFalse(parse({ pool: "ci/x" }));

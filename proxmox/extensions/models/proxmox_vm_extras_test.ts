@@ -578,8 +578,8 @@ Deno.test("cluster-has-migration-target passes without a call under a plain `swa
 
 const imageArgs = {
   vmName: "v",
-  importFrom: "mrrobot:import/rocky10.qcow2",
-  diskStorage: "mrrobot",
+  importFrom: "images:import/rocky10.qcow2",
+  diskStorage: "images",
 };
 const tenGiBImage = httpOutput(200, {
   data: { format: "qcow2", size: 10 * 1024 ** 3, used: 520355840 },
@@ -595,7 +595,7 @@ Deno.test("disk-size-fits-image passes when diskSize is at least the image's vir
   assertEquals(result, { pass: true });
   assertStringIncludes(
     calls[0].args.join(" "),
-    "/nodes/pve/storage/mrrobot/content/mrrobot%3Aimport%2Frocky10.qcow2",
+    "/nodes/pve/storage/images/content/images%3Aimport%2Frocky10.qcow2",
   );
 
   const exact = await runCheck(

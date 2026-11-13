@@ -2255,8 +2255,8 @@ Deno.test("clusterHealth refuses an unsafe node argument or configured node", as
 const RUNNER_TOKEN_ID = "swamp-ci@pve!runner-pool";
 const RUNNER_COMMENT = "managed by @dmc/proxmox ensureRunnerPoolAccess";
 const RUNNER_PRIVS = ["VM.Allocate", "VM.Audit", "VM.Clone", "VM.PowerMgmt"];
-const STORAGE_PATH = "/storage/mrrobot-nfs";
-const BRIDGE_PATH = "/sdn/zones/localnetwork/vmbr1v10";
+const STORAGE_PATH = "/storage/vm-nfs";
+const BRIDGE_PATH = "/sdn/zones/localnetwork/vmbr0";
 const TEMPLATE_PATH = "/vms/9000";
 const TEMPLATE_PRIVS = ["VM.Audit", "VM.Clone"];
 
@@ -2268,8 +2268,8 @@ function runnerArgs(input: Record<string, unknown>): Record<string, unknown> {
 /** Storage, bridge and template 9000 set. */
 function fullRunnerArgs(over: Record<string, unknown> = {}) {
   return runnerArgs({
-    storage: "mrrobot-nfs",
-    bridge: "vmbr1v10",
+    storage: "vm-nfs",
+    bridge: "vmbr0",
     templates: [9000],
     ...over,
   });
@@ -2377,7 +2377,7 @@ Deno.test("ensureRunnerPoolAccess arguments refuse unsafe or clashing values", (
 });
 
 Deno.test("bridgeAclPath adds the VLAN tag only when one is given", () => {
-  assertEquals(bridgeAclPath("localnetwork", "vmbr1v10"), BRIDGE_PATH);
+  assertEquals(bridgeAclPath("localnetwork", "vmbr0"), BRIDGE_PATH);
   assertEquals(
     bridgeAclPath("localnetwork", "vmbr0", 10),
     "/sdn/zones/localnetwork/vmbr0/10",
