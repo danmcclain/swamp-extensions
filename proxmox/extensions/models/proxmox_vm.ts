@@ -59,6 +59,13 @@ const StartArgs = z.object({
 
 const StopArgs = z.object({ vmName: VmNameArg });
 
+const ShutdownArgs = z.object({
+  vmName: VmNameArg,
+  timeoutSeconds: z.number().int().min(10).max(3600).default(300).describe(
+    "Seconds Proxmox waits for the guest to power off. When it is still running after that, the method fails; it never forces a stop (stop does that)",
+  ),
+});
+
 const DeleteArgs = z.object({ vmName: VmNameArg });
 
 const CreateArgs = z.object({
@@ -190,6 +197,18 @@ export function findVm(vms: PveVm[], vmName: string): PveVm {
   return vm;
 }
 
+/**
+ * Build the POST /qemu/{vmid}/status/shutdown form for `shutdown`. forceStop
+ * is always 0: a guest that does not power off in time stays running, and the
+ * task fails.
+ */
+export function buildShutdownParams(timeoutSeconds: number): URLSearchParams {
+  return new URLSearchParams({
+    timeout: String(timeoutSeconds),
+    forceStop: "0",
+  });
+}
+
 /** Build the POST /qemu/{vmid}/clone form for `clone`. */
 export function buildCloneParams(
   newid: number,
@@ -266,7 +285,7 @@ function runTask(g: VmGlobalArgs, auth: PveAuth, upid: unknown) {
 /** Swamp model definition for `@dmc/proxmox/vm`. */
 export const model = {
   type: "@dmc/proxmox/vm",
-  version: "2026.11.13.1",
+  version: "2026.11.14.1",
   globalArguments: ProxmoxConnectionArgs,
   upgrades: [
     {
@@ -285,6 +304,12 @@ export const model = {
       toVersion: "2026.11.13.1",
       description:
         "Additive: new methods clone (linked by default, optionally into a pool, records the clone time) and convertToTemplate. The vm resource gains optional template, source, pool, linked and durationMs fields. No argument changes",
+      upgradeAttributes: dropRemovedAuthArgs,
+    },
+    {
+      toVersion: "2026.11.14.1",
+      description:
+        "Additive: new method shutdown (a clean guest shutdown that waits until the VM is stopped and never forces a stop). No argument or resource changes",
       upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
@@ -577,6 +602,79 @@ export const model = {
           vmName,
           status: "stopped",
           ip: null,
+          success: true,
+          logs: log.text(),
+          timestamp: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    shutdown: {
+      description:
+        "Shut a VM down cleanly (ACPI, or the guest agent when the VM has it on) and wait until it is stopped; no-op when it is stopped. Fails when the guest is still running after timeoutSeconds: it never forces a stop (stop does that). Needs: VM.PowerMgmt, VM.Audit.",
+      arguments: ShutdownArgs,
+      execute: async (args: z.infer<typeof ShutdownArgs>, context: Ctx) => {
+        const { vmName, timeoutSeconds } = args;
+        const g = context.globalArgs;
+        const log = createMethodLogger(context);
+        log.info("Shutting down VM {vmName} on node {node}", {
+          vmName,
+          node: g.node,
+        });
+
+        const auth = await vmAuth(g);
+        const vm = await resolveVm(g, auth, vmName);
+        log.info("Found VM {vmName}: vmid {vmid} [{status}]", {
+          vmName,
+          vmid: vm.vmid,
+          status: vm.status,
+        });
+
+        if (vm.status !== "stopped") {
+          const upid = await pveCall(
+            g,
+            auth,
+            "POST",
+            nodePath(g, `/qemu/${vm.vmid}/status/shutdown`),
+            `Shutting down VM "${vmName}" (vmid ${vm.vmid})`,
+            buildShutdownParams(timeoutSeconds).toString(),
+          );
+          log.info("Shutdown task started; Proxmox waits up to {s}s", {
+            s: timeoutSeconds,
+          });
+          // Proxmox ends the task at its own timeout; the margin covers the polls.
+          const taskResult = await waitForTask(
+            g.apiUrl,
+            g.node,
+            upid,
+            auth,
+            tlsOptions(g),
+            timeoutSeconds + 60,
+          );
+          if (!taskResult.success) {
+            throw new Error(
+              `VM "${vmName}" (vmid ${vm.vmid}) did not shut down within ${timeoutSeconds}s: ${taskResult.exitstatus}`,
+            );
+          }
+          const after = await resolveVm(g, auth, vmName);
+          if (after.status !== "stopped") {
+            throw new Error(
+              `VM "${vmName}" (vmid ${vm.vmid}) is ${after.status} after the shutdown task`,
+            );
+          }
+          log.info("VM {vmid} is stopped ({polls} polls)", {
+            vmid: vm.vmid,
+            polls: taskResult.pollCount,
+          });
+        } else {
+          log.info("VM is already stopped", {});
+        }
+
+        const handle = await context.writeResource("vm", vmName, {
+          vmid: vm.vmid,
+          vmName,
+          status: "stopped",
           success: true,
           logs: log.text(),
           timestamp: new Date().toISOString(),

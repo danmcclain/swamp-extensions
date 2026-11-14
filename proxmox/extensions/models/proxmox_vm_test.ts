@@ -362,7 +362,7 @@ const TEMPLATE_LIST = {
 
 /** Run one vm method; errors are returned, not thrown. */
 async function runVm(
-  method: "clone" | "convertToTemplate",
+  method: "clone" | "convertToTemplate" | "shutdown",
   routes: Record<string, unknown>,
   input: Record<string, unknown>,
 ) {
@@ -538,4 +538,78 @@ Deno.test("convertToTemplate is a no-op for a template and refuses a running VM"
   assertStringIncludes(running.error.message, "is running");
   assertFalse(running.seen.some((s) => s.method !== "GET"));
   assertEquals(running.written, []);
+});
+
+const SHUTDOWN_UPID = "UPID:pve:9:qmshutdown:";
+const shutdownTask = (exitstatus: string) => ({
+  [`GET /tasks/${encodeURIComponent(SHUTDOWN_UPID)}/status`]: {
+    data: { status: "stopped", exitstatus },
+  },
+});
+const buildVm = (status: string) => ({
+  data: [{ vmid: 9100, name: "runner-template", status }],
+});
+
+Deno.test("@dmc/proxmox/vm has shutdown", () => {
+  assert("shutdown" in model.methods);
+});
+
+Deno.test("shutdown asks for a clean shutdown with no force stop, waits, and checks the VM is stopped", async () => {
+  const r = await runVm("shutdown", {
+    "GET /nodes/pve/qemu": [buildVm("running"), buildVm("stopped")],
+    "POST /nodes/pve/qemu/9100/status/shutdown": { data: SHUTDOWN_UPID },
+    ...shutdownTask("OK"),
+  }, { vmName: "runner-template", timeoutSeconds: 120 });
+  assertEquals(r.error, null);
+  assertTokenOnly(r.seen);
+  const post = r.seen.filter((s) => s.method === "POST");
+  assertEquals(post.length, 1);
+  assertEquals(Object.fromEntries(new URLSearchParams(post[0].body ?? "")), {
+    timeout: "120",
+    forceStop: "0",
+  });
+  assert(r.seen.some((s) => s.url.includes("/tasks/")));
+  const data = r.written[0].data as Record<string, unknown>;
+  assertEquals(data.vmid, 9100);
+  assertEquals(data.status, "stopped");
+  assertEquals(data.success, true);
+});
+
+Deno.test("shutdown is a no-op for a stopped VM", async () => {
+  const r = await runVm("shutdown", {
+    "GET /nodes/pve/qemu": buildVm("stopped"),
+  }, { vmName: "runner-template" });
+  assertEquals(r.error, null);
+  assertFalse(r.seen.some((s) => s.method !== "GET"));
+  assertEquals((r.written[0].data as { status: string }).status, "stopped");
+});
+
+Deno.test("shutdown fails, with no data, when the guest does not power off in time", async () => {
+  const r = await runVm("shutdown", {
+    "GET /nodes/pve/qemu": buildVm("running"),
+    "POST /nodes/pve/qemu/9100/status/shutdown": { data: SHUTDOWN_UPID },
+    ...shutdownTask("VM quit/powerdown failed"),
+  }, { vmName: "runner-template" });
+  assert(r.error);
+  assertStringIncludes(r.error.message, "did not shut down within 300s");
+  assertEquals(r.written, []);
+});
+
+Deno.test("shutdown fails when the VM still runs after a task that reports OK", async () => {
+  const r = await runVm("shutdown", {
+    "GET /nodes/pve/qemu": buildVm("running"),
+    "POST /nodes/pve/qemu/9100/status/shutdown": { data: SHUTDOWN_UPID },
+    ...shutdownTask("OK"),
+  }, { vmName: "runner-template" });
+  assert(r.error);
+  assertStringIncludes(r.error.message, "is running after the shutdown task");
+  assertEquals(r.written, []);
+});
+
+Deno.test("shutdown arguments: timeoutSeconds defaults to 300 and stays in 10..3600", () => {
+  const args = model.methods.shutdown.arguments;
+  assertEquals(args.parse({ vmName: "x" }).timeoutSeconds, 300);
+  assertFalse(args.safeParse({ vmName: "x", timeoutSeconds: 5 }).success);
+  assertFalse(args.safeParse({ vmName: "x", timeoutSeconds: 4000 }).success);
+  assertFalse(args.safeParse({ vmName: "x", timeoutSeconds: 30.5 }).success);
 });

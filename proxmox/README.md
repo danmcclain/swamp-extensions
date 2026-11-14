@@ -73,6 +73,10 @@ QEMU VM (and LXC) lifecycle: `lookup`, `start`, `stop`, `create`, `delete`,
   time from the request to the end of the clone task (polled each second).
 - `convertToTemplate` — turn a stopped VM into a template. It does nothing for a
   template, and refuses a VM that is not stopped (it never stops one).
+- `shutdown` — shut a VM down cleanly (ACPI, or the guest agent when the VM has
+  it on) and wait until it is stopped. It does nothing for a stopped VM. When
+  the guest is still running after `timeoutSeconds` (default 300), the method
+  fails: it never forces a stop. `stop` is the hard power-off.
 
 **Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, `caCert`, and auth (see
 [Authentication](#authentication) and [TLS](#tls)).
