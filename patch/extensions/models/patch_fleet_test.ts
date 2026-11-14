@@ -7678,6 +7678,45 @@ Deno.test("auditAccess: the user probe goes to sshModel without sudo; the root p
   });
 });
 
+
+Deno.test("auditAccess: userProbeVia root sends both probes to provisionSshModel and none to sshModel; the record says so and passes at failOn high", async () => {
+  const env = auditEnv(
+    sshDefinition("root", [{ name: "web1" }, { name: "web2", user: "ops" }]),
+    ["web1", "web2"].map((host) => ({ host })),
+  );
+  await withCallLog(env, async (calls) => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      access: ACCESS,
+      machines: [{ host: "web1" }, { host: "web2" }],
+    });
+    await model.methods.auditAccess.execute(
+      AUDIT_ARGS.parse({ userProbeVia: "root" }),
+      t.ctx,
+    );
+
+    // Per sudo group: the user probe as the login, then the root probe. Nothing over the key.
+    const lines = await calls();
+    assertEquals(lines.length, 4);
+    for (const l of lines) assert(l.startsWith("prov script "), l);
+    assertEquals(lines.filter((l) => l.includes("sudo:json=true")).length, 2);
+    for (const host of ["web1", "web2"]) {
+      const rec = auditOf(t, host);
+      assertEquals(rec.userProbeVia, "root");
+      assertEquals(rec.ok, true);
+      assert(
+        auditFindings(rec).includes("user-probe-via-root info"),
+        JSON.stringify(rec.findings),
+      );
+    }
+  });
+});
+
+Deno.test("auditAccess: userProbeVia defaults to ssh", () => {
+  assertEquals(AUDIT_ARGS.parse({}).userProbeVia, "ssh");
+  assertThrows(() => AUDIT_ARGS.parse({ userProbeVia: "laptop" }));
+});
+
 Deno.test("auditAccess: a managed host whose sudoers file has no grants gives only the privilege-missing warnings, ok true, and no throw", async () => {
   await withCallLog(
     auditEnv(sshDefinition("root", [{ name: "web1" }]), [{ host: "web1" }]),

@@ -146,6 +146,56 @@ printf '{"_kind":"patch-access-user-probe","user":%s,"uid":%s,"groups":[%s],"sud
 `;
 }
 
+/** Ends the user probe in the heredoc of userProbeAsLoginScript. The probe never contains it. */
+export const USER_PROBE_EOF = "SWAMP_PATCH_USER_PROBE_EOF";
+
+/**
+ * The user probe for a host the access key cannot reach from here (its from= names another
+ * source): run as root through the provisioning model, it runs the same read-only user
+ * probe as the patch login, with an empty environment and from /. The probe then sees what
+ * the login sees: its uid and groups, its sudo rules, which paths it can write, whether it
+ * reaches the docker socket. What it cannot test is sshd: whether the key logs in from its
+ * from= source. The root probe still checks the authorized_keys line itself.
+ *
+ * runuser -u runs the command with no shell. Where there is no runuser (Alpine), su runs
+ * it, with /bin/sh as the shell so that a nologin shell does not stop it. A missing account
+ * exits 3 before anything runs.
+ */
+export function userProbeAsLoginScript(user: string): string {
+  if (
+    typeof user !== "string" ||
+    !AccessProfile.shape.user.safeParse(user).success
+  ) {
+    throw new Error(
+      "the access user must be 1-32 characters of a-z, 0-9, _ or -, start with a-z or _, and not be root or toor",
+    );
+  }
+  const probe = userProbeScript();
+  if (probe.includes(USER_PROBE_EOF)) {
+    throw new Error("the user probe contains its own heredoc end marker");
+  }
+  return `#!/usr/bin/env bash
+# Run as root through the provisioning model. It runs the read-only user probe as the patch
+# login and writes nothing. The probe is fixed text: it takes no input.
+PATCH_USER=${shQuote(user)}
+if ! id -u "$PATCH_USER" >/dev/null 2>&1; then
+  echo "the account $PATCH_USER does not exist" >&2
+  exit 3
+fi
+cd / || exit 3
+probe() {
+  cat <<'${USER_PROBE_EOF}'
+${probe}${USER_PROBE_EOF}
+}
+CLEAN_ENV='exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C bash -s'
+if command -v runuser >/dev/null 2>&1; then
+  probe | runuser -u "$PATCH_USER" -- /bin/sh -c "$CLEAN_ENV"
+else
+  probe | su -s /bin/sh "$PATCH_USER" -c "$CLEAN_ENV"
+fi
+`;
+}
+
 /**
  * The root probe, run as root through the provisioning model. The user and the public key
  * are validated here and shell-quoted in the assignments at the top. The rest of the script
@@ -432,6 +482,8 @@ printf '{"_kind":"patch-access-root-probe","account":%s,"groupsOfUser":[%s],"aut
 // ---------------------------------------------------------------------------
 
 export type Severity = "critical" | "high" | "warning" | "info";
+export const USER_PROBE_VIAS = ["ssh", "root"] as const;
+export type UserProbeVia = typeof USER_PROBE_VIAS[number];
 export interface Finding {
   id: string;
   severity: Severity;
@@ -447,6 +499,12 @@ export interface AuditInput {
   /** The parsed user probe JSON, or null when the probe did not run. */
   userProbe: unknown;
   userProbeError: string | null;
+  /**
+   * How the user probe reached the host: over the access key (ssh, the default), or as the
+   * patch login through the root login (root; userProbeAsLoginScript), which does not test
+   * whether sshd accepts the key from its from= source.
+   */
+  userProbeVia?: UserProbeVia;
   /** The parsed root probe JSON, or null when the probe did not run. */
   rootProbe: unknown;
   rootProbeError: string | null;
@@ -960,6 +1018,14 @@ export async function evaluateAudit(i: AuditInput): Promise<AuditResult> {
     }
   }
 
+  // Not a pass by itself: the user probe below must still run and give its facts.
+  if (i.userProbeVia === "root") {
+    add(
+      "user-probe-via-root",
+      "info",
+      `the user probe ran as ${i.user} through the root login, not over the access key: whether sshd accepts the key from its from= source was not tested (the root probe checks the authorized_keys line)`,
+    );
+  }
   const up = readProbe(UserProbe, "user", i.userProbe, i.userProbeError, add);
   const rp = readProbe(RootProbe, "root", i.rootProbe, i.rootProbeError, add);
   const digests = await expectedDigests(

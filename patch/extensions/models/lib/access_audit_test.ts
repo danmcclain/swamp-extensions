@@ -22,6 +22,8 @@ import {
   type AuditResult,
   evaluateAudit,
   rootProbeScript,
+  USER_PROBE_EOF,
+  userProbeAsLoginScript,
   userProbeScript,
 } from "./access_audit.ts";
 import {
@@ -1725,4 +1727,79 @@ Deno.test("evaluateAudit compose: a directory the probe could not scan gives com
     }),
   }));
   expectFindings(r, "compose-unreadable:/srv/app high");
+});
+
+// ---------------------------------------------------------------------------
+// The user probe as the patch login, through the root login (userProbeVia root)
+// ---------------------------------------------------------------------------
+
+Deno.test("userProbeAsLoginScript passes bash -n", async () => {
+  await assertBashSyntax(userProbeAsLoginScript(USER));
+});
+
+Deno.test("userProbeAsLoginScript refuses a bad user", () => {
+  for (const bad of ["root", "toor", "a b", "x;rm -rf /", "", "UPPER"]) {
+    assertThrows(() => userProbeAsLoginScript(bad));
+  }
+});
+
+Deno.test("userProbeAsLoginScript carries the user probe unchanged, in a quoted heredoc that ends once", () => {
+  const script = userProbeAsLoginScript(USER);
+  assertStringIncludes(script, userProbeScript());
+  // The quoted start (<<'EOF') and the end line: nothing in the probe is expanded by root.
+  assertEquals(occurrences(script, USER_PROBE_EOF), 2);
+  assertStringIncludes(script, `<<'${USER_PROBE_EOF}'`);
+  assertStringIncludes(script, `\n${USER_PROBE_EOF}\n`);
+  assertEquals(occurrences(userProbeScript(), USER_PROBE_EOF), 0);
+});
+
+Deno.test("INJECTION: userProbeAsLoginScript takes the user only from its top assignment", () => {
+  const script = userProbeAsLoginScript(USER);
+  assertEquals(occurrences(script, USER), 1);
+  assertStringIncludes(script, `PATCH_USER='${USER}'`);
+});
+
+Deno.test("userProbeAsLoginScript drops to the login with an empty environment, through runuser or su", () => {
+  const script = userProbeAsLoginScript(USER);
+  assertStringIncludes(script, 'runuser -u "$PATCH_USER" --');
+  assertStringIncludes(script, 'su -s /bin/sh "$PATCH_USER" -c');
+  assertStringIncludes(script, "/usr/bin/env -i PATH=");
+  assertStringIncludes(script, "cd / || exit 3");
+});
+
+Deno.test("evaluateAudit: userProbeVia root on a clean host gives only the info finding user-probe-via-root", async () => {
+  const r = await evaluateAudit(input({ userProbeVia: "root" }));
+  expectFindings(r, "user-probe-via-root info");
+  assertStringIncludes(r.findings[0].message, "from= source was not tested");
+});
+
+Deno.test("evaluateAudit: userProbeVia root does not pass a user probe that did not run", async () => {
+  const r = await evaluateAudit(
+    input({
+      userProbeVia: "root",
+      userProbe: null,
+      userProbeError: "exit 3: the account does not exist",
+    }),
+  );
+  expectFindings(r, "probe-failed:user high", "user-probe-via-root info");
+});
+
+Deno.test("evaluateAudit: userProbeVia root keeps every user-probe finding", async () => {
+  const r = await evaluateAudit(
+    input({
+      userProbeVia: "root",
+      userProbe: userFacts({ dockerRc: 0, sudoTrueRc: 0 }),
+    }),
+  );
+  expectFindings(
+    r,
+    "docker-socket-access critical",
+    "privilege-unrestricted critical",
+    "user-probe-via-root info",
+  );
+});
+
+Deno.test("evaluateAudit: userProbeVia ssh adds no finding", async () => {
+  const r = await evaluateAudit(input({ userProbeVia: "ssh" }));
+  assertEquals(r.findings, []);
 });

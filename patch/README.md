@@ -385,6 +385,25 @@ compose project directory). For each node model that a machine uses (for
 snapshots or for a `proxmox-cluster` check), it also asks Proxmox for the
 token's own effective permissions (`/access/permissions`), once per model.
 
+**Auditing from where the key cannot log in.** The key's `from=` usually names
+only the machine that runs `scan` (for example a swamp serve host), so an audit
+from anywhere else cannot log in as the patch login and reports
+`probe-failed:user` (high). For such an audit, pass `userProbeVia: root`:
+
+```bash
+swamp behavior run patch-fleet auditAccess --input userProbeVia=root
+```
+
+The same read-only user probe then runs as the patch login through the
+provisioning model (`runuser -u`, or `su -s /bin/sh` where there is no
+`runuser`), with an empty environment and from `/`. It sees what the login sees
+(its uid and groups, its sudo rules, which paths it can write, whether it
+reaches the docker socket), so every check still runs. What it does not test is
+sshd: whether the key logs in from its `from=` source. The record carries
+`userProbeVia: root` and the info finding `user-probe-via-root`; the root probe
+still checks the `authorized_keys` line itself. A host without the account
+gives `probe-failed:user`, as before.
+
 **Sudo grants** are compared with what `provisionAccess` would write for that
 machine: the table entries for its policy, the docker helper, and the declared
 plug-in and privileged health-check commands. Any other line in our sudoers

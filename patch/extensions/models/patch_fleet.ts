@@ -47,9 +47,11 @@ import type { PrivCommand } from "./lib/access_sudoers.ts";
 import {
   evaluateAudit,
   rootProbeScript,
+  USER_PROBE_VIAS,
+  userProbeAsLoginScript,
   userProbeScript,
 } from "./lib/access_audit.ts";
-import type { Finding, Severity } from "./lib/access_audit.ts";
+import type { Finding, Severity, UserProbeVia } from "./lib/access_audit.ts";
 import {
   capabilitiesFor,
   effectivePolicy,
@@ -1150,6 +1152,9 @@ const AccessAudit = z.object({
   rootProbe: z.unknown().nullable(),
   userProbeError: z.string().nullable(),
   rootProbeError: z.string().nullable(),
+  userProbeVia: z.enum(USER_PROBE_VIAS).default("ssh").describe(
+    "How the user probe reached the host: ssh (over the access key) or root (as the patch login through the root login; sshd's acceptance of the key was not tested)",
+  ),
   pluginGrants: z.array(z.string()).default([]).describe(
     "The sudoers text of the commands the machine's plugged models declare (privileges), with @name@ where each path goes: part of the expected grants",
   ),
@@ -3729,8 +3734,9 @@ export function remoteClaim(raw: unknown): string[] {
 // ---------------------------------------------------------------------------
 // The swamp-patch access login. renderAccess, provisionAccess and revokeAccess reach a
 // host only through access.provisionSshModel, a root-capable login that must differ from
-// sshModel. auditAccess probes a host as the patch login through sshModel and as root
-// through provisionSshModel, and never changes it. scan, safeUpdate, reboot and the rest
+// sshModel. auditAccess probes a host as the patch login (through sshModel, or with
+// userProbeVia root through provisionSshModel) and as root through provisionSshModel, and
+// never changes it. scan, safeUpdate, reboot and the rest
 // never use provisionSshModel.
 // ---------------------------------------------------------------------------
 
@@ -4274,19 +4280,54 @@ async function runUserProbe(
   return outcomes;
 }
 
-/**
- * The root probe, through provisionSshModel. Each host's login is read from that model: a
- * login that cannot be read is not contacted, a root login runs the script as is, and any
- * other login runs it under sudo. Hosts with the same sudo flag share one script call.
- */
-async function runRootProbe(
+/** The root probe, through provisionSshModel (runProvisionProbe). */
+function runRootProbe(
   context: Ctx,
   access: AccessProfileT,
   hosts: string[],
 ): Promise<Map<string, ProbeOutcome>> {
+  return runProvisionProbe(
+    context,
+    access,
+    hosts,
+    rootProbeScript(access.user, access.publicKey),
+    "patch-access-root-probe",
+  );
+}
+
+/**
+ * The user probe as the patch login, through provisionSshModel (userProbeAsLoginScript):
+ * for hosts whose from= does not let the access key in from here. Read-only, like the
+ * probe over the key.
+ */
+function runUserProbeAsLogin(
+  context: Ctx,
+  access: AccessProfileT,
+  hosts: string[],
+): Promise<Map<string, ProbeOutcome>> {
+  return runProvisionProbe(
+    context,
+    access,
+    hosts,
+    userProbeAsLoginScript(access.user),
+    "patch-access-user-probe",
+  );
+}
+
+/**
+ * One read-only probe script through provisionSshModel. Each host's login is read from that
+ * model: a login that cannot be read is not contacted, a root login runs the script as is,
+ * and any other login runs it under sudo. Hosts with the same sudo flag share one call.
+ */
+async function runProvisionProbe(
+  context: Ctx,
+  access: AccessProfileT,
+  hosts: string[],
+  script: string,
+  kind: string,
+): Promise<Map<string, ProbeOutcome>> {
   const { provisionSshModel } = access;
   const swamp = methodSwamp(context);
-  const script = rootProbeScript(access.user, access.publicKey);
   const outcomes = new Map<string, ProbeOutcome>();
   const groups = new Map<boolean, string[]>();
   for (const host of hosts) {
@@ -4319,7 +4360,7 @@ async function runRootProbe(
         outcomes.set(
           host,
           probeOutcome(
-            "patch-access-root-probe",
+            kind,
             res.runs.find((r) => r.host === host),
           ),
         );
@@ -6919,7 +6960,7 @@ export const model = {
     },
     auditAccess: {
       description:
-        "Read-only audit of the swamp-patch access login on each selected machine. Probes each host as the patch login (through sshModel, no sudo) and as root (through access.provisionSshModel), " +
+        "Read-only audit of the swamp-patch access login on each selected machine. Probes each host as the patch login (through sshModel, no sudo; with userProbeVia root, as the patch login through access.provisionSshModel) and as root (through access.provisionSshModel), " +
         "reads the effective privileges of the API token behind each VM / CT snapshot and each proxmox-cluster health check (the node model's permissions method, once per model: api-token-extra critical, api-token-missing and api-token-unread high; " +
         "Sys.Audit on / without propagation is allowed only for a model some machine's proxmox-cluster check uses, and required on that machine), " +
         "evaluates the findings with the machine's accepted risks, and writes one accessAudit record per host. Never changes a host. After every host is written, the run fails when a host has a finding at or above failOn (none never fails).",
@@ -6930,13 +6971,21 @@ export const model = {
         failOn: FailOn.default("high").describe(
           "Fail the run when a host has a finding at or above this severity, after every host is written; none never fails (default high, so a host whose probes did not run also fails)",
         ),
+        userProbeVia: z.enum(USER_PROBE_VIAS).default("ssh").describe(
+          "How the user probe reaches each host: ssh (default) logs in with the access key through sshModel; root runs the same read-only probe as the patch login through access.provisionSshModel (runuser, or su). Use root when the audit runs from a place the key's from= does not allow (for example a laptop, when from= names the patch runner only). root records the info finding user-probe-via-root: sshd's acceptance of the key from its from= source is not tested, but every other check runs",
+        ),
       }),
       execute: async (
-        args: { hosts?: string[]; failOn?: z.infer<typeof FailOn> },
+        args: {
+          hosts?: string[];
+          failOn?: z.infer<typeof FailOn>;
+          userProbeVia?: UserProbeVia;
+        },
         context: Ctx,
       ) => {
         // An unknown state must not pass: probe-failed / probe-invalid are high.
         const failOn = args.failOn ?? "high";
+        const userProbeVia = args.userProbeVia ?? "ssh";
         const { access, targets } = accessTargets(
           context.globalArgs,
           args.hosts,
@@ -6971,7 +7020,9 @@ export const model = {
           }),
         );
         const swamp = methodSwamp(context);
-        const userProbes = await runUserProbe(sshModel, hosts, swamp);
+        const userProbes = userProbeVia === "root"
+          ? await runUserProbeAsLogin(context, access, hosts)
+          : await runUserProbe(sshModel, hosts, swamp);
         const rootProbes = await runRootProbe(context, access, hosts);
         // The API tokens each machine uses (snapshots, proxmox-cluster checks), read once
         // per node model. Sys.Audit on / is judged against the whole fleet's checks.
@@ -7006,6 +7057,7 @@ export const model = {
             docker: !!machine.docker,
             userProbe: user.probe,
             userProbeError: user.error,
+            userProbeVia,
             rootProbe: root.probe,
             rootProbeError: root.error,
             machine: {
@@ -7037,6 +7089,7 @@ export const model = {
               rootProbe: root.probe,
               userProbeError: user.error,
               rootProbeError: root.error,
+              userProbeVia,
               pluginGrants: plugins.commands.map(sudoersTemplate),
             }),
           );
