@@ -271,6 +271,19 @@ Deno.test("userProbeScript: the user is the login that runs it", async () => {
   }
 });
 
+Deno.test("userProbeScript: the groups are the login's group names, not numeric ids (GROUPS is a bash special variable)", async () => {
+  const id = await new Deno.Command("id", { args: ["-nG"] }).output();
+  const names = new TextDecoder().decode(id.stdout).trim().split(/\s+/);
+  const bin = await toolDir();
+  try {
+    const out = await runUserProbe(bin);
+    const probe = JSON.parse(out.stdout.trim());
+    assertEquals(probe.groups, names);
+  } finally {
+    await Deno.remove(bin, { recursive: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Evaluator fixtures
 // ---------------------------------------------------------------------------

@@ -120,9 +120,9 @@ ${pathAssignments()}${JSON_HELPERS}
 writable() { if test -w "$1"; then printf true; else printf false; fi; }
 
 user_name="$(id -un 2>/dev/null)"
-read -r -a GROUPS <<<"$(id -nG 2>/dev/null)"
+read -r -a LOGIN_GROUPS <<<"$(id -nG 2>/dev/null)"
 groups_json=""
-for g in "\${GROUPS[@]}"; do groups_json="\${groups_json:+$groups_json,}$(jstr "$g")"; done
+for g in "\${LOGIN_GROUPS[@]}"; do groups_json="\${groups_json:+$groups_json,}$(jstr "$g")"; done
 
 sudo_list=null
 sudo_true_rc=""
