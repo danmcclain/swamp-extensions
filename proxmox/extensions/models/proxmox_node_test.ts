@@ -1070,6 +1070,16 @@ function apiRoute(
     });
     return null;
   }
+  const roleUpdate = method === "PUT" &&
+    path.match(/^\/access\/roles\/([^/]+)$/);
+  if (roleUpdate) {
+    const role = st.roles.find((r) =>
+      r.roleid === decodeURIComponent(roleUpdate[1])
+    );
+    if (!role) throw new Error(`fake: no role ${roleUpdate[1]}`);
+    role.privs = form.get("privs") ?? "";
+    return null;
+  }
   if (method === "POST" && path === "/access/users") {
     st.users.push({
       userid: form.get("userid") ?? "",
@@ -2254,7 +2264,13 @@ Deno.test("clusterHealth refuses an unsafe node argument or configured node", as
 
 const RUNNER_TOKEN_ID = "swamp-ci@pve!runner-pool";
 const RUNNER_COMMENT = "managed by @dmc/proxmox ensureRunnerPoolAccess";
-const RUNNER_PRIVS = ["VM.Allocate", "VM.Audit", "VM.Clone", "VM.PowerMgmt"];
+const RUNNER_PRIVS = [
+  "VM.Allocate",
+  "VM.Audit",
+  "VM.Clone",
+  "VM.GuestAgent.Audit",
+  "VM.PowerMgmt",
+];
 const STORAGE_PATH = "/storage/vm-nfs";
 const BRIDGE_PATH = "/sdn/zones/localnetwork/vmbr0";
 const TEMPLATE_PATH = "/vms/9000";
@@ -2601,6 +2617,97 @@ Deno.test("ensureRunnerPoolAccess with everything in place writes nothing and re
       ],
     );
   }
+});
+
+/** A finished run from before VM.GuestAgent.Audit joined the pool role. */
+function runnerOldPoolRoleState(extra: string[] = []): FakePve {
+  const st = runnerPresentState({
+    callerAll: CALLER_PRIVS.filter((p) => p !== "Realm.AllocateUser"),
+  });
+  const pool = st.roles.find((r) => r.roleid === "SwampCiPool")!;
+  pool.privs = [
+    ...RUNNER_PRIVS.filter((p) => p !== "VM.GuestAgent.Audit"),
+    ...extra,
+  ].join(",");
+  return st;
+}
+
+Deno.test("ensureRunnerPoolAccess blocks on a pool role that is missing a privilege, and names updateRoles", async () => {
+  const r = await ensure(
+    runnerOldPoolRoleState(),
+    fullRunnerArgs({ dryRun: false }),
+    "ensureRunnerPoolAccess",
+  );
+  assert(r.error);
+  assertStringIncludes(
+    r.error.message,
+    "role SwampCiPool is missing privileges: VM.GuestAgent.Audit (updateRoles: true adds them)",
+  );
+  assertEquals(writesOf(r.seen), []);
+});
+
+Deno.test("ensureRunnerPoolAccess with updateRoles plans the role update in a dry run and writes nothing", async () => {
+  const r = await ensure(
+    runnerOldPoolRoleState(),
+    fullRunnerArgs({ dryRun: true, updateRoles: true }),
+    "ensureRunnerPoolAccess",
+  );
+  assertEquals(r.error, null);
+  assertEquals(writesOf(r.seen), []);
+  const rec = writtenData(r.written, "runnerPoolAccess");
+  assertEquals(rec.blockers, []);
+  assertEquals(
+    rec.actions.find((a: { action: string }) => a.action === "updateRole"),
+    { action: "updateRole", target: "SwampCiPool", state: "planned" },
+  );
+});
+
+Deno.test("ensureRunnerPoolAccess with updateRoles sets the pool role to exactly its set, then verifies", async () => {
+  const st = runnerOldPoolRoleState();
+  const r = await ensure(
+    st,
+    fullRunnerArgs({ dryRun: false, updateRoles: true }),
+    "ensureRunnerPoolAccess",
+  );
+  assertEquals(r.error, null);
+  const writes = writesOf(r.seen);
+  assertEquals(writes.map((w) => `${w.method} ${new URL(w.url).pathname}`), [
+    "PUT /api2/json/access/roles/SwampCiPool",
+  ]);
+  // No append flag: Proxmox replaces the role's privileges with exactly this set.
+  assertEquals(
+    new URLSearchParams(writes[0].body ?? "").get("privs"),
+    RUNNER_PRIVS.join(","),
+  );
+  assertFalse(new URLSearchParams(writes[0].body ?? "").has("append"));
+  assertEquals(
+    st.roles.find((x) => x.roleid === "SwampCiPool")!.privs,
+    RUNNER_PRIVS.join(","),
+  );
+  const rec = writtenData(r.written, "runnerPoolAccess");
+  assertEquals(rec.status, "applied");
+  assertEquals(
+    rec.actions.find((a: { action: string }) => a.action === "updateRole"),
+    { action: "updateRole", target: "SwampCiPool", state: "applied" },
+  );
+  assertEquals(
+    rec.verified.find((v: { path: string }) => v.path === "/pool/ci"),
+    { path: "/pool/ci", privileges: RUNNER_PRIVS, ok: true },
+  );
+});
+
+Deno.test("ensureRunnerPoolAccess with updateRoles still blocks on a role with extra privileges", async () => {
+  const r = await ensure(
+    runnerOldPoolRoleState(["VM.Config.Disk"]),
+    fullRunnerArgs({ dryRun: false, updateRoles: true }),
+    "ensureRunnerPoolAccess",
+  );
+  assert(r.error);
+  assertStringIncludes(
+    r.error.message,
+    "role SwampCiPool has extra privileges: VM.Config.Disk",
+  );
+  assertEquals(writesOf(r.seen), []);
 });
 
 Deno.test("ensureRunnerPoolAccess needs Permissions.Modify on the storage and bridge paths", async () => {

@@ -535,11 +535,14 @@ of a template) needs a token that can make and delete VMs, but only its own.
 makes one. With the default arguments (`user`, `tokenName`, `pool`, `role`,
 `storageRole` and `netRole` change the names) it makes:
 
-- role `SwampCiPool` with exactly `VM.Allocate`, `VM.Audit`, `VM.Clone` and
-  `VM.PowerMgmt`, granted on `/pool/ci`. Proxmox lets a token that holds
-  `VM.Allocate` on a pool create a VM in that pool (a clone with `pool: ci`),
-  and pool grants reach every guest in the pool, so the token can clone, start,
-  stop and delete the pool's guests, and no other guest;
+- role `SwampCiPool` with exactly `VM.Allocate`, `VM.Audit`, `VM.Clone`,
+  `VM.GuestAgent.Audit` and `VM.PowerMgmt`, granted on `/pool/ci`.
+  `VM.GuestAgent.Audit` lets the token read a clone's address from its guest
+  agent (`start` waits for it); it gives no guest agent commands or file access.
+  Proxmox lets a token that holds `VM.Allocate` on a pool create a VM in that
+  pool (a clone with `pool: ci`), and pool grants reach every guest in the pool,
+  so the token can clone, start, stop and delete the pool's guests, and no other
+  guest;
 - with `templates`, role `SwampCiTemplate` with exactly `VM.Audit` and
   `VM.Clone` on each `/vms/{template}`. The templates must be templates and must
   stay out of the pool, so the token can clone them but cannot delete, change or
@@ -558,6 +561,15 @@ privilege. The checks, the dry run and the token secret work as for
 `ensureSnapshotAccess` (vault key `runner-pool-token`). Clones in the pool are
 reported as `extraMembers` and never removed. A run that adds `storage`,
 `bridge` or a template later adds only those grants.
+
+An existing role must hold exactly its set. A role with extra privileges always
+blocks the run. A role that is missing privileges blocks it too, unless the run
+sets `updateRoles: true`: then the run sets the role to exactly its set (a dry
+run shows `updateRole` as planned).
+
+**Upgrading to 2026.11.14.3:** the pool role adds `VM.GuestAgent.Audit`. A pool
+role made by an earlier release blocks the run with "role SwampCiPool is missing
+privileges: VM.GuestAgent.Audit". Re-run once with `updateRoles: true`.
 
 ```bash
 # Plan (dry run), then apply

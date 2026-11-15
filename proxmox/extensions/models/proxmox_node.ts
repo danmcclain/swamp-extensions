@@ -106,11 +106,13 @@ const ACCESS_ACTIONS = [
 ] as const;
 
 /** Privileges of the runner-pool role on `/pool/{pool}`: make (clone into the pool), clone,
- *  read, power and delete the pool's guests. No VM.Config.*, no snapshot, no console. */
+ *  read, power and delete the pool's guests, and read a clone's address from its guest agent.
+ *  No VM.Config.*, no snapshot, no console, no guest agent commands or file access. */
 const RUNNER_POOL_PRIVILEGES = [
   "VM.Allocate",
   "VM.Audit",
   "VM.Clone",
+  "VM.GuestAgent.Audit",
   "VM.PowerMgmt",
 ];
 
@@ -140,6 +142,7 @@ const SDN_ZONE_RE = /^[A-Za-z][A-Za-z0-9]{0,31}$/;
 /** Actions `ensureRunnerPoolAccess` records. Each grant adds a createRole, aclUser and aclToken. */
 const RUNNER_ACCESS_ACTIONS = [
   "createRole",
+  "updateRole",
   "createUser",
   "createPool",
   "addMembers",
@@ -353,6 +356,9 @@ const EnsureRunnerPoolAccessArgs = z.object({
       RUNNER_TEMPLATE_PRIVILEGES.join(", ")
     }`,
   ),
+  updateRoles: z.boolean().default(false).describe(
+    "Add the missing privileges to an existing role of this method (for example, after a release adds one to the pool role). A role with extra privileges still blocks the run. Default false: a role that is missing privileges blocks the run",
+  ),
 })
   .refine(
     (a) => a.vlan === undefined || a.bridge !== undefined,
@@ -502,6 +508,7 @@ function snapshotAccessSpec(args: EnsureArgs): AccessSpec {
     members: [...args.members].sort((a, b) => a - b),
     grants,
     templates: [],
+    updateRoles: false,
   };
 }
 
@@ -562,6 +569,7 @@ function runnerPoolAccessSpec(args: RunnerPoolArgs): AccessSpec {
     members: [],
     grants,
     templates,
+    updateRoles: args.updateRoles,
   };
 }
 
@@ -923,6 +931,8 @@ interface AccessSpec {
   grants: AccessGrant[];
   /** Guests that must exist, be templates and stay out of `pool` (each has its own grant). */
   templates: number[];
+  /** Add missing privileges to an existing role instead of blocking; extra ones still block. */
+  updateRoles: boolean;
 }
 
 /** One planned or present action, with what it needs to run. */
@@ -930,6 +940,7 @@ interface AccessStep {
   record: AccessAction;
   kind:
     | "role"
+    | "roleUpdate"
     | "user"
     | "pool"
     | "members"
@@ -1043,9 +1054,13 @@ function planAccess(
     if (extra.length > 0) {
       blockers.push(`role ${name} has extra privileges: ${extra.join(", ")}`);
     }
-    if (missing.length > 0) {
+    if (missing.length > 0 && !(spec.updateRoles && extra.length === 0)) {
       blockers.push(
-        `role ${name} is missing privileges: ${missing.join(", ")}`,
+        `role ${name} is missing privileges: ${missing.join(", ")}${
+          extra.length === 0 && spec.method === "ensureRunnerPoolAccess"
+            ? " (updateRoles: true adds them)"
+            : ""
+        }`,
       );
     }
     return info;
@@ -1135,10 +1150,16 @@ function planAccess(
     grant,
   });
 
+  const roleStep = (grant: AccessGrant, info: RoleInfo | undefined) => {
+    if (!info) return step("role", grant.names.role, grant.role, false, grant);
+    // Only reached with updateRoles and no extra privileges (else a blocker above).
+    if (!isExactSet(info.privs, grant.privileges)) {
+      return step("roleUpdate", "updateRole", grant.role, false, grant);
+    }
+    return step("role", grant.names.role, grant.role, true, grant);
+  };
   const steps: AccessStep[] = [
-    ...roleGrants.map((grant, i) =>
-      step("role", grant.names.role, grant.role, !!roleInfos[i], grant)
-    ),
+    ...roleGrants.map((grant, i) => roleStep(grant, roleInfos[i])),
     step("user", "createUser", user, !!userInfo),
     step("pool", "createPool", pool, state.pools.includes(pool)),
     step("members", "addMembers", toAdd.join(","), toAdd.length === 0),
@@ -1334,7 +1355,12 @@ async function ensureAccess(
   };
   await failIfBlocked();
 
+  // A grant whose role gets missing privileges added (updateRoles) cannot be
+  // checked until the live run has updated the role.
+  const roleUpdatePlanned = (grant: AccessGrant) =>
+    steps.some((s) => s.kind === "roleUpdate" && s.grant?.role === grant.role);
   const tokenAclPresent = (grant: AccessGrant) =>
+    !roleUpdatePlanned(grant) &&
     steps.some((s) =>
       s.kind === "tokenAcl" && s.grant === grant &&
       s.record.state === "present"
@@ -1463,6 +1489,17 @@ async function ensureAccess(
             roleid: s.grant!.role,
             privs: s.grant!.privileges.join(","),
           }),
+        );
+        return;
+      case "roleUpdate":
+        // Without append, PUT replaces the role's privileges with exactly this set.
+        await pveCall(
+          g,
+          auth,
+          "PUT",
+          `${api}/access/roles/${encodeURIComponent(s.grant!.role)}`,
+          `Adding the missing privileges to role ${s.grant!.role}`,
+          formBody({ privs: s.grant!.privileges.join(",") }),
         );
         return;
       case "user":
@@ -2039,7 +2076,7 @@ const CT_SNAPSHOTS = snapshotMethods("lxc");
 /** Swamp model definition for `@dmc/proxmox/node`. */
 export const model = {
   type: "@dmc/proxmox/node",
-  version: "2026.11.13.1",
+  version: "2026.11.14.3",
   globalArguments: ProxmoxConnectionArgs,
   upgrades: [
     {
@@ -2058,6 +2095,12 @@ export const model = {
       toVersion: "2026.11.13.1",
       description:
         "Additive: new method ensureRunnerPoolAccess (a least-privilege token that may clone its templates, clone only into one CI pool, and power and delete only that pool's guests) with the runnerPoolAccess and runnerPoolToken resources. No argument changes",
+      upgradeAttributes: dropRemovedAuthArgs,
+    },
+    {
+      toVersion: "2026.11.14.3",
+      description:
+        "ensureRunnerPoolAccess: the pool role adds VM.GuestAgent.Audit (read a clone's address from its guest agent). An existing pool role without it blocks the run until it is re-run with the new updateRoles: true, which adds missing privileges; extra privileges still block",
       upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
