@@ -191,6 +191,9 @@ Deno.test("createFromImage sends the defaults when no hardware inputs are given"
   assertEquals(create.get("ostype"), "l26");
   assertEquals(create.get("agent"), "1");
   assertEquals(create.get("serial0"), "socket");
+  assertEquals(create.get("bios"), "seabios");
+  assertEquals(create.has("efidisk0"), false);
+  assertEquals(create.has("machine"), false);
   assertEquals(
     create.get("virtio0"),
     "nfs:0,import-from=nfs:import/rocky10.qcow2,iothread=1,discard=on",
@@ -226,6 +229,33 @@ Deno.test("createFromImage passes explicit hardware inputs through", async () =>
   assertEquals(
     create.get("virtio0"),
     "nfs:0,import-from=nfs:import/rocky10.qcow2,cache=writeback",
+  );
+});
+
+Deno.test("createFromImage with bios ovmf adds an EFI vars disk on diskStorage, without Secure Boot keys", async () => {
+  const { calls } = await runCreate({ bios: "ovmf", machine: "q35" }, [
+    ...createOk,
+    cloudInitOk,
+  ]);
+
+  const create = formBody(calls[0]);
+  assertEquals(create.get("bios"), "ovmf");
+  assertEquals(create.get("efidisk0"), "nfs:1,efitype=4m,pre-enrolled-keys=0");
+  assertEquals(create.get("machine"), "q35");
+});
+
+Deno.test("createFromImage rejects an unknown bios and a malformed machine", () => {
+  assertEquals(
+    createFromImage.arguments.safeParse({ ...baseCreateArgs, bios: "uefi" })
+      .success,
+    false,
+  );
+  assertEquals(
+    createFromImage.arguments.safeParse({
+      ...baseCreateArgs,
+      machine: "q35,smm=off",
+    }).success,
+    false,
   );
 });
 

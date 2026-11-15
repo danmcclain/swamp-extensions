@@ -257,6 +257,8 @@ are methods of `@dmc/proxmox/vm`.
   | `serialConsole` | `true`                  | adds `serial0: socket`; cloud images log boot output there                                                                                |
   | `diskOptions`   | `iothread=1,discard=on` | extra options for `virtio0`                                                                                                               |
   | `diskSize`      | the image's size        | GiB. `import-from` copies the image at its own size; when set, the disk grows to this size before the first boot. Cannot shrink.          |
+  | `bios`          | `seabios`               | `ovmf` boots with UEFI and adds `efidisk0` (4m, no Secure Boot keys) on `diskStorage`. The image needs an EFI system partition.           |
+  | `machine`       | Proxmox's (`i440fx`)    | QEMU machine type, e.g. `q35`                                                                                                             |
   | `networkBridge` | `vmbr0`                 |                                                                                                                                           |
   | `ipConfig`      | `ip=dhcp`               |                                                                                                                                           |
 
@@ -539,9 +541,9 @@ makes one. With the default arguments (`user`, `tokenName`, `pool`, `role`,
   and pool grants reach every guest in the pool, so the token can clone, start,
   stop and delete the pool's guests, and no other guest;
 - with `templates`, role `SwampCiTemplate` with exactly `VM.Audit` and
-  `VM.Clone` on each `/vms/{template}`. The templates must be templates and
-  must stay out of the pool, so the token can clone them but cannot delete,
-  change or start them. A template in the pool blocks the run;
+  `VM.Clone` on each `/vms/{template}`. The templates must be templates and must
+  stay out of the pool, so the token can clone them but cannot delete, change or
+  start them. A template in the pool blocks the run;
 - with `storage`, role `SwampCiStorage` with exactly `Datastore.AllocateSpace`
   on `/storage/{storage}`, for the clone disks;
 - with `bridge`, role `SwampCiNet` with exactly `SDN.Use` on

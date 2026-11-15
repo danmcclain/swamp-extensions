@@ -609,6 +609,13 @@ export const vmExtraMethods = {
       diskSize: z.number().int().positive().optional().describe(
         "Grow the imported disk to this size in GiB before first boot (default: keep the image's size). Must not be smaller than the image.",
       ),
+      bios: z.enum(["seabios", "ovmf"]).default("seabios").describe(
+        "Firmware. ovmf boots with UEFI and adds an EFI vars disk (efidisk0, 4m, no Secure Boot keys enrolled) on diskStorage; the image must have an EFI system partition.",
+      ),
+      machine: z.string().regex(/^[a-z0-9][a-z0-9._+-]*$/).optional()
+        .describe(
+          "QEMU machine type, e.g. q35 (default: Proxmox's default, i440fx)",
+        ),
     }),
     execute: async (args, context) => {
       const { apiUrl, node } = context.globalArgs;
@@ -630,6 +637,8 @@ export const vmExtraMethods = {
         serialConsole,
         diskOptions,
         diskSize,
+        bios,
+        machine,
       } = args;
       context.logger.info(
         "Creating VM {vmName} on {node} from image {importFrom}",
@@ -678,8 +687,16 @@ export const vmExtraMethods = {
           .filter(Boolean).join(","),
         net0: `virtio,bridge=${networkBridge}`,
         boot: "order=virtio0",
+        bios,
       });
       if (serialConsole) createParams.set("serial0", "socket");
+      if (bios === "ovmf") {
+        createParams.set(
+          "efidisk0",
+          `${diskStorage}:1,efitype=4m,pre-enrolled-keys=0`,
+        );
+      }
+      if (machine) createParams.set("machine", machine);
 
       const createResp = await fetchWithCurl(
         `${apiUrl}/api2/json/nodes/${node}/qemu`,

@@ -285,7 +285,7 @@ function runTask(g: VmGlobalArgs, auth: PveAuth, upid: unknown) {
 /** Swamp model definition for `@dmc/proxmox/vm`. */
 export const model = {
   type: "@dmc/proxmox/vm",
-  version: "2026.11.14.1",
+  version: "2026.11.14.2",
   globalArguments: ProxmoxConnectionArgs,
   upgrades: [
     {
@@ -310,6 +310,12 @@ export const model = {
       toVersion: "2026.11.14.1",
       description:
         "Additive: new method shutdown (a clean guest shutdown that waits until the VM is stopped and never forces a stop). No argument or resource changes",
+      upgradeAttributes: dropRemovedAuthArgs,
+    },
+    {
+      toVersion: "2026.11.14.2",
+      description:
+        "Additive: createFromImage takes bios (seabios default, or ovmf for UEFI with an EFI vars disk) and machine (e.g. q35). Existing calls send the same VM config as before, plus an explicit bios=seabios",
       upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
