@@ -2265,6 +2265,7 @@ Deno.test("clusterHealth refuses an unsafe node argument or configured node", as
 const RUNNER_TOKEN_ID = "swamp-ci@pve!runner-pool";
 const RUNNER_COMMENT = "managed by @dmc/proxmox ensureRunnerPoolAccess";
 const RUNNER_PRIVS = [
+  "Pool.Audit",
   "VM.Allocate",
   "VM.Audit",
   "VM.Clone",

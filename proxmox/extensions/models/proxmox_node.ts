@@ -106,9 +106,11 @@ const ACCESS_ACTIONS = [
 ] as const;
 
 /** Privileges of the runner-pool role on `/pool/{pool}`: make (clone into the pool), clone,
- *  read, power and delete the pool's guests, and read a clone's address from its guest agent.
- *  No VM.Config.*, no snapshot, no console, no guest agent commands or file access. */
+ *  read, power and delete the pool's guests, read a clone's address from its guest agent, and
+ *  read the pool's membership (without Pool.Audit, `/cluster/resources` leaves out each guest's
+ *  pool). No VM.Config.*, no snapshot, no console, no guest agent commands or file access. */
 const RUNNER_POOL_PRIVILEGES = [
+  "Pool.Audit",
   "VM.Allocate",
   "VM.Audit",
   "VM.Clone",
@@ -2076,7 +2078,7 @@ const CT_SNAPSHOTS = snapshotMethods("lxc");
 /** Swamp model definition for `@dmc/proxmox/node`. */
 export const model = {
   type: "@dmc/proxmox/node",
-  version: "2026.11.14.3",
+  version: "2026.11.15.1",
   globalArguments: ProxmoxConnectionArgs,
   upgrades: [
     {
@@ -2101,6 +2103,12 @@ export const model = {
       toVersion: "2026.11.14.3",
       description:
         "ensureRunnerPoolAccess: the pool role adds VM.GuestAgent.Audit (read a clone's address from its guest agent). An existing pool role without it blocks the run until it is re-run with the new updateRoles: true, which adds missing privileges; extra privileges still block",
+      upgradeAttributes: dropRemovedAuthArgs,
+    },
+    {
+      toVersion: "2026.11.15.1",
+      description:
+        "ensureRunnerPoolAccess: the pool role adds Pool.Audit (read the pool's membership; without it /cluster/resources leaves out each guest's pool). An existing pool role without it blocks the run until it is re-run with updateRoles: true",
       upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
