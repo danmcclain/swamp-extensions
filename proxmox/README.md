@@ -45,10 +45,10 @@ this type.
 - `ensureSnapshotAccess` — make a least-privilege API token for snapshots and,
   optionally, cluster health. See
   [A limited token for snapshots and health](#a-limited-token-for-snapshots-and-health).
-- `ensureRunnerPoolAccess` — make a least-privilege API token for a CI runner
-  pool: it may clone the templates it is given, clone only into one pool, and
-  power and delete only the guests in that pool. See
-  [A limited token for a CI runner pool](#a-limited-token-for-a-ci-runner-pool).
+- `ensureTokenAccess` — make a least-privilege API token from a policy that the
+  definition gives: a pool role, other grants and template grants, each with
+  exact privileges. See
+  [A limited token from your own policy](#a-limited-token-from-your-own-policy).
 
 **Global arguments:** `apiUrl`, `node`, `skipTlsVerify`, `caCert`, and auth (see
 [Authentication](#authentication) and [TLS](#tls)).
@@ -527,66 +527,85 @@ Point a second `@dmc/proxmox/node` model at that token
 (`tokenId: swamp-patch@pve!patch`), and use it as the `nodeModel` of a
 community-script, or as a `@dmc/patch` snapshot or health-check model.
 
-### A limited token for a CI runner pool
+### A limited token from your own policy
 
-A runner pool (for example, ephemeral Forgejo Actions runners as linked clones
-of a template) needs a token that can make and delete VMs, but only its own.
-`ensureRunnerPoolAccess` on a `@dmc/proxmox/node` model with an admin token
-makes one. With the default arguments (`user`, `tokenName`, `pool`, `role`,
-`storageRole` and `netRole` change the names) it makes:
+`ensureTokenAccess` on a `@dmc/proxmox/node` model with an admin token makes a
+user, a privilege-separated API token and a pool, and grants the token only what
+the policy says. The extension has no default policy: the definition gives the
+user, the token, the roles and their exact privileges.
 
-- role `SwampCiPool` with exactly `Pool.Audit`, `VM.Allocate`, `VM.Audit`,
-  `VM.Clone`, `VM.GuestAgent.Audit` and `VM.PowerMgmt`, granted on `/pool/ci`.
-  `VM.GuestAgent.Audit` lets the token read a clone's address from its guest
-  agent (`start` waits for it); it gives no guest agent commands or file access.
-  `Pool.Audit` lets the token read the pool's membership: without it
-  `/cluster/resources` leaves out each guest's `pool`, so the token cannot tell
-  its clones from other guests.
-  Proxmox lets a token that holds `VM.Allocate` on a pool create a VM in that
-  pool (a clone with `pool: ci`), and pool grants reach every guest in the pool,
-  so the token can clone, start, stop and delete the pool's guests, and no other
-  guest;
-- with `templates`, role `SwampCiTemplate` with exactly `VM.Audit` and
-  `VM.Clone` on each `/vms/{template}`. The templates must be templates and must
-  stay out of the pool, so the token can clone them but cannot delete, change or
-  start them. A template in the pool blocks the run;
-- with `storage`, role `SwampCiStorage` with exactly `Datastore.AllocateSpace`
-  on `/storage/{storage}`, for the clone disks;
-- with `bridge`, role `SwampCiNet` with exactly `SDN.Use` on
-  `/sdn/zones/{sdnZone}/{bridge}` (`sdnZone` defaults to `localnetwork`, the
-  plain Linux bridges; `vlan` adds the tag to the path for a VLAN-aware bridge);
-- user `swamp-ci@pve`, pool `ci` (empty: each clone joins it when it is made),
-  and a privilege-separated token `runner-pool`.
+- `pool`: `{ name, role, privileges }`. The role is granted on `/pool/{name}`.
+  Pool grants reach every guest in the pool, so these privileges hold on each
+  pool guest. With `VM.Allocate` on the pool, Proxmox lets the token create a
+  guest in that pool (for example a linked clone with `pool` set).
+- `members`: guests to put in the pool. A guest in another pool blocks the run;
+  guests are never moved between pools.
+- `grants`: `[{ path, role, privileges }]`, each its own role on one path, for
+  example `Datastore.AllocateSpace` on `/storage/{storage}`, or `SDN.Use` on
+  `/sdn/zones/{zone}/{bridge}` (add `/{vlan}` for one tag of a VLAN-aware
+  bridge).
+- `templates`: `{ vmids, role, privileges }`, the role on each `/vms/{vmid}`.
+  Each must exist, be a template and stay out of the pool, so the pool role
+  never reaches it. A template in the pool blocks the run.
+- `name`: names the data: the run record `{name}-access` and the one-time token
+  secret `{name}-token` (a sensitive output, in the vault, never in data).
 
 Each grant goes to the user and the token with propagate 0, so the token holds
-nothing on any other path. The role has no `VM.Config.*`, snapshot or console
-privilege. The checks, the dry run and the token secret work as for
-`ensureSnapshotAccess` (vault key `runner-pool-token`). Clones in the pool are
-reported as `extraMembers` and never removed. A run that adds `storage`,
-`bridge` or a template later adds only those grants.
+nothing on any other path. Each role must hold exactly its privileges, and the
+pool, each grant and the templates each have their own role. The arguments
+refuse privileges that change access or reach a node's shell:
+`Permissions.Modify`, `User.Modify`, `Group.Allocate`, `Realm.Allocate`,
+`Realm.AllocateUser`, `Sys.Modify` and `Sys.Console`. The checks, the dry run
+and the token secret work as for `ensureSnapshotAccess`. Guests in the pool that
+were not requested are reported as `extraMembers` and never removed. A run that
+adds a grant or a template later adds only those grants.
 
 An existing role must hold exactly its set. A role with extra privileges always
 blocks the run. A role that is missing privileges blocks it too, unless the run
 sets `updateRoles: true`: then the run sets the role to exactly its set (a dry
 run shows `updateRole` as planned).
 
-**Upgrading to 2026.11.14.3:** the pool role adds `VM.GuestAgent.Audit`. A pool
-role made by an earlier release blocks the run with "role SwampCiPool is missing
-privileges: VM.GuestAgent.Audit". Re-run once with `updateRoles: true`.
+Put the policy in the definition, so each run uses the same one, and give only
+what changes in the step or on the command line:
 
-**Upgrading to 2026.11.15.1:** the pool role adds `Pool.Audit`. A pool role made
-by an earlier release blocks the run with "role SwampCiPool is missing
-privileges: Pool.Audit". Re-run once with `updateRoles: true`.
+```yaml
+# proxmox-admin.yaml (type @dmc/proxmox/node, an admin token)
+methods:
+  ensureTokenAccess:
+    arguments:
+      name: clones
+      user: clones@pve
+      tokenName: clones
+      pool:
+        name: clones
+        role: ClonesPool
+        privileges: [Pool.Audit, VM.Allocate, VM.Audit, VM.Clone, VM.PowerMgmt]
+      grants:
+        - path: /storage/vm-nfs
+          role: ClonesStorage
+          privileges: [Datastore.AllocateSpace]
+      templates:
+        vmids: [9000]
+        role: ClonesTemplate
+        privileges: [VM.Audit, VM.Clone]
+```
 
 ```bash
 # Plan (dry run), then apply
-swamp model method run proxmox-admin ensureRunnerPoolAccess \
-  --input storage=vm-nfs --input bridge=vmbr0 \
-  --input 'templates:json=[9000]'
-swamp model method run proxmox-admin ensureRunnerPoolAccess \
-  --input storage=vm-nfs --input bridge=vmbr0 \
-  --input 'templates:json=[9000]' --input dryRun=false
+swamp model method run proxmox-admin ensureTokenAccess
+swamp model method run proxmox-admin ensureTokenAccess --input dryRun=false
 ```
+
+## Upgrading to 2026.11.18.1
+
+`ensureRunnerPoolAccess` and its `runnerPoolAccess` and `runnerPoolToken`
+resources are removed: the extension holds no runner-pool policy.
+`ensureTokenAccess` makes the same kind of token from a policy that you give. To
+keep a token that `ensureRunnerPoolAccess` made, give it the same user, token,
+pool, roles and privileges, and `name: runner-pool`, so the data names stay
+`runner-pool-access` and `runner-pool-token`. The `permissions` method shows the
+token's privileges on each path. A dry run must then report `unchanged`.
+Existing data is kept.
 
 ## Upgrading to 2026.11.07.1
 

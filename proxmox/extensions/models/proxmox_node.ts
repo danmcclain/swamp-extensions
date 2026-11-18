@@ -4,7 +4,7 @@
  * (snapshot / rollback / list / delete, on the node each guest runs on now),
  * effective-privilege checks
  * (permissions), the least-privilege snapshot token (ensureSnapshotAccess), and
- * the least-privilege CI runner-pool token (ensureRunnerPoolAccess).
+ * least-privilege API tokens from a policy the definition gives (ensureTokenAccess).
  *
  * Replaces `@keeb/proxmox/node` plus the ai-infra `proxmox_node_guests.ts`
  * extension. The method names and argument/output shapes of the guest methods
@@ -105,44 +105,27 @@ const ACCESS_ACTIONS = [
   "aclTokenAudit",
 ] as const;
 
-/** Privileges of the runner-pool role on `/pool/{pool}`: make (clone into the pool), clone,
- *  read, power and delete the pool's guests, read a clone's address from its guest agent, and
- *  read the pool's membership (without Pool.Audit, `/cluster/resources` leaves out each guest's
- *  pool). No VM.Config.*, no snapshot, no console, no guest agent commands or file access. */
-const RUNNER_POOL_PRIVILEGES = [
-  "Pool.Audit",
-  "VM.Allocate",
-  "VM.Audit",
-  "VM.Clone",
-  "VM.GuestAgent.Audit",
-  "VM.PowerMgmt",
+/** Privileges `ensureTokenAccess` never grants: each lets the token change who holds which
+ *  rights (ACLs, users, groups, realms), or reach a node's shell or system configuration. A
+ *  token with one of them is not least-privilege, whatever else it holds. */
+const DENIED_TOKEN_PRIVILEGES = [
+  "Group.Allocate",
+  "Permissions.Modify",
+  "Realm.Allocate",
+  "Realm.AllocateUser",
+  "Sys.Console",
+  "Sys.Modify",
+  "User.Modify",
 ];
 
-/** Privileges of the runner template role on each `/vms/{template}`: read and clone it, but
- *  not delete, change or power it. The templates stay out of the pool for this reason. */
-const RUNNER_TEMPLATE_PRIVILEGES = ["VM.Audit", "VM.Clone"];
+/** Comment stamped on each object `ensureTokenAccess` creates. */
+const TOKEN_ACCESS_COMMENT = "managed by @dmc/proxmox ensureTokenAccess";
 
-/** Privileges of the runner storage role on `/storage/{storage}`: room for clone disks. */
-const RUNNER_STORAGE_PRIVILEGES = ["Datastore.AllocateSpace"];
+/** The `name` of an `ensureTokenAccess` run: its data is `{name}-access` and `{name}-token`. */
+const ACCESS_NAME_RE = /^[a-z][a-z0-9-]{0,47}$/;
 
-/** Privileges of the runner network role on the bridge's `/sdn/zones/...` path. */
-const RUNNER_NET_PRIVILEGES = ["SDN.Use"];
-
-/** Comment stamped on each object `ensureRunnerPoolAccess` creates. */
-const RUNNER_POOL_ACCESS_COMMENT =
-  "managed by @dmc/proxmox ensureRunnerPoolAccess";
-
-/** Proxmox storage id. */
-const STORAGE_ID_RE = /^[A-Za-z][A-Za-z0-9._-]{0,98}[A-Za-z0-9]$/;
-
-/** Linux bridge or SDN VNet name (an interface name, max 15 chars). */
-const BRIDGE_NAME_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,14}$/;
-
-/** SDN zone id; `localnetwork` holds the plain Linux bridges. */
-const SDN_ZONE_RE = /^[A-Za-z][A-Za-z0-9]{0,31}$/;
-
-/** Actions `ensureRunnerPoolAccess` records. Each grant adds a createRole, aclUser and aclToken. */
-const RUNNER_ACCESS_ACTIONS = [
+/** Actions `ensureTokenAccess` records. Each grant adds a createRole, aclUser and aclToken. */
+const TOKEN_ACCESS_ACTIONS = [
   "createRole",
   "updateRole",
   "createUser",
@@ -227,7 +210,7 @@ const UseridArg = z.string().regex(
 ).describe("User or token to read (default: the caller)");
 
 /** A custom role name: never a built-in (PVE*, Administrator, NoAccess). */
-function roleArg(defaultName: string, description: string) {
+function customRoleArg() {
   return z.string()
     .regex(
       ROLE_NAME_RE,
@@ -236,10 +219,44 @@ function roleArg(defaultName: string, description: string) {
     .refine(
       (r) => !/^pve/i.test(r) && !RESERVED_ROLE_NAMES.includes(r.toLowerCase()),
       "role must not start with PVE and must not be Administrator or NoAccess",
-    )
-    .default(defaultName)
-    .describe(description);
+    );
 }
+
+/** A custom role name with a default. */
+function roleArg(defaultName: string, description: string) {
+  return customRoleArg().default(defaultName).describe(description);
+}
+
+/** The exact privileges of one custom role: Proxmox privilege names, none repeated, none that
+ *  changes access or reaches a node's shell (DENIED_TOKEN_PRIVILEGES). */
+const PrivilegesArg = z.array(
+  z.string().regex(
+    PRIVILEGE_NAME_RE,
+    "privilege must be a Proxmox privilege name such as VM.Audit",
+  ),
+)
+  .min(1, "privileges must not be empty")
+  .refine(
+    (ps) => new Set(ps).size === ps.length,
+    "privileges must not repeat",
+  )
+  .refine(
+    (ps) => !ps.some((p) => DENIED_TOKEN_PRIVILEGES.includes(p)),
+    `privileges must not include ${
+      DENIED_TOKEN_PRIVILEGES.join(", ")
+    } (they change access or reach a node's shell)`,
+  );
+
+/** An ACL path to grant on. */
+const AclPathArg = z.string()
+  .regex(
+    ACL_PATH_RE,
+    "path must be an ACL path such as /storage/local (letters, digits, . _ - and /)",
+  )
+  .refine(
+    (p) => !p.includes("..") && !p.includes("//"),
+    "path must not contain .. or //",
+  );
 
 const EnsureSnapshotAccessArgs = z.object({
   dryRun: z.boolean().default(true).describe(
@@ -288,102 +305,112 @@ const EnsureSnapshotAccessArgs = z.object({
 
 type EnsureArgs = z.infer<typeof EnsureSnapshotAccessArgs>;
 
-const EnsureRunnerPoolAccessArgs = z.object({
+const EnsureTokenAccessArgs = z.object({
   dryRun: z.boolean().default(true).describe(
     "Plan and check only; write nothing (default true)",
   ),
+  name: z.string()
+    .regex(
+      ACCESS_NAME_RE,
+      "name must start with a lower-case letter and use only a-z, 0-9 or - (max 48)",
+    )
+    .describe(
+      "Names this token's data: the record {name}-access and the one-time secret {name}-token",
+    ),
   user: z.string()
     .regex(PVE_USER_RE, "user must be name@pve (only the pve realm)")
-    .default("swamp-ci@pve")
-    .describe("Proxmox user that owns the runner-pool token"),
+    .describe("Proxmox user that owns the token"),
   tokenName: z.string()
     .regex(
       TOKEN_NAME_RE,
       "tokenName must start with a letter and use only letters, digits, . _ or - (2 to 64 chars)",
     )
-    .default("runner-pool")
     .describe("API token name under that user"),
-  pool: z.string()
-    .regex(
-      POOL_NAME_RE,
-      "pool must be one name (letters, digits, _ or -, max 40; no /)",
-    )
-    .default("ci")
-    .describe(
-      "Pool whose guests the token may clone, power and delete, and the only pool it may clone into",
+  pool: z.object({
+    name: z.string()
+      .regex(
+        POOL_NAME_RE,
+        "pool name must be one name (letters, digits, _ or -, max 40; no /)",
+      )
+      .describe("The pool"),
+    role: customRoleArg().describe("Custom role on /pool/{name}"),
+    privileges: PrivilegesArg.describe(
+      "Exact privileges of the pool role; they hold on each guest in the pool",
     ),
-  role: roleArg(
-    "SwampCiPool",
-    `Custom role on /pool/{pool}: exactly ${RUNNER_POOL_PRIVILEGES.join(", ")}`,
+  }).describe(
+    "The pool grant: role on /pool/{name}, to the user and the token",
   ),
-  storage: z.string()
-    .regex(STORAGE_ID_RE, "storage must be a Proxmox storage id")
-    .optional()
-    .describe(
-      "Storage that holds the clone disks: the token gets Datastore.AllocateSpace on /storage/{storage}. Omit to grant no storage right",
-    ),
-  storageRole: roleArg(
-    "SwampCiStorage",
-    "Custom role on /storage/{storage}: exactly Datastore.AllocateSpace",
-  ),
-  bridge: z.string()
-    .regex(BRIDGE_NAME_RE, "bridge must be an interface name (max 15 chars)")
-    .optional()
-    .describe(
-      "Bridge (or SDN VNet) the clones use: the token gets SDN.Use on /sdn/zones/{sdnZone}/{bridge}[/{vlan}]. Omit to grant no network right",
-    ),
-  sdnZone: z.string()
-    .regex(SDN_ZONE_RE, "sdnZone must be an SDN zone id")
-    .default("localnetwork")
-    .describe("SDN zone of the bridge; localnetwork for a plain Linux bridge"),
-  vlan: z.number().int().min(1).max(4094).optional().describe(
-    "VLAN tag the clones use on a VLAN-aware bridge; the grant is then on that tag only",
-  ),
-  netRole: roleArg(
-    "SwampCiNet",
-    "Custom role on the bridge path: exactly SDN.Use",
-  ),
-  templates: z.array(VmidArg)
+  members: z.array(VmidArg)
     .refine(
       (ids) => new Set(ids).size === ids.length,
-      "templates must not repeat a vmid",
+      "members must not repeat a vmid",
     )
     .default([])
-    .describe(
-      "Templates the token may clone: each gets templateRole on /vms/{vmid}. They must be templates outside the pool, so the token cannot delete or change them",
+    .describe("Guests to put in the pool; never moved from another pool"),
+  grants: z.array(z.object({
+    path: AclPathArg.describe(
+      "ACL path, e.g. /storage/{storage} or /sdn/zones/{zone}/{bridge}[/{vlan}]",
     ),
-  templateRole: roleArg(
-    "SwampCiTemplate",
-    `Custom role on each /vms/{template}: exactly ${
-      RUNNER_TEMPLATE_PRIVILEGES.join(", ")
-    }`,
-  ),
+    role: customRoleArg().describe("Custom role on that path"),
+    privileges: PrivilegesArg.describe("Exact privileges of that role"),
+  }))
+    .default([])
+    .describe("Other grants, each its own custom role on one path"),
+  templates: z.object({
+    vmids: z.array(VmidArg)
+      .min(1, "templates.vmids must not be empty")
+      .refine(
+        (ids) => new Set(ids).size === ids.length,
+        "templates.vmids must not repeat a vmid",
+      )
+      .describe("The templates"),
+    role: customRoleArg().describe("Custom role on each /vms/{vmid}"),
+    privileges: PrivilegesArg.describe("Exact privileges of the template role"),
+  })
+    .optional()
+    .describe(
+      "Templates the token may use: role on each /vms/{vmid}. Each must exist, be a template and stay outside the pool, so the pool role never reaches it",
+    ),
   updateRoles: z.boolean().default(false).describe(
-    "Add the missing privileges to an existing role of this method (for example, after a release adds one to the pool role). A role with extra privileges still blocks the run. Default false: a role that is missing privileges blocks the run",
+    "Add the missing privileges to an existing role (for example, after the policy adds one). A role with extra privileges still blocks the run. Default false: a role that is missing privileges blocks the run",
   ),
-})
-  .refine(
-    (a) => a.vlan === undefined || a.bridge !== undefined,
-    { message: "vlan needs a bridge", path: ["vlan"] },
-  )
-  .refine(
-    (a) => {
-      const roles = [
-        a.role,
-        ...(a.storage ? [a.storageRole] : []),
-        ...(a.bridge ? [a.netRole] : []),
-        ...(a.templates.length > 0 ? [a.templateRole] : []),
-      ];
-      return new Set(roles).size === roles.length;
-    },
-    {
+}).superRefine((a, ctx) => {
+  const roles = [
+    a.pool.role,
+    ...a.grants.map((x) => x.role),
+    ...(a.templates ? [a.templates.role] : []),
+  ];
+  if (new Set(roles).size !== roles.length) {
+    ctx.addIssue({
+      code: "custom",
       message:
-        "role, storageRole, netRole and templateRole must be different roles",
-      path: ["role"],
-    },
-  );
+        "the pool, each grant and the templates must each have their own role",
+      path: ["grants"],
+    });
+  }
+  const paths = [
+    `/pool/${a.pool.name}`,
+    ...a.grants.map((x) => x.path),
+    ...(a.templates?.vmids ?? []).map((vmid) => `/vms/${vmid}`),
+  ];
+  if (new Set(paths).size !== paths.length) {
+    ctx.addIssue({
+      code: "custom",
+      message: "each ACL path may have only one grant",
+      path: ["grants"],
+    });
+  }
+  const templateIds = a.templates?.vmids ?? [];
+  if (a.members.some((vmid) => templateIds.includes(vmid))) {
+    ctx.addIssue({
+      code: "custom",
+      message: "a template must not be a pool member",
+      path: ["members"],
+    });
+  }
+});
 
-type RunnerPoolArgs = z.infer<typeof EnsureRunnerPoolAccessArgs>;
+type TokenAccessArgs = z.infer<typeof EnsureTokenAccessArgs>;
 
 const SnapshotAccessSchema = z.object({
   dryRun: z.boolean().describe("True when the run only planned and checked"),
@@ -434,7 +461,7 @@ const SnapshotTokenSchema = z.object({
   createdAt: z.string(),
 });
 
-const RunnerPoolAccessSchema = z.object({
+const TokenAccessSchema = z.object({
   dryRun: z.boolean().describe("True when the run only planned and checked"),
   status: z.enum(["planned", "unchanged", "applied", "blocked", "failed"]),
   user: z.string(),
@@ -446,26 +473,27 @@ const RunnerPoolAccessSchema = z.object({
     role: z.string(),
     privileges: z.array(z.string()),
   })).describe(
-    "Each grant (propagate 0): the pool first, then the storage, the bridge and each template when given",
+    "Each grant (propagate 0): the pool first, then the other grants, then each template",
   ),
+  members: z.array(z.number()),
   templates: z.array(z.number()).describe(
-    "Templates the token may clone; outside the pool",
+    "Templates the token may use; outside the pool",
   ),
   extraMembers: z.array(z.number()).describe(
-    "Guests in the pool (the clones); reported, never removed",
+    "Guests in the pool that were not requested; reported, never removed",
   ),
   callerMissing: z.array(
     z.object({ path: z.string(), privilege: z.string() }),
   ).describe("Privileges the caller lacks (`A|B` means either one)"),
   actions: z.array(z.object({
-    action: z.enum(RUNNER_ACCESS_ACTIONS),
+    action: z.enum(TOKEN_ACCESS_ACTIONS),
     target: z.string(),
     state: z.enum(["present", "planned", "applied", "failed"]),
   })),
   blockers: z.array(z.string()),
   verified: z.array(z.object({
     path: z.string().describe(
-      "/pool/{pool}, /storage/{storage}, the bridge path or /vms/{template}",
+      "/pool/{pool}, /vms/{member}, each grant path or /vms/{template}",
     ),
     privileges: z.array(z.string()),
     ok: z.boolean(),
@@ -474,7 +502,7 @@ const RunnerPoolAccessSchema = z.object({
   checkedAt: z.string(),
 });
 
-const RunnerPoolTokenSchema = z.object({
+const AccessTokenSchema = z.object({
   tokenId: z.string(),
   tokenSecret: z.string().describe("Token secret, shown once by Proxmox")
     .meta({ sensitive: true }),
@@ -514,61 +542,43 @@ function snapshotAccessSpec(args: EnsureArgs): AccessSpec {
   };
 }
 
-/** The ACL path of SDN.Use for a bridge, with the VLAN tag when one is given. */
-export function bridgeAclPath(
-  zone: string,
-  bridge: string,
-  vlan?: number,
-): string {
-  return `/sdn/zones/${zone}/${bridge}${vlan === undefined ? "" : `/${vlan}`}`;
-}
-
-/** The runner role on the pool, then the storage role and the bridge role when given. */
-function runnerPoolAccessSpec(args: RunnerPoolArgs): AccessSpec {
+/** The pool grant, then the other grants in their order, then each template, sorted. */
+function tokenAccessSpec(args: TokenAccessArgs): AccessSpec {
   const names = {
     role: "createRole",
     userAcl: "aclUser",
     tokenAcl: "aclToken",
   };
-  const grants: AccessGrant[] = [{
-    path: `/pool/${args.pool}`,
-    role: args.role,
-    privileges: RUNNER_POOL_PRIVILEGES,
-    names,
-  }];
-  if (args.storage) {
-    grants.push({
-      path: `/storage/${args.storage}`,
-      role: args.storageRole,
-      privileges: RUNNER_STORAGE_PRIVILEGES,
+  const grants: AccessGrant[] = [
+    {
+      path: `/pool/${args.pool.name}`,
+      role: args.pool.role,
+      privileges: args.pool.privileges,
       names,
-    });
-  }
-  if (args.bridge) {
-    grants.push({
-      path: bridgeAclPath(args.sdnZone, args.bridge, args.vlan),
-      role: args.netRole,
-      privileges: RUNNER_NET_PRIVILEGES,
+    },
+    ...args.grants.map((x) => ({
+      path: x.path,
+      role: x.role,
+      privileges: x.privileges,
       names,
-    });
-  }
-  const templates = [...args.templates].sort((a, b) => a - b);
+    })),
+  ];
+  const templates = [...(args.templates?.vmids ?? [])].sort((a, b) => a - b);
   for (const vmid of templates) {
     grants.push({
       path: `/vms/${vmid}`,
-      role: args.templateRole,
-      privileges: RUNNER_TEMPLATE_PRIVILEGES,
+      role: args.templates!.role,
+      privileges: args.templates!.privileges,
       names,
     });
   }
   return {
-    method: "ensureRunnerPoolAccess",
-    comment: RUNNER_POOL_ACCESS_COMMENT,
+    method: "ensureTokenAccess",
+    comment: TOKEN_ACCESS_COMMENT,
     user: args.user,
     tokenName: args.tokenName,
-    pool: args.pool,
-    // Nothing is added to the pool: the templates stay out, and clones join it themselves.
-    members: [],
+    pool: args.pool.name,
+    members: [...args.members].sort((a, b) => a - b),
     grants,
     templates,
     updateRoles: args.updateRoles,
@@ -1059,7 +1069,7 @@ function planAccess(
     if (missing.length > 0 && !(spec.updateRoles && extra.length === 0)) {
       blockers.push(
         `role ${name} is missing privileges: ${missing.join(", ")}${
-          extra.length === 0 && spec.method === "ensureRunnerPoolAccess"
+          extra.length === 0 && spec.method === "ensureTokenAccess"
             ? " (updateRoles: true adds them)"
             : ""
         }`,
@@ -2078,7 +2088,7 @@ const CT_SNAPSHOTS = snapshotMethods("lxc");
 /** Swamp model definition for `@dmc/proxmox/node`. */
 export const model = {
   type: "@dmc/proxmox/node",
-  version: "2026.11.15.1",
+  version: "2026.11.18.1",
   globalArguments: ProxmoxConnectionArgs,
   upgrades: [
     {
@@ -2109,6 +2119,13 @@ export const model = {
       toVersion: "2026.11.15.1",
       description:
         "ensureRunnerPoolAccess: the pool role adds Pool.Audit (read the pool's membership; without it /cluster/resources leaves out each guest's pool). An existing pool role without it blocks the run until it is re-run with updateRoles: true",
+      upgradeAttributes: dropRemovedAuthArgs,
+    },
+    {
+      toVersion: "2026.11.18.1",
+      description:
+        "Breaking: ensureRunnerPoolAccess and its runnerPoolAccess and runnerPoolToken resources are removed; the extension holds no runner-pool policy. New method ensureTokenAccess makes the same kind of token from a policy the definition gives (user, token, pool role, other grants and templates, each with exact privileges), and refuses privileges that change access or reach a node's shell." +
+        " To keep a token that ensureRunnerPoolAccess made, give the same user, token, pool, roles and privileges, with name runner-pool: its data names stay runner-pool-access and runner-pool-token, and a dry run must report unchanged. Existing data is kept",
       upgradeAttributes: dropRemovedAuthArgs,
     },
   ],
@@ -2159,17 +2176,17 @@ export const model = {
       lifetime: "infinite",
       garbageCollection: 5,
     },
-    runnerPoolAccess: {
+    tokenAccess: {
       description:
-        "Plan, blockers, actions and verification of an ensureRunnerPoolAccess run",
-      schema: RunnerPoolAccessSchema,
+        "Plan, blockers, actions and verification of an ensureTokenAccess run",
+      schema: TokenAccessSchema,
       lifetime: "infinite",
       garbageCollection: 20,
     },
-    runnerPoolToken: {
+    accessToken: {
       description:
-        "One-time secret of a runner-pool API token created by ensureRunnerPoolAccess (sensitive)",
-      schema: RunnerPoolTokenSchema,
+        "One-time secret of an API token created by ensureTokenAccess (sensitive)",
+      schema: AccessTokenSchema,
       lifetime: "infinite",
       garbageCollection: 5,
     },
@@ -2432,25 +2449,25 @@ export const model = {
         ),
     },
 
-    ensureRunnerPoolAccess: {
+    ensureTokenAccess: {
       description:
-        "Make a least-privilege Proxmox API token for a CI runner pool: it may clone, start, stop and delete the guests in one pool, and make new guests (linked clones) only in that pool. It may only read and clone the templates it is given (VM.Audit and VM.Clone on each /vms/{template}); the templates must stay outside the pool, so the token cannot delete or change them. It also gets Datastore.AllocateSpace on one storage (the clone disks) and, when a bridge is given, SDN.Use on that bridge. Each kind of grant is its own custom role with propagate 0, so the token holds nothing on any other path. " +
-        "Dry run by default. Reads everything first and writes nothing if any blocker exists. Creates only what is missing: it never changes or removes an existing role, user, token, ACL, pool or guest membership, and never moves a guest out of another pool. It never adds a guest to the pool: a clone joins it when it is made. Clones in the pool are reported as extra members, never removed. " +
-        "The new token secret is a sensitive output, stored in the vault as runner-pool-token and never in data. " +
-        "Needs: Sys.Audit and Sys.Modify on /access; User.Modify on /access/groups; Realm.AllocateUser on /access/realm/pve (new user only); Pool.Allocate, Pool.Audit and Permissions.Modify on /pool/{pool}; Permissions.Modify on /storage/{storage}, with a bridge on its /sdn/zones path, and on each /vms/{template}.",
-      arguments: EnsureRunnerPoolAccessArgs,
-      execute: (args: RunnerPoolArgs, context: Ctx) => {
-        const spec = runnerPoolAccessSpec(args);
+        "Make a least-privilege Proxmox API token from a policy the definition gives: one pool role on /pool/{pool} (its privileges hold on each guest in the pool), other grants each with its own custom role on one path, and a template role on each /vms/{template}. Every grant has propagate 0, and each role must hold exactly its privileges. The templates must exist, be templates and stay outside the pool. Privileges that change access or reach a node's shell (Permissions.Modify, User.Modify, Group.Allocate, Realm.Allocate, Realm.AllocateUser, Sys.Modify, Sys.Console) are refused. " +
+        "Dry run by default. Reads everything first and writes nothing if any blocker exists. Creates only what is missing: it never changes or removes an existing user, token, ACL, pool or guest membership, and never moves a guest out of another pool; with updateRoles it adds missing privileges to an existing role, never removes any. Guests in the pool that were not requested are reported as extra members, never removed. " +
+        "The new token secret is a sensitive output, stored in the vault as {name}-token and never in data. " +
+        "Needs: Sys.Audit and Sys.Modify on /access; User.Modify on /access/groups; Realm.AllocateUser on /access/realm/pve (new user only); Pool.Allocate, Pool.Audit and Permissions.Modify on /pool/{pool}; Permissions.Modify on each grant path and each /vms/{template}; Permissions.Modify or VM.Allocate on each guest added.",
+      arguments: EnsureTokenAccessArgs,
+      execute: (args: TokenAccessArgs, context: Ctx) => {
+        const spec = tokenAccessSpec(args);
         return ensureAccess(
           spec,
           args.dryRun,
           {
-            recordSpec: "runnerPoolAccess",
-            recordName: "runner-pool-access",
-            tokenSpec: "runnerPoolToken",
-            tokenName: "runner-pool-token",
-            label: "Runner pool access",
-            record: ({ members: _members, ...base }) => ({
+            recordSpec: "tokenAccess",
+            recordName: `${args.name}-access`,
+            tokenSpec: "accessToken",
+            tokenName: `${args.name}-token`,
+            label: "Token access",
+            record: (base) => ({
               ...base,
               templates: spec.templates,
               grants: spec.grants.map(({ path, role, privileges }) => ({
