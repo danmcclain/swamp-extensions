@@ -2395,6 +2395,8 @@ Deno.test("ensureTokenAccess arguments refuse unsafe or clashing values", () => 
     { name: "Work" },
     { name: "-work" },
     { name: "work_token" },
+    { name: "snapshot" },
+    { name: "cluster-health-pve" },
     { user: "root@pam" },
     { tokenName: "w" },
     { pool: { ...pool, name: "work/sub" } },

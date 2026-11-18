@@ -314,6 +314,10 @@ const EnsureTokenAccessArgs = z.object({
       ACCESS_NAME_RE,
       "name must start with a lower-case letter and use only a-z, 0-9 or - (max 48)",
     )
+    .refine(
+      (n) => n !== "snapshot" && !n.startsWith("cluster-health-"),
+      "name must not be snapshot or start with cluster-health- (ensureSnapshotAccess and clusterHealth write those data names)",
+    )
     .describe(
       "Names this token's data: the record {name}-access and the one-time secret {name}-token",
     ),
