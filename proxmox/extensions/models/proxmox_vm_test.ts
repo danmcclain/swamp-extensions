@@ -12,6 +12,17 @@ import {
 import { model } from "./proxmox_vm.ts";
 import * as extras from "./proxmox_vm_extras.ts";
 
+/** The model's own context type: swamp-testing's context types globalArgs loosely. */
+type Ctx =
+  & Parameters<typeof model.methods.lookup.execute>[1]
+  & Parameters<typeof model.methods.createFromImage.execute>[1];
+
+/** createModelTestContext, with its context typed as the model's methods take it. */
+function testContext(options: Parameters<typeof createModelTestContext>[0]) {
+  const r = createModelTestContext(options);
+  return { ...r, context: r.context as unknown as Ctx };
+}
+
 const { vmExtraChecks, vmExtraMethods } = extras;
 
 const TOKEN_ID = "swamp@pve!automation";
@@ -100,7 +111,10 @@ Deno.test("@dmc/proxmox/vm has the base methods and every extra, but no spiceCon
   ) assert(m in model.methods, m);
   for (const m of Object.keys(vmExtraMethods)) {
     assert(m in model.methods, `extra ${m}`);
-    assertEquals(model.methods[m], vmExtraMethods[m]);
+    assertEquals(
+      (model.methods as Record<string, unknown>)[m],
+      (vmExtraMethods as Record<string, unknown>)[m],
+    );
   }
   assertFalse("spiceConnect" in model.methods);
   for (const c of Object.keys(vmExtraChecks)) {
@@ -109,7 +123,7 @@ Deno.test("@dmc/proxmox/vm has the base methods and every extra, but no spiceCon
 });
 
 Deno.test("start starts a stopped VM with the token and waits for its IP", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -147,7 +161,7 @@ Deno.test("start starts a stopped VM with the token and waits for its IP", async
 });
 
 Deno.test("start leaves a running VM alone", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
   const { seen, handler } = router({
     "GET /nodes/pve/qemu": {
       data: [{ vmid: 300, name: "swamp-serve", status: "running" }],
@@ -178,7 +192,7 @@ Deno.test("start leaves a running VM alone", async () => {
 });
 
 Deno.test("start fails when no IP arrives and requireIp is set", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { handler } = router({
@@ -208,7 +222,7 @@ Deno.test("start fails when no IP arrives and requireIp is set", async () => {
 });
 
 Deno.test("create is a no-op when a VM with that name exists", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -225,7 +239,7 @@ Deno.test("create is a no-op when a VM with that name exists", async () => {
 });
 
 Deno.test("delete stops a running VM, then deletes it", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -249,7 +263,7 @@ Deno.test("delete stops a running VM, then deletes it", async () => {
 });
 
 Deno.test("delete succeeds when the VM is already gone", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { handler } = router({ "GET /nodes/pve/qemu": { data: [] } });
@@ -262,7 +276,7 @@ Deno.test("delete succeeds when the VM is already gone", async () => {
 });
 
 Deno.test("an extra method (getConfig) runs on @dmc/proxmox/vm with the token", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -366,7 +380,7 @@ async function runVm(
   routes: Record<string, unknown>,
   input: Record<string, unknown>,
 ) {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const r = bodyRouter(routes);

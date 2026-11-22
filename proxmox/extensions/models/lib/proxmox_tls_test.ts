@@ -22,6 +22,17 @@ import {
 } from "./proxmox.ts";
 import { model as storageModel } from "../proxmox_storage.ts";
 
+/** createModelTestContext, with its context typed as the model's methods take it. */
+function testContext(options: Parameters<typeof createModelTestContext>[0]) {
+  const r = createModelTestContext(options);
+  return {
+    ...r,
+    context: r.context as unknown as Parameters<
+      typeof storageModel.methods.downloadImage.execute
+    >[1],
+  };
+}
+
 const TOKEN_ID = "swamp@pve!automation";
 const TOKEN_SECRET = "11111111-2222-3333-4444-555555555555";
 const TOKEN_AUTH = {
@@ -286,7 +297,7 @@ Deno.test("pveCall: reads caCert from the connection (the global args)", async (
 });
 
 Deno.test("storage downloadImage pins every call, task polls included", async () => {
-  const { context } = createModelTestContext({
+  const { context } = testContext({
     globalArgs: {
       apiUrl: "https://pve.test:8006",
       node: "pve",

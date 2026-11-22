@@ -19,6 +19,15 @@ import {
   pickLxcIpv4,
 } from "./proxmox_node.ts";
 
+/** The model's own context type: swamp-testing's context types globalArgs loosely. */
+type Ctx = Parameters<typeof model.methods.status.execute>[1];
+
+/** createModelTestContext, with its context typed as the model's methods take it. */
+function testContext(options: Parameters<typeof createModelTestContext>[0]) {
+  const r = createModelTestContext(options);
+  return { ...r, context: r.context as unknown as Ctx };
+}
+
 const TOKEN_ID = "swamp@pve!automation";
 const TOKEN_SECRET = "11111111-2222-3333-4444-555555555555";
 
@@ -88,7 +97,7 @@ function assertTokenOnly(seen: Seen[]) {
 }
 
 Deno.test("node status reads /status with the API token", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -112,7 +121,7 @@ Deno.test("node status reads /status with the API token", async () => {
 });
 
 Deno.test("listGuests lists qemu + lxc with IPs from each guest's node", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -177,7 +186,10 @@ Deno.test("listGuests lists qemu + lxc with IPs from each guest's node", async (
   const data = getWrittenResources()[0].data;
   assertEquals(data.total, 3);
   assertEquals(
-    data.guests.map((g: { vmid: number; ip: string | null }) => [g.vmid, g.ip]),
+    (data.guests as Array<{ vmid: number; ip: string | null }>).map((g) => [
+      g.vmid,
+      g.ip,
+    ]),
     [[101, "192.0.2.11"], [102, null], [200, "192.0.2.20"]],
   );
   assertFalse(
@@ -200,7 +212,7 @@ const VM_101_ON_PVE = {
 };
 
 Deno.test("snapshotVm posts the snapshot, waits for the task, records it", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -229,7 +241,7 @@ Deno.test("snapshotVm posts the snapshot, waits for the task, records it", async
 });
 
 Deno.test("snapshotVm throws before writing when the task fails", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { handler } = router({
@@ -256,7 +268,7 @@ Deno.test("snapshotVm throws before writing when the task fails", async () => {
 });
 
 Deno.test("rollbackVm and deleteVmSnapshot hit the snapshot paths", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const upid = "UPID:pve:3:x:";
@@ -280,15 +292,13 @@ Deno.test("rollbackVm and deleteVmSnapshot hit the snapshot paths", async () => 
   });
   assertTokenOnly(seen);
   assertEquals(
-    getWrittenResources().map((r: { data: { action: string } }) =>
-      r.data.action
-    ),
+    getWrittenResources().map((r) => (r.data as { action: string }).action),
     ["rollback", "delete"],
   );
 });
 
 Deno.test("listVmSnapshots drops the 'current' pseudo-snapshot", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { handler } = router({
@@ -336,7 +346,7 @@ const CT_201_ON_PVE2 = {
   },
 };
 
-type TestContext = ReturnType<typeof createModelTestContext>["context"];
+type TestContext = Ctx;
 
 Deno.test("guestNode returns the node a guest runs on", () => {
   assertEquals(
@@ -392,7 +402,7 @@ Deno.test("guestNode refuses a node name that is not safe in a path", () => {
 });
 
 Deno.test("snapshotCt posts to the node a CT runs on, not the configured node", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const upid = "UPID:pve2:1:vzsnapshot:";
@@ -433,7 +443,7 @@ Deno.test("snapshotCt posts to the node a CT runs on, not the configured node", 
 });
 
 Deno.test("rollbackCt sends start=1 by default and no body with start false", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
   const upid = "UPID:pve2:4:vzrollback:";
   const { seen, handler } = router({
     ...CT_201_ON_PVE2,
@@ -451,7 +461,7 @@ Deno.test("rollbackCt sends start=1 by default and no body with start false", as
     name: "pre-a",
     start: false,
   });
-  assertEquals(byDefault.start, true);
+  assertEquals((byDefault as { start?: boolean }).start, true);
   await withMockedCommand(handler, async () => {
     await model.methods.rollbackCt.execute(byDefault, context);
     await model.methods.rollbackCt.execute(noStart, context);
@@ -472,7 +482,7 @@ Deno.test("rollbackCt sends start=1 by default and no body with start false", as
 });
 
 Deno.test("listCtSnapshots drops 'current' and deleteCtSnapshot uses the CT's node", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const upid = "UPID:pve2:5:vzdelsnapshot:";
@@ -585,7 +595,7 @@ Deno.test("CT and VM snapshot methods fail closed on the wrong kind or an unknow
     ],
   ];
   for (const [routes, run, message] of cases) {
-    const { context, getWrittenResources } = createModelTestContext({
+    const { context, getWrittenResources } = testContext({
       globalArgs,
     });
     const { seen, handler } = router(routes);
@@ -605,7 +615,7 @@ Deno.test("CT and VM snapshot methods fail closed on the wrong kind or an unknow
 });
 
 Deno.test("snapshotVm posts to the node a VM runs on after it migrated", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
   const upid = "UPID:pve2:6:qmsnapshot:";
   const { seen, handler } = router({
     "GET /cluster/resources?type=vm": {
@@ -671,7 +681,7 @@ Deno.test("node-reachable reports the API error", async () => {
     () => model.checks["node-reachable"].execute({ globalArgs }),
   );
   assertFalse(result.pass);
-  assertStringIncludes(result.errors[0], "HTTP 401");
+  assertStringIncludes(result.errors?.[0] ?? "", "HTTP 401");
 });
 
 Deno.test("node-reachable reads /version, so a token without node access passes", async () => {
@@ -698,7 +708,7 @@ Deno.test("parseClusterGuests and pickLxcIpv4 handle odd payloads", () => {
 });
 
 Deno.test("permissions writes the caller's privileges, sorted by path and name", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -743,7 +753,7 @@ Deno.test("permissions writes the caller's privileges, sorted by path and name",
 });
 
 Deno.test("permissions sends path and userid as query params only when set", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const { seen, handler } = router({
@@ -829,7 +839,7 @@ Deno.test("parsePermissions skips junk values, bad names and non-path keys", () 
 });
 
 Deno.test("permissions reports an HTTP error with the status", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   await assertRejects(
@@ -1166,7 +1176,7 @@ async function ensure(
   args: Record<string, unknown>,
   method: "ensureSnapshotAccess" | "ensureTokenAccess" = "ensureSnapshotAccess",
 ) {
-  const { context, getWrittenResources, getLogs } = createModelTestContext({
+  const { context, getWrittenResources, getLogs } = testContext({
     globalArgs,
   });
   const fake = fakePve(st);
@@ -1201,7 +1211,7 @@ async function ensure(
 }
 
 /** Arguments as the method sees them, with schema defaults applied. */
-function accessArgs(input: Record<string, unknown>): Record<string, unknown> {
+function accessArgs(input: Record<string, unknown>) {
   return model.methods.ensureSnapshotAccess.arguments.parse(input);
 }
 
@@ -1760,7 +1770,7 @@ Deno.test("ensureSnapshotAccess never passes on a JSON error from the token resp
     }
     return fake.handler(cmd, args);
   };
-  const { context, getWrittenResources, getLogs } = createModelTestContext({
+  const { context, getWrittenResources, getLogs } = testContext({
     globalArgs,
   });
   const err = await assertRejects(() =>
@@ -1782,7 +1792,7 @@ Deno.test("ensureSnapshotAccess never passes on a JSON error from the token resp
 });
 
 Deno.test("ensureSnapshotAccess says the secret is lost when it cannot be stored", async () => {
-  const { context, getLogs } = createModelTestContext({ globalArgs });
+  const { context, getLogs } = testContext({ globalArgs });
   const writeResource = context.writeResource;
   context.writeResource = (spec: string, name: string, data: unknown) =>
     spec === "snapshotToken"
@@ -2202,7 +2212,7 @@ Deno.test("clusterHealth reads /cluster/status with the token and records the ve
       [{ node: "pve2" }, "pve2", false],
     ] as Array<[Record<string, string>, string, boolean]>
   ) {
-    const { context, getWrittenResources } = createModelTestContext({
+    const { context, getWrittenResources } = testContext({
       globalArgs,
     });
     const { seen, handler } = router({
@@ -2231,7 +2241,7 @@ Deno.test("clusterHealth fails on an HTTP error or a malformed answer, and write
       () => httpOutput(200, { data: { not: "a list" } }),
     ]
   ) {
-    const { context, getWrittenResources } = createModelTestContext({
+    const { context, getWrittenResources } = testContext({
       globalArgs,
     });
     await assertRejects(() =>
@@ -2248,7 +2258,7 @@ Deno.test("clusterHealth refuses an unsafe node argument or configured node", as
   const args = model.methods.clusterHealth.arguments;
   assertFalse(args.safeParse({ node: "../access" }).success);
   assertFalse(args.safeParse({ node: "pve/x" }).success);
-  const { context } = createModelTestContext({
+  const { context } = testContext({
     globalArgs: { ...globalArgs, node: "pve/../x" },
   });
   await assertRejects(
