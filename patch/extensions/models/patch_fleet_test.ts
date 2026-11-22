@@ -1352,7 +1352,7 @@ Deno.test("evalHealth: service and command checks run in ONE batch on the machin
   await withCallLog({ FAKE_SWAMP_HC: hcOut("a", 0, 0) }, async (calls) => {
     const res = await fleet.evalHealth({ host: "a" }, [
       { type: "service", name: "nginx" },
-      { type: "command", run: "test -f /ok", timeoutSec: 5 },
+      { type: "command", privileged: false, run: "test -f /ok", timeoutSec: 5 },
     ], "ssh", CLI);
     assertEquals(res.healthy, true);
     assertEquals(res.results, [
@@ -1372,7 +1372,7 @@ Deno.test("evalHealth: service and command checks run in ONE batch on the machin
   await withFake({ FAKE_SWAMP_HC: hcOut("a", 1, 1) }, async () => {
     const res = await fleet.evalHealth({ host: "a" }, [
       { type: "service", name: "nginx", label: "web" },
-      { type: "command", run: "false", timeoutSec: 5 },
+      { type: "command", privileged: false, run: "false", timeoutSec: 5 },
     ], "ssh", CLI);
     assertEquals(res.healthy, false);
     assertEquals(res.results[0], {
@@ -1391,8 +1391,8 @@ Deno.test("evalHealth: each check gets its own rc, and a missing marker is 'no r
   }, async () => {
     const res = await fleet.evalHealth({ host: "a" }, [
       { type: "service", name: "one" },
-      { type: "command", run: "two", timeoutSec: 5 },
-      { type: "command", run: "three", timeoutSec: 5 },
+      { type: "command", privileged: false, run: "two", timeoutSec: 5 },
+      { type: "command", privileged: false, run: "three", timeoutSec: 5 },
     ], "ssh", CLI);
     assertEquals(res.results.map((r) => [r.ok, r.detail]), [
       [true, "active"],
@@ -1409,7 +1409,7 @@ Deno.test("evalHealth: a CT's checks run through pct exec on its node, in one ca
       { host: "ct1", ct: { proxmoxNode: "pve", ctid: 200 }, unsafe: PCT_OK },
       [
         { type: "service", name: "caddy" },
-        { type: "command", run: "exit 3", timeoutSec: 5 },
+        { type: "command", privileged: false, run: "exit 3", timeoutSec: 5 },
       ],
       "ssh",
       CLI,
@@ -1494,7 +1494,7 @@ Deno.test("evalHealth: a long command is labelled with its first 40 characters",
   await withFake({ FAKE_SWAMP_HC: hcOut("a", 0) }, async () => {
     const run = "x".repeat(60);
     const res = await fleet.evalHealth({ host: "a" }, [
-      { type: "command", run, timeoutSec: 5 },
+      { type: "command", privileged: false, run, timeoutSec: 5 },
     ], "ssh", CLI);
     assertEquals(res.results[0].label, `command: ${"x".repeat(40)}`);
   });
@@ -9847,7 +9847,7 @@ Deno.test("pluginPrivilegesFor: a machine with only privileged checks has one mo
   const p = await fleet.pluginPrivilegesFor({
     host: "h",
     unsafe: PRIV_HEALTH_OK,
-    health: [{ type: "command", privileged: true, argv: ["myhealth"] }],
+    health: [{ type: "command", privileged: true, argv: ["myhealth"], timeoutSec: 30 }],
   }, api);
   assertEquals(calls, []);
   assertEquals(p.errors, []);
@@ -9867,7 +9867,7 @@ Deno.test("pluginPrivilegesFor: the health ids continue after a plugged model's 
     host: "web1",
     source: { model: "app" },
     unsafe: PRIV_HEALTH_OK,
-    health: [{ type: "command", privileged: true, argv: ["myhealth"] }],
+    health: [{ type: "command", privileged: true, argv: ["myhealth"], timeoutSec: 30 }],
   }, api);
   assertEquals(calls, ['app privileges {"host":"web1"}']);
   assertEquals(p.errors, []);

@@ -21,6 +21,17 @@ import {
 } from "./proxmox.ts";
 import { model as storageModel } from "../proxmox_storage.ts";
 
+/** createModelTestContext, with its context typed as the model's methods take it. */
+function testContext(options: Parameters<typeof createModelTestContext>[0]) {
+  const r = createModelTestContext(options);
+  return {
+    ...r,
+    context: r.context as unknown as Parameters<
+      typeof storageModel.methods.downloadImage.execute
+    >[1],
+  };
+}
+
 const TOKEN_ID = "swamp@pve!automation";
 const TOKEN_SECRET = "11111111-2222-3333-4444-555555555555";
 
@@ -263,7 +274,7 @@ Deno.test("waitForTask polls with token auth headers", async () => {
 });
 
 Deno.test("storage downloadImage authenticates every call with the API token", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs: {
       apiUrl: "https://pve.test:8006",
       node: "pve",
@@ -321,7 +332,10 @@ Deno.test("storage-target-exists reports refused credentials, not a missing stor
       }),
   );
   assertFalse(result.pass);
-  assertStringIncludes(result.errors[0], "refused the credentials (401)");
+  assertStringIncludes(
+    result.errors?.[0] ?? "",
+    "refused the credentials (401)",
+  );
 });
 
 Deno.test("resolveAuth does not echo a malformed tokenId, which may be the secret", async () => {

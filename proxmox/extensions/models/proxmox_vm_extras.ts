@@ -3,19 +3,27 @@ import {
   authHeaders,
   fetchWithCurl,
   hasUnresolvedAuth,
+  type ProxmoxAuth,
   resolveAuth,
   type TlsOptions,
   tlsOptions,
   waitForTask,
 } from "./lib/proxmox.ts";
 
+/** A guest as /nodes/{node}/qemu and /nodes/{node}/lxc list it. */
+interface ListedGuest {
+  vmid: number;
+  name?: string;
+  status?: string;
+}
+
 async function resolveVmId(
-  apiUrl,
-  node,
-  vmName,
-  auth,
+  apiUrl: string,
+  node: string,
+  vmName: string,
+  auth: ProxmoxAuth,
   tls: TlsOptions,
-) {
+): Promise<ListedGuest> {
   const response = await fetchWithCurl(
     `${apiUrl}/api2/json/nodes/${node}/qemu`,
     {
@@ -27,7 +35,7 @@ async function resolveVmId(
   if (!response.ok) {
     throw new Error(`Failed to list VMs: ${await response.text()}`);
   }
-  const vms = (await response.json()).data;
+  const vms: ListedGuest[] = (await response.json()).data;
   const vm = vms.find((v) => v.name === vmName);
   if (!vm) {
     throw new Error(
@@ -40,12 +48,12 @@ async function resolveVmId(
 }
 
 async function resolveLxcId(
-  apiUrl,
-  node,
-  ctName,
-  auth,
+  apiUrl: string,
+  node: string,
+  ctName: string,
+  auth: ProxmoxAuth,
   tls: TlsOptions,
-) {
+): Promise<ListedGuest> {
   const response = await fetchWithCurl(
     `${apiUrl}/api2/json/nodes/${node}/lxc`,
     {
@@ -57,7 +65,7 @@ async function resolveLxcId(
   if (!response.ok) {
     throw new Error(`Failed to list LXC containers: ${await response.text()}`);
   }
-  const cts = (await response.json()).data;
+  const cts: ListedGuest[] = (await response.json()).data;
   const ct = cts.find((c) => c.name === ctName);
   if (!ct) {
     throw new Error(
@@ -130,7 +138,7 @@ async function destroyNewVm(
 const GIB = 1024 ** 3;
 
 /** The part of swamp's check context these checks read. */
-interface VmCheckContext {
+export interface VmCheckContext {
   globalArgs: {
     apiUrl: string;
     node: string;
@@ -481,7 +489,10 @@ const preflightChecks = {
 function skipLiveWhenAuthUnresolved<
   T extends Record<
     string,
-    { labels?: string[]; execute: (ctx) => Promise<CheckResult> }
+    {
+      labels?: string[];
+      execute: (ctx: VmCheckContext) => Promise<CheckResult>;
+    }
   >,
 >(checks: T): T {
   const out = {} as T;
@@ -489,7 +500,7 @@ function skipLiveWhenAuthUnresolved<
     out[name as keyof T] = (check.labels?.includes("live")
       ? {
         ...check,
-        execute: (ctx) =>
+        execute: (ctx: VmCheckContext) =>
           hasUnresolvedAuth(ctx?.globalArgs)
             ? Promise.resolve({ pass: true })
             : check.execute(ctx),
@@ -532,7 +543,8 @@ export const vmExtraChecks = skipLiveWhenAuthUnresolved({
         };
       }
 
-      const items = (await response.json()).data;
+      const items: Array<{ type?: string; name?: string; online?: number }> =
+        (await response.json()).data;
       const nodes = items.filter((n) => n.type === "node");
       if (nodes.length < 2) {
         return {
@@ -561,8 +573,28 @@ export const vmExtraChecks = skipLiveWhenAuthUnresolved({
  * VM and LXC lifecycle methods — provisioning, snapshots, disk/node migration,
  * and container control, used by the `@dmc/proxmox/vm` model.
  */
+/** The parts of swamp's method context the extra methods use. */
+export interface VmExtraContext {
+  globalArgs: VmCheckContext["globalArgs"];
+  logger: { info(template: string, props?: Record<string, unknown>): void };
+  writeResource: (
+    spec: string,
+    name: string,
+    data: unknown,
+  ) => Promise<unknown>;
+}
+
+/** A method whose execute takes the parsed `arguments` and a VmExtraContext. */
+function method<S extends z.ZodType, R>(m: {
+  description: string;
+  arguments: S;
+  execute: (args: z.output<S>, context: VmExtraContext) => Promise<R>;
+}) {
+  return m;
+}
+
 export const vmExtraMethods = {
-  createFromImage: {
+  createFromImage: method({
     description:
       "Create a VM by importing a cloud image disk — handles VM creation, disk import, and cloud-init drive in one step",
     arguments: z.object({
@@ -644,8 +676,8 @@ export const vmExtraMethods = {
         "Creating VM {vmName} on {node} from image {importFrom}",
         { vmName, node, importFrom },
       );
-      const logs = [];
-      const log = (msg) => logs.push(msg);
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
 
       const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
@@ -845,9 +877,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  configureCloudInit: {
+  configureCloudInit: method({
     description:
       "Update cloud-init configuration on an existing VM (user, SSH keys, IP config)",
     arguments: z.object({
@@ -868,8 +900,8 @@ export const vmExtraMethods = {
         vmName,
         node,
       });
-      const logs = [];
-      const log = (msg) => logs.push(msg);
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
 
       const auth = await resolveAuth(context.globalArgs);
 
@@ -924,9 +956,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  snapshot: {
+  snapshot: method({
     description: "Create a Proxmox VM snapshot",
     arguments: z.object({
       vmName: z.string().describe("VM name"),
@@ -943,8 +975,8 @@ export const vmExtraMethods = {
         "Creating snapshot {snapname} of VM {vmName} on {node}",
         { snapname, vmName, node },
       );
-      const logs = [];
-      const log = (msg) => logs.push(msg);
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
 
       const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
@@ -1007,9 +1039,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  deleteSnapshot: {
+  deleteSnapshot: method({
     description: "Delete a Proxmox VM snapshot",
     arguments: z.object({
       vmName: z.string().describe("VM name"),
@@ -1023,8 +1055,8 @@ export const vmExtraMethods = {
         "Deleting snapshot {snapname} of VM {vmName} on {node}",
         { snapname, vmName, node },
       );
-      const logs = [];
-      const log = (msg) => logs.push(msg);
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
 
       const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
@@ -1082,9 +1114,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  moveDisk: {
+  moveDisk: method({
     description:
       "Move a VM's disk to a different storage backend (VM should be stopped first for safety)",
     arguments: z.object({
@@ -1105,8 +1137,8 @@ export const vmExtraMethods = {
         "Moving disk {disk} of VM {vmName} to storage {targetStorage}",
         { disk, vmName, targetStorage },
       );
-      const logs = [];
-      const log = (msg) => logs.push(msg);
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
 
       const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
@@ -1178,9 +1210,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  listSnapshots: {
+  listSnapshots: method({
     description: "List snapshots for a Proxmox VM",
     arguments: z.object({
       vmName: z.string().describe("VM name"),
@@ -1218,7 +1250,7 @@ export const vmExtraMethods = {
             .text()}`,
         );
       }
-      const snapshots = (await response.json()).data;
+      const snapshots: Array<{ name: string }> = (await response.json()).data;
       const names = snapshots.map((s) => s.name).filter((n) => n !== "current");
 
       const handle = await context.writeResource("vm", `${vmName}-ops`, {
@@ -1234,9 +1266,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  lxcStop: {
+  lxcStop: method({
     description: "Stop a Proxmox LXC container",
     arguments: z.object({
       ctName: z.string().describe("LXC container name"),
@@ -1249,8 +1281,8 @@ export const vmExtraMethods = {
         ctName,
         node,
       });
-      const logs = [];
-      const log = (msg) => logs.push(msg);
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
 
       const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
@@ -1307,9 +1339,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  lxcStart: {
+  lxcStart: method({
     description: "Start a Proxmox LXC container",
     arguments: z.object({
       ctName: z.string().describe("LXC container name"),
@@ -1322,8 +1354,8 @@ export const vmExtraMethods = {
         ctName,
         node,
       });
-      const logs = [];
-      const log = (msg) => logs.push(msg);
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
 
       const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
@@ -1381,9 +1413,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  lxcMoveVolume: {
+  lxcMoveVolume: method({
     description:
       "Move an LXC container's volume (rootfs or mount point) to a different storage backend",
     arguments: z.object({
@@ -1404,8 +1436,8 @@ export const vmExtraMethods = {
         "Moving volume {volume} of LXC {ctName} to storage {targetStorage}",
         { volume, ctName, targetStorage },
       );
-      const logs = [];
-      const log = (msg) => logs.push(msg);
+      const logs: string[] = [];
+      const log = (msg: string) => logs.push(msg);
 
       const auth = await resolveAuth(context.globalArgs);
       const headers = authHeaders(auth);
@@ -1478,9 +1510,9 @@ export const vmExtraMethods = {
       });
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  getConfig: {
+  getConfig: method({
     description: "Read the raw config for a Proxmox VM or LXC container",
     arguments: z.object({
       vmName: z.string().describe("VM or LXC name"),
@@ -1549,9 +1581,9 @@ export const vmExtraMethods = {
       );
       return { dataHandles: [handle] };
     },
-  },
+  }),
 
-  migrate: {
+  migrate: method({
     description:
       "Live-migrate a VM to another Proxmox node. Requires shared storage (NFS/Ceph) — disk is not copied, only VM state is transferred.",
     arguments: z.object({
@@ -1655,5 +1687,5 @@ export const vmExtraMethods = {
       );
       return { dataHandles: [handle] };
     },
-  },
+  }),
 };

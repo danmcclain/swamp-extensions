@@ -27,7 +27,7 @@
 import { z } from "npm:zod@4";
 
 /** Quote a value for a curl config file (double-quoted string). */
-export function quoteCurlConfig(value) {
+export function quoteCurlConfig(value: unknown): string {
   return `"${
     String(value)
       .replace(/\\/g, "\\\\")
@@ -41,7 +41,7 @@ export function quoteCurlConfig(value) {
  * curl config file text for request headers. Headers carry the API token secret, so
  * they go in a 0600 temp file read with `-K`, never on the command line where `ps` shows them.
  */
-export function buildHeaderConfig(headers) {
+export function buildHeaderConfig(headers: Record<string, string>): string {
   return Object.entries(headers)
     .map(([key, value]) => {
       const line = `${key}: ${value}`;
@@ -98,7 +98,15 @@ export function pinnedCaCert(tls: TlsOptions | undefined): string | null {
   return ca;
 }
 
-export async function fetchWithCurl(url, options) {
+/** A request for fetchWithCurl. */
+export interface CurlRequest {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  tls?: TlsOptions;
+}
+
+export async function fetchWithCurl(url: string, options: CurlRequest) {
   const { method = "GET", headers = {}, body, tls } = options;
 
   const caCert = pinnedCaCert(tls);
@@ -109,9 +117,9 @@ export async function fetchWithCurl(url, options) {
   const config = Object.keys(headers).length > 0
     ? buildHeaderConfig(headers)
     : null;
-  let configPath;
-  let caPath;
-  let bodyPath;
+  let configPath: string | undefined;
+  let caPath: string | undefined;
+  let bodyPath: string | undefined;
   try {
     if (caCert !== null) {
       // @ts-ignore - Deno API
@@ -148,7 +156,7 @@ export async function fetchWithCurl(url, options) {
   }
 }
 
-async function runCurl(args) {
+async function runCurl(args: string[]) {
   // @ts-ignore - Deno API
   const command = new Deno.Command("curl", { args });
   const { code, stdout, stderr } = await command.output();
@@ -180,14 +188,14 @@ async function runCurl(args) {
  * it is still running after that long; without it, wait as long as it takes.
  */
 export async function waitForTask(
-  apiUrl,
-  node,
-  upid,
-  auth,
+  apiUrl: string,
+  node: string,
+  upid: unknown,
+  auth: ProxmoxAuth,
   tls: TlsOptions,
   timeoutSeconds?: number,
 ) {
-  const encodedUpid = encodeURIComponent(upid);
+  const encodedUpid = encodeURIComponent(String(upid));
   const url = `${apiUrl}/api2/json/nodes/${node}/tasks/${encodedUpid}/status`;
   const deadline = timeoutSeconds === undefined
     ? Infinity
@@ -227,7 +235,7 @@ export async function waitForTask(
 }
 
 /** True when `value` is a still-unresolved `${{ ... }}` vault/CEL reference. */
-export function isUnresolvedRef(value) {
+export function isUnresolvedRef(value: unknown): boolean {
   return typeof value === "string" && value.includes("${{");
 }
 
@@ -236,8 +244,8 @@ export function isUnresolvedRef(value) {
  * can see raw global args (e.g. under `validate`); they pass in that case and
  * leave auth to the method run.
  */
-export function hasUnresolvedAuth(globalArgs) {
-  return ["tokenId", "tokenSecret"]
+export function hasUnresolvedAuth(globalArgs: AuthArgs | undefined): boolean {
+  return (["tokenId", "tokenSecret"] as const)
     .some((k) => isUnresolvedRef(globalArgs?.[k]));
 }
 
@@ -266,6 +274,13 @@ export function dropRemovedAuthArgs(
 /** Proxmox API token id: `user@realm!tokenname`. */
 const TOKEN_ID_RE = /^[^@!\s]+@[^@!\s]+![A-Za-z][A-Za-z0-9._-]*$/;
 
+/** The auth global args as a model passes them: unchecked, maybe unresolved. */
+export interface AuthArgs {
+  tokenId?: unknown;
+  tokenSecret?: unknown;
+  [arg: string]: unknown;
+}
+
 /** A resolved Proxmox API token. */
 export interface ProxmoxAuth {
   tokenId: string;
@@ -288,7 +303,9 @@ export function authHeaders(auth: ProxmoxAuth): Record<string, string> {
  * 2026.11.07.1. Fails closed when the token is missing, unresolved or
  * malformed.
  */
-export function resolveAuth(globalArgs): Promise<ProxmoxAuth> {
+export function resolveAuth(
+  globalArgs: AuthArgs | undefined,
+): Promise<ProxmoxAuth> {
   const { tokenId, tokenSecret } = globalArgs ?? {};
   if (!tokenId || !tokenSecret) {
     return Promise.reject(
@@ -333,7 +350,7 @@ export function nodePath(
  */
 export async function pveCall(
   conn: TlsOptions,
-  auth,
+  auth: ProxmoxAuth,
   method: string,
   url: string,
   what: string,
@@ -385,7 +402,7 @@ export function pickGuestIpv4(interfaces: unknown): string | null {
  */
 export async function getVmIpWithRetry(
   conn: { apiUrl: string; node: string } & TlsOptions,
-  auth,
+  auth: ProxmoxAuth,
   vmid: number,
   waitSeconds = 120,
   pollInterval = 5,
@@ -463,17 +480,25 @@ export function renderTemplate(
  * Method logger: forwards structured messages to `context.logger` and keeps a
  * rendered copy for the resource `logs` field.
  */
-export function createMethodLogger(context: { logger? }) {
+/** The parts of swamp's method logger this module calls. */
+interface LoggerLike {
+  info(template: string, props?: Record<string, unknown>): void;
+  warn?(template: string, props?: Record<string, unknown>): void;
+  warning?(template: string, props?: Record<string, unknown>): void;
+}
+
+export function createMethodLogger(context: { logger?: unknown }) {
+  const logger = context.logger as LoggerLike | undefined;
   const lines: string[] = [];
   return {
     lines,
     info(template: string, props: Record<string, unknown> = {}) {
       lines.push(renderTemplate(template, props));
-      context.logger?.info(template, props);
+      logger?.info(template, props);
     },
     warn(template: string, props: Record<string, unknown> = {}) {
       lines.push(renderTemplate(template, props));
-      const l = context.logger;
+      const l = logger;
       const warnFn = l?.warning ?? l?.warn;
       if (warnFn) warnFn.call(l, template, props);
       else l?.info(template, props);

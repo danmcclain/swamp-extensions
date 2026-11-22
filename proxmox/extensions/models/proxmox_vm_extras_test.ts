@@ -9,6 +9,17 @@ import {
 } from "jsr:@systeminit/swamp-testing@0.20260604.20";
 import * as extras from "./proxmox_vm_extras.ts";
 
+/** createModelTestContext, with its context typed as the model's methods take it. */
+function testContext(options: Parameters<typeof createModelTestContext>[0]) {
+  const r = createModelTestContext(options);
+  return {
+    ...r,
+    context: r.context as unknown as
+      & extras.VmExtraContext
+      & extras.VmCheckContext,
+  };
+}
+
 const { vmExtraChecks, vmExtraMethods } = extras;
 
 const globalArgs = {
@@ -30,7 +41,7 @@ const clusterCheck = vmExtraChecks["cluster-has-migration-target"];
 const migrate = vmExtraMethods.migrate;
 
 Deno.test("cluster-has-migration-target passes for a healthy multi-node cluster", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   const { result } = await withMockedCommand(
     [
@@ -48,7 +59,7 @@ Deno.test("cluster-has-migration-target passes for a healthy multi-node cluster"
 });
 
 Deno.test("cluster-has-migration-target fails on a standalone node", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   const { result } = await withMockedCommand(
     [httpOutput(200, { data: [{ type: "node", name: "pve", online: 1 }] })],
@@ -59,7 +70,7 @@ Deno.test("cluster-has-migration-target fails on a standalone node", async () =>
 });
 
 Deno.test("cluster-has-migration-target fails when the node is reported offline", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   const { result } = await withMockedCommand(
     [
@@ -77,7 +88,7 @@ Deno.test("cluster-has-migration-target fails when the node is reported offline"
 });
 
 Deno.test("cluster-has-migration-target fails when the cluster status call errors", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   const { result } = await withMockedCommand(
     [httpOutput(500, {})],
@@ -88,7 +99,7 @@ Deno.test("cluster-has-migration-target fails when the cluster status call error
 });
 
 Deno.test("migrate moves a running VM to the target node", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
 
@@ -114,7 +125,7 @@ Deno.test("migrate moves a running VM to the target node", async () => {
 });
 
 Deno.test("migrate throws when the VM is not found", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   await assertRejects(
     () =>
@@ -150,7 +161,7 @@ async function runCreate(
   args: Record<string, unknown>,
   responses: Array<{ stdout: string; code: number }>,
 ) {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const parsed = createFromImage.arguments.parse({
@@ -301,7 +312,7 @@ async function runCreateFailing(
   args: Record<string, unknown>,
   responses: Array<{ stdout: string; code: number }>,
 ) {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
   const parsed = createFromImage.arguments.parse({
@@ -429,7 +440,7 @@ async function runCheck(
   methodArgs: Record<string, unknown>,
   responses: Array<{ stdout: string; code: number }> = [],
 ) {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
   const ctx = {
     ...context,
     methodName,
@@ -597,7 +608,7 @@ Deno.test("vmid-free passes without a call under a plain `swamp model validate` 
 });
 
 Deno.test("cluster-has-migration-target passes without a call under a plain `swamp model validate` (empty methodName)", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
   const { result, calls } = await withMockedCommand(
     [httpOutput(200, { data: [{ type: "node", name: "pve", online: 1 }] })],
     () => clusterCheck.execute({ ...context, methodName: "" }),

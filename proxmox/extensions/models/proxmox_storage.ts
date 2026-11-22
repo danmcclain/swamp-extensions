@@ -28,6 +28,24 @@ const GlobalArgs = z.object({
     .meta({ sensitive: true }),
 });
 
+type StorageGlobalArgs = z.infer<typeof GlobalArgs>;
+
+/** The parts of swamp's method context this model uses. */
+interface Ctx {
+  globalArgs: StorageGlobalArgs;
+  logger: { info(template: string, props?: Record<string, unknown>): void };
+  writeResource: (
+    spec: string,
+    name: string,
+    data: unknown,
+  ) => Promise<unknown>;
+}
+
+/** A storage content entry from /nodes/{node}/storage/{storage}/content. */
+interface ContentEntry {
+  volid?: string;
+}
+
 const ImageSchema = z.object({
   storage: z.string(),
   filename: z.string(),
@@ -46,13 +64,13 @@ export const model = {
     {
       toVersion: "2026.07.18.1",
       description: "Version bump, no schema changes",
-      upgradeAttributes: (old) => old,
+      upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
       toVersion: "2026.10.25.1",
       description:
         "Add optional tokenId/tokenSecret global args (API-token auth)",
-      upgradeAttributes: (old) => old,
+      upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
       toVersion: "2026.11.07.1",
@@ -76,7 +94,8 @@ export const model = {
         "Verify the target storage exists and is active on the target node before requesting a download",
       labels: ["live"],
       appliesTo: ["downloadImage"],
-      execute: async (context) => {
+      // Checks can see the raw global args (under validate), defaults not applied.
+      execute: async (context: { globalArgs: z.input<typeof GlobalArgs> }) => {
         const { apiUrl, node, storage } = context.globalArgs;
         const tls = tlsOptions(context.globalArgs);
         if (hasUnresolvedAuth(context.globalArgs)) return { pass: true };
@@ -136,12 +155,20 @@ export const model = {
           "Checksum algorithm (sha256, md5, sha1)",
         ),
       }),
-      execute: async (args, context) => {
+      execute: async (
+        args: {
+          url: string;
+          filename: string;
+          checksum?: string;
+          checksumAlgorithm?: string;
+        },
+        context: Ctx,
+      ) => {
         const { apiUrl, node, storage } = context.globalArgs;
         const tls = tlsOptions(context.globalArgs);
         const { url, filename, checksum, checksumAlgorithm } = args;
-        const logs = [];
-        const log = (msg) => logs.push(msg);
+        const logs: string[] = [];
+        const log = (msg: string) => logs.push(msg);
 
         context.logger.info(
           "Downloading image {filename} into storage {storage} on {node}",
@@ -161,9 +188,9 @@ export const model = {
             `Failed to list storage content: ${await existingResp.text()}`,
           );
         }
-        const existing = (await existingResp.json()).data.find((v) =>
-          v.volid && v.volid.includes(filename)
-        );
+        const existing = (await existingResp.json()).data.find((
+          v: ContentEntry,
+        ) => v.volid && v.volid.includes(filename));
         if (existing) {
           log(`Image already exists at ${existing.volid} — skipping download`);
           const handle = await context.writeResource("image", filename, {
@@ -254,7 +281,7 @@ export const model = {
           );
         }
         const contentList = (await contentResp.json()).data;
-        const imageEntry = contentList.find((v) =>
+        const imageEntry = contentList.find((v: ContentEntry) =>
           v.volid && v.volid.includes(filename)
         );
         if (!imageEntry) {

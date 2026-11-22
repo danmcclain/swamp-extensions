@@ -5,6 +5,15 @@ import {
 } from "jsr:@systeminit/swamp-testing@0.20260604.20";
 import { model } from "./proxmox_storage.ts";
 
+/** The model's own context type: swamp-testing's context types globalArgs loosely. */
+type Ctx = Parameters<typeof model.methods.downloadImage.execute>[1];
+
+/** createModelTestContext, with its context typed as the model's methods take it. */
+function testContext(options: Parameters<typeof createModelTestContext>[0]) {
+  const r = createModelTestContext(options);
+  return { ...r, context: r.context as unknown as Ctx };
+}
+
 const globalArgs = {
   apiUrl: "https://proxmox.test:8006",
   node: "pve",
@@ -22,7 +31,7 @@ function httpOutput(status: number, body: unknown) {
 }
 
 Deno.test("downloadImage skips the download when the file already exists", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
 
@@ -46,7 +55,7 @@ Deno.test("downloadImage skips the download when the file already exists", async
 });
 
 Deno.test("downloadImage downloads and records the volid when the file is new", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
 
@@ -71,7 +80,7 @@ Deno.test("downloadImage downloads and records the volid when the file is new", 
 });
 
 Deno.test("downloadImage treats Proxmox's 'refusing to override existing file' as idempotent success", async () => {
-  const { context, getWrittenResources } = createModelTestContext({
+  const { context, getWrittenResources } = testContext({
     globalArgs,
   });
 
@@ -101,7 +110,7 @@ Deno.test("downloadImage treats Proxmox's 'refusing to override existing file' a
 });
 
 Deno.test("downloadImage throws on a genuine download task failure", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   await assertRejects(
     () =>
@@ -125,7 +134,7 @@ Deno.test("downloadImage throws on a genuine download task failure", async () =>
 });
 
 Deno.test("storage-target-exists check passes for an active storage", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   const { result } = await withMockedCommand(
     [httpOutput(200, { data: { active: 1 } })],
@@ -136,7 +145,7 @@ Deno.test("storage-target-exists check passes for an active storage", async () =
 });
 
 Deno.test("storage-target-exists check fails when the storage is not found on the node", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   const { result } = await withMockedCommand(
     [httpOutput(500, { data: null })],
@@ -147,7 +156,7 @@ Deno.test("storage-target-exists check fails when the storage is not found on th
 });
 
 Deno.test("storage-target-exists check fails when the storage is inactive", async () => {
-  const { context } = createModelTestContext({ globalArgs });
+  const { context } = testContext({ globalArgs });
 
   const { result } = await withMockedCommand(
     [httpOutput(200, { data: { active: 0 } })],
