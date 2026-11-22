@@ -23,9 +23,24 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: https://github.com/denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
-        with:
-          deno-version: v2.7.1
+      # Not denoland/setup-deno: it extracts with unzip, which the runner
+      # image lacks. Pin the version and the sha256 from its .sha256sum
+      # file; python3's zipfile does the extracting.
+      - name: Install Deno
+        env:
+          DENO_VERSION: v2.7.1
+          DENO_SHA256: b7154ae42839d7b1453422e2f33c907e5c68fde8fe9f145cd43b8dd083671a6f
+        run: |
+          dir="$RUNNER_TEMP/deno"
+          mkdir -p "$dir"
+          curl -fsSL --proto '=https' -o "$dir/deno.zip" \
+            "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip"
+          echo "${DENO_SHA256}  $dir/deno.zip" | sha256sum -c -
+          python3 -m zipfile -e "$dir/deno.zip" "$dir"
+          chmod 0755 "$dir/deno"
+          rm "$dir/deno.zip"
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/deno" --version
 
       - name: fastmail
         working-directory: fastmail
