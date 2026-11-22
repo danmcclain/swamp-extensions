@@ -2,10 +2,6 @@
 # Deno tests. It runs on the runner pool (runs-on: bootc, a host runner on a
 # one-job VM) and needs no secret. main's branch protection requires
 # "test / test (pull_request)", so keep the workflow and job names.
-#
-# --no-check: the test files of fastmail, patch and proxmox do not type-check
-# yet (test doubles narrower than MethodContext, implicit any). Drop the flag
-# once `deno test` type-checks cleanly in every extension.
 name: test
 
 on:
@@ -44,16 +40,16 @@ jobs:
 
       - name: fastmail
         working-directory: fastmail
-        run: deno test -A --no-check
+        run: deno test -A
 
       - name: patch
         working-directory: patch
-        run: deno test -A --no-check
+        run: deno test -A
 
       - name: proxmox
         working-directory: proxmox
-        run: deno test -A --no-check
+        run: deno test -A
 
       - name: unifi-networks
         working-directory: unifi-networks
-        run: deno test -A --no-check
+        run: deno test -A
