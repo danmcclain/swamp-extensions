@@ -2118,8 +2118,15 @@ export const model = {
         "STP-blocked ports. Joins the integration API with the classic " +
         "controller API (same key) by MAC. Read-only. Same mode/fan-out " +
         "rules as scan.",
-      arguments: z.object({}),
-      execute: async (_args: Record<string, never>, context: Ctx) => {
+      arguments: z.object({
+        groupBy: z.enum(["none", "model", "state", "uplink"]).default("none")
+          .describe(
+            "How the @dmc/unifi-device-status report groups its device " +
+              "table: none (one table), model, state, or uplink device. " +
+              "Does not change the data written.",
+          ),
+      }),
+      execute: async (_args: { groupBy?: string }, context: Ctx) => {
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
         context.logger.info("{method}: scanning {count} console(s)", {

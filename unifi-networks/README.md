@@ -111,6 +111,11 @@ swamp model method run my-unifi scanDevices
 swamp data query 'specName == "siteDevices"' --select 'content.notOnline'
 ```
 
+Each run writes a new version of the site's `siteDevices` data, and swamp keeps
+the last 400 versions (about a year of daily runs). That version history is the
+device history: list it with `swamp data versions <model> devices-<site>`. Run
+`scanDevices` from a scheduled workflow on `swamp serve` to build it up.
+
 ### Setting a network's domain name
 
 `setNetworkDomain` sets the **Domain Name** of a network's DHCP server — the
@@ -196,6 +201,35 @@ Both run automatically after `scanFirewall`:
   rules.
 - **`@dmc/unifi-zone-matrix`** — source→destination posture grid from the
   catch-all defaults, marking pairs a higher-priority rule overrides.
+
+After `scanDevices`:
+
+- **`@dmc/unifi-device-status`** — a table of every device (state, firmware,
+  offered upgrade, last seen, uplink, STP-blocked ports), not-online devices
+  first, and the changes since the previous scan: state, firmware, a newly
+  offered upgrade, uplink, STP-blocked ports, and devices added or removed. It
+  compares the new `siteDevices` version with the one before it.
+
+Add a report to a model definition's `reports.require` to run it, for example:
+
+```yaml
+reports:
+  require:
+    - name: "@dmc/unifi-device-status"
+      methods: [scanDevices]
+```
+
+The device table can be split into one table per group with the `scanDevices`
+argument `groupBy`: `none` (the default, one table), `model`, `state`, or
+`uplink` (the device each one connects to). Each group heading shows how many of
+its devices are not online. Set it in the definition so every run uses it:
+
+```yaml
+methods:
+  scanDevices:
+    arguments:
+      groupBy: model
+```
 
 ## Example
 
