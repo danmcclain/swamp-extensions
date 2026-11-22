@@ -443,7 +443,7 @@ interface SetupConfig {
   bulkThreshold: number;
   // Fastmail-idiom options:
   dialect: "simple" | "fastmail";
-  action: "file" | "allowlist";
+  action: "file" | "allowlist" | "rules";
   rootPrefix: string;
   separator: string;
   skipInbox: boolean;
@@ -451,6 +451,17 @@ interface SetupConfig {
 }
 
 const depth = (category: string) => category.split("/").filter(Boolean).length;
+
+/** The scan-driven rules of a setup: those with both a category and a pattern. */
+function scanDrivenRules(
+  rules: Array<{ category?: string; pattern?: string }>,
+): SetupConfig["rules"] {
+  return rules.flatMap((r) =>
+    r.category && r.pattern
+      ? [{ category: r.category, pattern: r.pattern }]
+      : []
+  );
+}
 
 /** Compile + auto-sort rules so more specific paths (A/B) win over parents (A). */
 function compileRules(rules: SetupConfig["rules"]): CompiledRule[] {
@@ -898,12 +909,7 @@ function classifyMessage(
         sawExclude = true;
         continue;
       }
-      const compiled = compileRules(
-        s.rules.filter((r) => r.category && r.pattern).map((r) => ({
-          category: r.category!,
-          pattern: r.pattern!,
-        })),
-      );
+      const compiled = compileRules(scanDrivenRules(s.rules));
       const hay = `${msg.from.toLowerCase()} ${
         (msg.fromName ?? "").toLowerCase()
       }`;
@@ -1151,7 +1157,7 @@ type Ctx = {
  */
 export const model = {
   type: "@dmc/fastmail",
-  version: "2026.09.15.1",
+  version: "2026.11.22.1",
   globalArguments: GlobalArgsSchema,
   checks: {
     "valid-api-token": {
@@ -1487,7 +1493,9 @@ export const model = {
           const cfg: SetupConfig = {
             folderPrefix: setup.folderPrefix,
             mode: setup.mode,
-            rules: setup.rules,
+            // Scan-driven rules only ({category, pattern}), as the plan report takes
+            // them: a direct rule may lack either, and compileRules needs both.
+            rules: scanDrivenRules(setup.rules),
             exclude: setup.exclude,
             overrides: setup.overrides,
             bulkFallback: setup.bulkFallback,
