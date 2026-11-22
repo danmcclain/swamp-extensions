@@ -8857,14 +8857,16 @@ async function sha256Of(text: string): Promise<string> {
 }
 
 /**
- * Run collect_packages_hash from the bundled collector with a fake `dpkg-query` (a sh
- * body) first on PATH, and echo the hash the function set.
+ * Run collect_packages_hash from the bundled collector with a fake `rpm` (a sh body)
+ * first on PATH, and echo the hash the function set. The fake is rpm because the
+ * manifest command tries rpm first: a fake for a later branch would lose to the host's
+ * real rpm (on a CentOS CI runner, say).
  */
-async function runPackagesHash(dpkgQuery: string): Promise<string> {
+async function runPackagesHash(manifest: string): Promise<string> {
   const dir = await Deno.makeTempDir();
   try {
-    await Deno.writeTextFile(`${dir}/dpkg-query`, `#!/bin/sh\n${dpkgQuery}\n`);
-    await Deno.chmod(`${dir}/dpkg-query`, 0o755);
+    await Deno.writeTextFile(`${dir}/rpm`, `#!/bin/sh\n${manifest}\n`);
+    await Deno.chmod(`${dir}/rpm`, 0o755);
     const body = fleet.COLLECTOR_SCRIPT.split("\n")
       .filter((l) => l !== "main </dev/null")
       .join("\n");
