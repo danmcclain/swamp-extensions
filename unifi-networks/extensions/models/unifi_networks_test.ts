@@ -430,15 +430,15 @@ function aRecord(
 
 Deno.test("planDnsARecords: missing names are created with a full create body", () => {
   const plans = planDnsARecords([], [
-    { name: "Fort.Lan.Example", ipv4Address: "192.0.2.50" },
-    { name: "pve.lan.example", ipv4Address: " 192.0.2.51 " },
+    { name: "Host1.Lan.Example", ipv4Address: "192.0.2.50" },
+    { name: "host2.lan.example", ipv4Address: " 192.0.2.51 " },
   ], 3600);
   assertEquals(plans.map((p) => p.action), ["create", "create"]);
-  assertEquals(plans[0].name, "fort.lan.example"); // stored lowercase
+  assertEquals(plans[0].name, "host1.lan.example"); // stored lowercase
   assertEquals(plans[0].body, {
     type: "A_RECORD",
     enabled: true,
-    domain: "fort.lan.example",
+    domain: "host1.lan.example",
     ipv4Address: "192.0.2.50",
     ttlSeconds: 3600,
   });
@@ -447,8 +447,8 @@ Deno.test("planDnsARecords: missing names are created with a full create body", 
 
 Deno.test("planDnsARecords: matching record is unchanged", () => {
   const plans = planDnsARecords(
-    [aRecord("p1", "fort.lan.example", "192.0.2.50")],
-    [{ name: "fort.lan.example", ipv4Address: "192.0.2.50" }],
+    [aRecord("p1", "host1.lan.example", "192.0.2.50")],
+    [{ name: "host1.lan.example", ipv4Address: "192.0.2.50" }],
     3600,
   );
   assertEquals(plans[0].action, "unchanged");
@@ -458,14 +458,14 @@ Deno.test("planDnsARecords: matching record is unchanged", () => {
 Deno.test("planDnsARecords: differing address, TTL or disabled record is updated in place", () => {
   for (
     const existing of [
-      aRecord("p1", "fort.lan.example", "192.0.2.99"),
-      aRecord("p1", "fort.lan.example", "192.0.2.50", 60),
-      aRecord("p1", "fort.lan.example", "192.0.2.50", 3600, false),
+      aRecord("p1", "host1.lan.example", "192.0.2.99"),
+      aRecord("p1", "host1.lan.example", "192.0.2.50", 60),
+      aRecord("p1", "host1.lan.example", "192.0.2.50", 3600, false),
     ]
   ) {
     const [plan] = planDnsARecords(
       [existing],
-      [{ name: "fort.lan.example", ipv4Address: "192.0.2.50" }],
+      [{ name: "host1.lan.example", ipv4Address: "192.0.2.50" }],
       3600,
     );
     assertEquals(plan.action, "update");
@@ -491,8 +491,8 @@ Deno.test("planDnsARecords: differing address, TTL or disabled record is updated
 
 Deno.test("planDnsARecords: name match is case-insensitive", () => {
   const [plan] = planDnsARecords(
-    [aRecord("p1", "FORT.lan.example", "192.0.2.50")],
-    [{ name: "fort.lan.example", ipv4Address: "192.0.2.50" }],
+    [aRecord("p1", "HOST1.lan.example", "192.0.2.50")],
+    [{ name: "host1.lan.example", ipv4Address: "192.0.2.50" }],
     3600,
   );
   assertEquals(plan.action, "unchanged");
@@ -503,12 +503,12 @@ Deno.test("planDnsARecords: other record types for the name do not block A recor
     type: "TXT_RECORD",
     id: "t1",
     enabled: true,
-    domain: "fort.lan.example",
+    domain: "host1.lan.example",
     text: "x",
   };
   const [plan] = planDnsARecords(
     [txt],
-    [{ name: "fort.lan.example", ipv4Address: "192.0.2.50" }],
+    [{ name: "host1.lan.example", ipv4Address: "192.0.2.50" }],
     3600,
   );
   assertEquals(plan.action, "create");

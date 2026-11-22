@@ -2440,7 +2440,7 @@ export const model = {
       arguments: z.object({
         records: z.array(z.object({
           name: z.string().describe(
-            "Fully qualified name, e.g. fort.lan.example",
+            "Fully qualified name, e.g. host1.lan.example",
           ),
           ipv4Address: z.string().describe("IPv4 address, e.g. 192.0.2.50"),
         })).min(1).describe("A records to set"),

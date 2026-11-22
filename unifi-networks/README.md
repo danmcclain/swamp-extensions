@@ -186,8 +186,8 @@ and verified.
 ```bash
 swamp model method run my-unifi setDnsRecords --input '{
   "records": [
-    {"name": "fort.lan.example", "ipv4Address": "192.0.2.50"},
-    {"name": "pve.lan.example", "ipv4Address": "192.0.2.51"}
+    {"name": "host1.lan.example", "ipv4Address": "192.0.2.50"},
+    {"name": "host2.lan.example", "ipv4Address": "192.0.2.51"}
   ]}'
 # add "dryRun": false to apply
 ```

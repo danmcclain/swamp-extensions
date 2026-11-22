@@ -7,10 +7,9 @@ description: >-
   firewall-summary and zone-matrix reports. Also reads switch port VLANs
   (native, tagged, excluded) with wired clients and LLDP neighbours, and device
   state, firmware, last seen, uplink and per-port STP state with a device-status
-  report, and sets
-  network DHCP domain names and local DNS A records, with dry runs and
-  verification. Supports local
-  (per-console key) and cloud (unifi.ui.com key, multi-console fan-out) modes.
+  report. Also sets network DHCP domain names and local DNS A records, with dry
+  runs and verification. Supports local (per-console key) and cloud
+  (unifi.ui.com key, multi-console fan-out) modes.
 repository: "https://github.com/danmcclain/swamp-extensions"
 license: MIT
 models:
