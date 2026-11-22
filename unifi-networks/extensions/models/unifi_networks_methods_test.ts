@@ -69,6 +69,8 @@ interface FakeConsole {
   onDnsWrite?: (stored: Obj) => void;
   /** Classic API lists by path under /proxy/network/api/s/default. */
   classic?: Record<string, Obj[]>;
+  /** Integration API adopted devices. */
+  devices?: Obj[];
 }
 
 function fakeConsole(): FakeConsole {
@@ -148,6 +150,9 @@ function handler(c: FakeConsole) {
     }
     if (m === "GET" && path === `/v1/sites/${SITE}/clients`) {
       return page(c.clients);
+    }
+    if (m === "GET" && path === `/v1/sites/${SITE}/devices`) {
+      return page(c.devices ?? []);
     }
     const polMatch = path.match(
       `^/v1/sites/${SITE}/firewall/policies/([^/]+)$`,
@@ -729,7 +734,86 @@ Deno.test("scanPorts: a classic error rc fails the run", async () => {
   );
 });
 
-Deno.test("upgrade 2026.11.12.1: the latest upgrade reaches the model version and keeps arguments", () => {
+// ── scanDevices ───────────────────────────────────────────────────────────────
+
+Deno.test("scanDevices: joins both APIs read-only and summarises the site", async () => {
+  const c = fakeConsole();
+  c.devices = [
+    {
+      id: "d1",
+      name: "Core",
+      macAddress: "aa:aa",
+      state: "ONLINE",
+      firmwareVersion: "7.1.26",
+      firmwareUpdatable: false,
+    },
+    {
+      id: "d2",
+      name: "UPS",
+      macAddress: "bb:bb",
+      state: "OFFLINE",
+      firmwareVersion: "1.0.9",
+      firmwareUpdatable: true,
+    },
+  ];
+  c.classic = {
+    "stat/device": [
+      {
+        name: "Core",
+        mac: "aa:aa",
+        port_table: [
+          { port_idx: 9, up: true, stp_state: "discarding" },
+          { port_idx: 10, up: true, stp_state: "forwarding" },
+        ],
+      },
+      {
+        name: "UPS",
+        mac: "bb:bb",
+        last_seen: 1_763_700_000,
+        uplink: { uplink_mac: "aa:aa", uplink_remote_port: 9 },
+      },
+    ],
+  };
+  const { context, getWrittenResources } = ctx("scanDevices");
+  const { calls } = await withMockedFetch(
+    handler(c),
+    () => model.methods.scanDevices.execute({}, context as never),
+  );
+  assertEquals(writes(calls), []);
+  const [res] = getWrittenResources();
+  assertEquals([res.specName, res.name], ["siteDevices", "devices-Default"]);
+  assertEquals(res.data.deviceCount, 2);
+  assertEquals(res.data.notOnline, ["UPS"]);
+  assertEquals(res.data.updatable, ["UPS"]);
+  assertEquals(res.data.stpBlocked, [
+    { deviceName: "Core", portIdx: 9, stpState: "discarding" },
+  ]);
+  const ups = (res.data.devices as Obj[])[1];
+  assertEquals(ups.uplink, { deviceMac: "aa:aa", deviceName: "Core", port: 9 });
+  assertEquals(ups.lastSeen, new Date(1_763_700_000 * 1000).toISOString());
+});
+
+Deno.test("scanDevices: a classic error rc fails the run", async () => {
+  const c = fakeConsole();
+  const { context } = ctx("scanDevices");
+  await assertRejects(
+    () =>
+      withMockedFetch(
+        (req) =>
+          new URL(req.url).pathname.endsWith("/stat/device")
+            ? Response.json({
+              meta: { rc: "error", msg: "api.err.NoPermission" },
+              data: [],
+            })
+            : handler(c)(req),
+        () => model.methods.scanDevices.execute({}, context as never),
+      ),
+    Error,
+    "rc=error: api.err.NoPermission",
+  );
+});
+
+Deno.test("upgrade 2026.11.22.1: the latest upgrade reaches the model version and keeps arguments", () => {
   const last = model.upgrades[model.upgrades.length - 1];
   assertEquals(last.toVersion, model.version);
   const args = { mode: "local", host: HOST, apiKey: "k" };

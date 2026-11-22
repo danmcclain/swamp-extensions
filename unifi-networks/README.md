@@ -70,6 +70,7 @@ set `caCert`.
 | `scanClients`      | Connected clients, mapped to VLAN by IP-subnet match                       |
 | `scanWifi`         | WiFi SSIDs, mapped to VLAN via their network reference                     |
 | `scanPorts`        | Switch ports with native/tagged VLANs, wired clients and LLDP neighbours   |
+| `scanDevices`      | Device state, firmware, offered upgrade, last seen, uplink, port STP state |
 | `consoles`         | List consoles visible to a cloud key (cloud mode)                          |
 | `deletePolicy`     | Delete one user-defined firewall policy (verifies it is user-defined)      |
 | `setNetworkDomain` | Set the DHCP domain name on named networks (dry run by default)            |
@@ -89,6 +90,25 @@ one.
 ```bash
 swamp model method run my-unifi scanPorts
 swamp data query 'specName == "siteSwitchPorts"' --select content
+```
+
+### Devices, firmware and STP
+
+`scanDevices` records every adopted device per site so you can track it over
+time. From the integration API (`/v1/sites/<id>/devices`) it takes the device's
+`state` (`ONLINE`, `OFFLINE`, `UPDATING`, ...) and the firmware the controller
+last recorded. That stays known while a device is offline. From the classic
+`stat/device` list it adds `lastSeen`, uptime, the firmware the controller
+offers as an upgrade, the uplink device and port, and each port's spanning tree
+state (`stpState`). The two lists are joined by MAC. It is read-only.
+
+Each site snapshot also has a summary: `notOnline` (device names), `updatable`
+(device names) and `stpBlocked` (every port in a `blocking`, `discarding` or
+`broken` STP state).
+
+```bash
+swamp model method run my-unifi scanDevices
+swamp data query 'specName == "siteDevices"' --select 'content.notOnline'
 ```
 
 ### Setting a network's domain name

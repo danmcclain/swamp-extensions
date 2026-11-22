@@ -1,11 +1,12 @@
 manifestVersion: 1
 name: "@dmc/unifi-networks"
-version: "2026.11.12.1"
+version: "2026.11.22.1"
 description: >-
   Query UniFi Network sites via the official integration API — VLANs, firewall
   zones/policies, connected clients, and WiFi SSIDs, all mapped together — with
   firewall-summary and zone-matrix reports. Also reads switch port VLANs
-  (native, tagged, excluded) with wired clients and LLDP neighbours, and sets
+  (native, tagged, excluded) with wired clients and LLDP neighbours, and device
+  state, firmware, last seen, uplink and per-port STP state, and sets
   network DHCP domain names and local DNS A records, with dry runs and
   verification. Supports local
   (per-console key) and cloud (unifi.ui.com key, multi-console fan-out) modes.

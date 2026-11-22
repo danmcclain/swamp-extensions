@@ -297,6 +297,72 @@ const SiteSwitchPortsSchema = z.object({
   ports: z.array(SwitchPortSchema),
 });
 
+const DevicePortSchema = z.object({
+  portIdx: z.number(),
+  portName: z.string().optional(),
+  up: z.boolean(),
+  speedMbps: z.number().optional(),
+  stpState: z.string().optional().describe(
+    "Spanning tree state the device reports: forwarding, blocking, " +
+      "discarding, learning, disabled, ...",
+  ),
+  stpPathCost: z.number().optional(),
+});
+
+const DeviceSchema = z.object({
+  id: z.string().optional().describe("Integration API device id"),
+  name: z.string(),
+  mac: z.string(),
+  model: z.string().optional(),
+  ipAddress: z.string().optional(),
+  state: z.string().optional().describe(
+    "ONLINE | OFFLINE | UPDATING | CONNECTION_INTERRUPTED | ISOLATED | ...",
+  ),
+  firmwareVersion: z.string().optional().describe(
+    "Firmware the controller last recorded for the device",
+  ),
+  firmwareUpdatable: z.boolean().optional(),
+  upgradeToFirmware: z.string().optional().describe(
+    "Firmware the controller offers as an upgrade, when one is available",
+  ),
+  lastSeen: z.string().optional().describe(
+    "When the controller last heard from the device (ISO 8601)",
+  ),
+  uptimeSeconds: z.number().optional(),
+  uplink: z.object({
+    deviceMac: z.string(),
+    deviceName: z.string().optional(),
+    port: z.number().optional().describe("Port on the uplink device"),
+  }).optional(),
+  stpBlockedPorts: z.array(z.number()).describe(
+    "Ports this device reports as STP blocking, discarding or broken",
+  ),
+  ports: z.array(DevicePortSchema),
+});
+
+const SiteDevicesSchema = z.object({
+  scannedAt: z.string(),
+  mode: z.enum(["local", "cloud"]),
+  target: z.string(),
+  consoleId: z.string().optional(),
+  consoleShortname: z.string().optional(),
+  siteId: z.string(),
+  siteName: z.string(),
+  deviceCount: z.number(),
+  notOnline: z.array(z.string()).describe(
+    "Names of devices whose state is not ONLINE",
+  ),
+  updatable: z.array(z.string()).describe(
+    "Names of devices with a firmware update available",
+  ),
+  stpBlocked: z.array(z.object({
+    deviceName: z.string(),
+    portIdx: z.number(),
+    stpState: z.string(),
+  })).describe("Every STP-blocked port on the site"),
+  devices: z.array(DeviceSchema),
+});
+
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 interface RequestOptions {
@@ -1245,6 +1311,103 @@ export function mapSwitchPorts(
   return out;
 }
 
+// ── devices (integration API + classic controller API) ───────────────────────
+
+const STP_BLOCKED_STATES = new Set(["blocking", "discarding", "broken"]);
+
+const normMac = (m: unknown) =>
+  typeof m === "string" ? m.toLowerCase() : undefined;
+
+/**
+ * Join adopted devices from the integration API (state, firmware) with the
+ * classic stat/device list (last seen, uptime, offered upgrade, uplink and
+ * per-port STP state), matched by MAC. A device found in only one list is
+ * still reported, with what that list knows.
+ */
+export function mapDevices(
+  integration: Obj[],
+  classic: Obj[],
+): z.infer<typeof DeviceSchema>[] {
+  const classicByMac = new Map<string, Obj>();
+  for (const d of classic) {
+    const mac = normMac(d.mac);
+    if (mac) classicByMac.set(mac, d);
+  }
+  const nameByMac = new Map<string, string>();
+  for (const d of [...classic, ...integration]) {
+    const mac = normMac(d.mac ?? d.macAddress);
+    const name = d.name as string | undefined;
+    if (mac && name) nameByMac.set(mac, name);
+  }
+
+  const out: z.infer<typeof DeviceSchema>[] = [];
+  const seen = new Set<string>();
+  const build = (i: Obj | undefined, c: Obj | undefined) => {
+    const mac = (normMac(i?.macAddress) ?? normMac(c?.mac)) as string;
+    seen.add(mac);
+    const table = (Array.isArray(c?.port_table) ? c.port_table : []) as Obj[];
+    const ports = table.map((p) => ({
+      portIdx: p.port_idx as number,
+      portName: p.name as string | undefined,
+      up: p.up === true,
+      speedMbps: typeof p.speed === "number" ? p.speed : undefined,
+      stpState: typeof p.stp_state === "string" ? p.stp_state : undefined,
+      stpPathCost: typeof p.stp_pathcost === "number"
+        ? p.stp_pathcost
+        : undefined,
+    }));
+    const up = c?.uplink as Obj | undefined;
+    const upMac = normMac(up?.uplink_mac);
+    const lastSeen = typeof c?.last_seen === "number"
+      ? new Date(c.last_seen * 1000).toISOString()
+      : undefined;
+    const current = (i?.firmwareVersion ?? c?.version) as string | undefined;
+    const offered = c?.upgrade_to_firmware;
+    out.push({
+      id: i?.id as string | undefined,
+      name: (i?.name ?? c?.name ?? mac) as string,
+      mac,
+      model: (i?.model ?? c?.model) as string | undefined,
+      ipAddress: (i?.ipAddress ?? c?.ip) as string | undefined,
+      state: i?.state as string | undefined,
+      firmwareVersion: current,
+      firmwareUpdatable: typeof i?.firmwareUpdatable === "boolean"
+        ? i.firmwareUpdatable
+        : typeof c?.upgradable === "boolean"
+        ? c.upgradable
+        : undefined,
+      upgradeToFirmware:
+        typeof offered === "string" && offered !== "" && offered !== current
+          ? offered
+          : undefined,
+      lastSeen,
+      uptimeSeconds: typeof c?.uptime === "number" ? c.uptime : undefined,
+      uplink: upMac
+        ? {
+          deviceMac: upMac,
+          deviceName: nameByMac.get(upMac),
+          port: typeof up?.uplink_remote_port === "number"
+            ? up.uplink_remote_port
+            : undefined,
+        }
+        : undefined,
+      stpBlockedPorts: ports
+        .filter((p) => p.stpState && STP_BLOCKED_STATES.has(p.stpState))
+        .map((p) => p.portIdx),
+      ports,
+    });
+  };
+
+  for (const i of integration) {
+    build(i, classicByMac.get(normMac(i.macAddress) ?? ""));
+  }
+  for (const c of classic) {
+    const mac = normMac(c.mac);
+    if (mac && !seen.has(mac)) build(undefined, c);
+  }
+  return out;
+}
+
 /** Classic API base for a target: the integration base with /api in its place. */
 export function classicBase(integrationBase: string): string {
   return integrationBase.replace(/\/integration$/, "/api");
@@ -1397,7 +1560,7 @@ interface Ctx {
 
 export const model = {
   type: "@dmc/unifi-networks",
-  version: "2026.11.12.1",
+  version: "2026.11.22.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1415,6 +1578,13 @@ export const model = {
       toVersion: "2026.11.12.1",
       description:
         "Adds scanPorts: switch port VLANs from the classic controller API.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.22.1",
+      description:
+        "Adds scanDevices: device state, firmware, last seen, uplink and " +
+        "per-port STP state.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1458,6 +1628,14 @@ export const model = {
       schema: SiteSwitchPortsSchema,
       lifetime: "infinite",
       garbageCollection: 10,
+    },
+    siteDevices: {
+      description:
+        "Adopted UniFi devices per site with state, last-recorded firmware, " +
+        "offered upgrade, last seen, uplink and per-port STP state",
+      schema: SiteDevicesSchema,
+      lifetime: "infinite",
+      garbageCollection: 400,
     },
     networkDomainChange: {
       description:
@@ -1925,6 +2103,100 @@ export const model = {
 
         context.logger.info("{method}: wrote {count} site snapshot(s)", {
           method: "scanPorts",
+          count: dataHandles.length,
+        });
+        return { dataHandles };
+      },
+    },
+
+    scanDevices: {
+      description:
+        "Fetch every adopted device per site: state, the firmware the " +
+        "controller last recorded, any offered upgrade, when it was last " +
+        "seen, its uplink, and each port's spanning tree (STP) state, with " +
+        "a site summary of devices not online, devices with updates and " +
+        "STP-blocked ports. Joins the integration API with the classic " +
+        "controller API (same key) by MAC. Read-only. Same mode/fan-out " +
+        "rules as scan.",
+      arguments: z.object({}),
+      execute: async (_args: Record<string, never>, context: Ctx) => {
+        const g = context.globalArgs;
+        const targets = await resolveTargets(g);
+        context.logger.info("{method}: scanning {count} console(s)", {
+          method: "scanDevices",
+          count: targets.length,
+        });
+        const disambiguate = targets.length > 1;
+        const dataHandles = [];
+
+        for (const t of targets) {
+          const sites = await fetchAllPages(
+            t.base,
+            "/v1/sites",
+            g.apiKey,
+            t.caCert,
+          );
+          for (const site of sites) {
+            const siteId = site.id as string;
+            const siteName = (site.name as string) ?? siteId;
+            const ref = site.internalReference as string | undefined;
+            if (!ref) {
+              throw new Error(
+                `Site ${siteName} (${siteId}) has no internalReference, so ` +
+                  "its classic API path is unknown",
+              );
+            }
+            const api = `${classicBase(t.base)}/s/${encodeURIComponent(ref)}`;
+            const [integration, classic] = await Promise.all([
+              fetchAllPages(
+                t.base,
+                `/v1/sites/${siteId}/devices`,
+                g.apiKey,
+                t.caCert,
+              ),
+              classicList(`${api}/stat/device`, g.apiKey, t.caCert),
+            ]);
+            const devices = mapDevices(integration, classic);
+            // Its own data name ("devices-<site>"), not the bare site name the
+            // other scans share: the version line is the device history, so
+            // it must not interleave with other specs or share their (shorter)
+            // retention.
+            const handle = await context.writeResource(
+              "siteDevices",
+              `devices-${instanceName(t, siteName, disambiguate)}`,
+              {
+                scannedAt: new Date().toISOString(),
+                mode: g.mode,
+                target: t.target,
+                consoleId: t.consoleId,
+                consoleShortname: t.consoleShortname,
+                siteId,
+                siteName,
+                deviceCount: devices.length,
+                notOnline: devices
+                  .filter((d) => d.state !== undefined && d.state !== "ONLINE")
+                  .map((d) => d.name),
+                updatable: devices
+                  .filter((d) => d.firmwareUpdatable === true)
+                  .map((d) => d.name),
+                stpBlocked: devices.flatMap((d) =>
+                  d.ports
+                    .filter((p) => d.stpBlockedPorts.includes(p.portIdx))
+                    .map((p) => ({
+                      deviceName: d.name,
+                      portIdx: p.portIdx,
+                      stpState: p.stpState as string,
+                    }))
+                ),
+                devices,
+              },
+            );
+            dataHandles.push(handle);
+          }
+        }
+
+        context.logger.info("{method}: wrote {count} site snapshot(s)", {
+          method: "scanDevices",
           count: dataHandles.length,
         });
         return { dataHandles };
