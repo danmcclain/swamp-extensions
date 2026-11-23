@@ -71,6 +71,7 @@ set `caCert`.
 | `scanWifi`         | WiFi SSIDs, mapped to VLAN via their network reference                     |
 | `scanPorts`        | Switch ports with native/tagged VLANs, wired clients and LLDP neighbours   |
 | `scanDevices`      | Device state, firmware, offered upgrade, last seen, uplink, port STP state |
+| `scanDns`          | Local DNS records (A, AAAA, CNAME, MX, TXT, SRV, forward domains)          |
 | `consoles`         | List consoles visible to a cloud key (cloud mode)                          |
 | `deletePolicy`     | Delete one user-defined firewall policy (verifies it is user-defined)      |
 | `setNetworkDomain` | Set the DHCP domain name on named networks (dry run by default)            |
@@ -115,6 +116,27 @@ Each run writes a new version of the site's `siteDevices` data, and swamp keeps
 the last 400 versions (about a year of daily runs). That version history is the
 device history: list it with `swamp data versions <model> devices-<site>`. Run
 `scanDevices` from a scheduled workflow on `swamp serve` to build it up.
+
+### Local DNS records inventory
+
+`scanDns` records every local DNS record (UniFi DNS policy) per site from
+`/v1/sites/<id>/dns/policies`: A, AAAA, CNAME, MX, TXT, SRV and forward domains.
+Each record has its `type`, `domain`, `value` (the address, target domain, mail
+server, text, `service.protocol server:port`, or the DNS server a forward domain
+goes to), `ttlSeconds`, `priority` and `weight` where the type has them,
+`enabled`, and the policy `origin`. It is read-only.
+
+Names the gateway registers from DHCP leases are not DNS policies, so they are
+not in this list.
+
+```bash
+swamp model method run my-unifi scanDns
+swamp data query 'specName == "siteDnsRecords"' --select 'content.records'
+```
+
+As with `scanDevices`, each run writes a new version of the site's `dns-<site>`
+data, and swamp keeps the last 400. List the history with
+`swamp data versions <model> dns-<site>`.
 
 ### Setting a network's domain name
 
@@ -209,6 +231,13 @@ After `scanDevices`:
   first, and the changes since the previous scan: state, firmware, a newly
   offered upgrade, uplink, STP-blocked ports, and devices added or removed. It
   compares the new `siteDevices` version with the one before it.
+
+After `scanDns`:
+
+- **`@dmc/unifi-dns-records`** — a table of every local DNS record (domain,
+  type, value, TTL, priority, enabled), sorted by domain, and the changes since
+  the previous scan: records added, removed, or changed in domain, value, TTL,
+  priority, weight or enabled flag. Records are matched by policy id.
 
 Add a report to a model definition's `reports.require` to run it, for example:
 
