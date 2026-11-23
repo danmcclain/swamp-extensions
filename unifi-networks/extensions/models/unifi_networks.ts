@@ -363,6 +363,38 @@ const SiteDevicesSchema = z.object({
   devices: z.array(DeviceSchema),
 });
 
+const DnsRecordSchema = z.object({
+  id: z.string(),
+  type: z.string().describe(
+    "A_RECORD | AAAA_RECORD | CNAME_RECORD | MX_RECORD | TXT_RECORD | " +
+      "SRV_RECORD | FORWARD_DOMAIN",
+  ),
+  domain: z.string(),
+  value: z.string().describe(
+    "What the record points to, as one string: the address, target domain, " +
+      "mail server, text, 'service.protocol server:port', or the DNS server " +
+      "a forward domain goes to",
+  ),
+  ttlSeconds: z.number().optional(),
+  priority: z.number().optional().describe("MX and SRV"),
+  weight: z.number().optional().describe("SRV"),
+  enabled: z.boolean(),
+  origin: z.string().optional().describe("Policy metadata origin"),
+});
+
+const SiteDnsRecordsSchema = z.object({
+  scannedAt: z.string(),
+  mode: z.enum(["local", "cloud"]),
+  target: z.string(),
+  consoleId: z.string().optional(),
+  consoleShortname: z.string().optional(),
+  siteId: z.string(),
+  siteName: z.string(),
+  recordCount: z.number(),
+  disabledCount: z.number(),
+  records: z.array(DnsRecordSchema).describe("Sorted by domain, then type"),
+});
+
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 interface RequestOptions {
@@ -1431,6 +1463,65 @@ async function classicList(
   return Array.isArray(r.data) ? r.data as Obj[] : [];
 }
 
+// ── DNS policies ─────────────────────────────────────────────────────────────
+
+const num = (v: unknown) => (typeof v === "number" ? v : undefined);
+const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+
+/** The value a DNS policy points to, as one string, per its type. */
+function dnsValue(p: Obj): string {
+  switch (p.type) {
+    case "A_RECORD":
+      return str(p.ipv4Address) ?? "";
+    case "AAAA_RECORD":
+      return str(p.ipv6Address) ?? "";
+    case "CNAME_RECORD":
+      return str(p.targetDomain) ?? "";
+    case "MX_RECORD":
+      return str(p.mailServerDomain) ?? "";
+    case "TXT_RECORD":
+      return str(p.text) ?? "";
+    case "SRV_RECORD": {
+      const svc = [str(p.service), str(p.protocol)].filter(Boolean).join(".");
+      const port = num(p.port);
+      const target = `${str(p.serverDomain) ?? ""}${
+        port !== undefined ? `:${port}` : ""
+      }`;
+      return svc ? `${svc} ${target}` : target;
+    }
+    case "FORWARD_DOMAIN":
+      return str(p.ipAddress) ?? "";
+    default:
+      return "";
+  }
+}
+
+/**
+ * DNS policies from the integration API, one row per policy, with the
+ * type-specific target folded into `value`. Sorted by domain, then type.
+ */
+export function mapDnsRecords(
+  raw: Obj[],
+): z.infer<typeof DnsRecordSchema>[] {
+  return raw
+    .filter((p) => typeof p.id === "string")
+    .map((p) => ({
+      id: p.id as string,
+      type: str(p.type) ?? "UNKNOWN",
+      domain: str(p.domain) ?? "",
+      value: dnsValue(p),
+      ttlSeconds: num(p.ttlSeconds),
+      priority: num(p.priority),
+      weight: num(p.weight),
+      enabled: p.enabled === true,
+      origin: str((p.metadata as Obj | undefined)?.origin),
+    }))
+    .sort((a, b) =>
+      a.domain.localeCompare(b.domain) || a.type.localeCompare(b.type) ||
+      a.value.localeCompare(b.value)
+    );
+}
+
 /** A console to scan: its proxy base URL plus identity for labelling output. */
 interface Target {
   base: string;
@@ -1584,7 +1675,7 @@ export const model = {
       toVersion: "2026.11.22.1",
       description:
         "Adds scanDevices: device state, firmware, last seen, uplink and " +
-        "per-port STP state.",
+        "per-port STP state, and scanDns: local DNS records.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1634,6 +1725,14 @@ export const model = {
         "Adopted UniFi devices per site with state, last-recorded firmware, " +
         "offered upgrade, last seen, uplink and per-port STP state",
       schema: SiteDevicesSchema,
+      lifetime: "infinite",
+      garbageCollection: 400,
+    },
+    siteDnsRecords: {
+      description:
+        "Local DNS records (UniFi DNS policies) per site: A, AAAA, CNAME, " +
+        "MX, TXT, SRV and forward domains, with TTL and enabled flag",
+      schema: SiteDnsRecordsSchema,
       lifetime: "infinite",
       garbageCollection: 400,
     },
@@ -2204,6 +2303,72 @@ export const model = {
 
         context.logger.info("{method}: wrote {count} site snapshot(s)", {
           method: "scanDevices",
+          count: dataHandles.length,
+        });
+        return { dataHandles };
+      },
+    },
+
+    scanDns: {
+      description:
+        "Fetch every local DNS record (UniFi DNS policy) per site: A, AAAA, " +
+        "CNAME, MX, TXT, SRV and forward domains, with TTL, enabled flag " +
+        "and origin. Names the gateway registers from DHCP leases are not " +
+        "DNS policies and are not included. Read-only. Same mode/fan-out " +
+        "rules as scan.",
+      arguments: z.object({}),
+      execute: async (_args: Record<string, never>, context: Ctx) => {
+        const g = context.globalArgs;
+        const targets = await resolveTargets(g);
+        context.logger.info("{method}: scanning {count} console(s)", {
+          method: "scanDns",
+          count: targets.length,
+        });
+        const disambiguate = targets.length > 1;
+        const dataHandles = [];
+
+        for (const t of targets) {
+          const sites = await fetchAllPages(
+            t.base,
+            "/v1/sites",
+            g.apiKey,
+            t.caCert,
+          );
+          for (const site of sites) {
+            const siteId = site.id as string;
+            const siteName = (site.name as string) ?? siteId;
+            const records = mapDnsRecords(
+              await fetchAllPages(
+                t.base,
+                `/v1/sites/${siteId}/dns/policies`,
+                g.apiKey,
+                t.caCert,
+              ),
+            );
+            // Its own data name ("dns-<site>"), for the same reason as
+            // siteDevices: the version line is the record history.
+            const handle = await context.writeResource(
+              "siteDnsRecords",
+              `dns-${instanceName(t, siteName, disambiguate)}`,
+              {
+                scannedAt: new Date().toISOString(),
+                mode: g.mode,
+                target: t.target,
+                consoleId: t.consoleId,
+                consoleShortname: t.consoleShortname,
+                siteId,
+                siteName,
+                recordCount: records.length,
+                disabledCount: records.filter((r) => !r.enabled).length,
+                records,
+              },
+            );
+            dataHandles.push(handle);
+          }
+        }
+
+        context.logger.info("{method}: wrote {count} site snapshot(s)", {
+          method: "scanDns",
           count: dataHandles.length,
         });
         return { dataHandles };

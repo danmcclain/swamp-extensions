@@ -819,3 +819,51 @@ Deno.test("upgrade 2026.11.22.1: the latest upgrade reaches the model version an
   const args = { mode: "local", host: HOST, apiKey: "k" };
   assertEquals(last.upgradeAttributes(args), args);
 });
+
+// ── scanDns ───────────────────────────────────────────────────────────────────
+
+Deno.test("scanDns: records every DNS policy read-only, sorted, disabled counted", async () => {
+  const c = fakeConsole();
+  c.dns.set("p2", {
+    id: "p2",
+    type: "CNAME_RECORD",
+    domain: "www.lan.example",
+    targetDomain: "host1.lan.example",
+    ttlSeconds: 300,
+    enabled: false,
+  });
+  c.dns.set("p1", {
+    id: "p1",
+    type: "A_RECORD",
+    domain: "host1.lan.example",
+    ipv4Address: "192.0.2.50",
+    ttlSeconds: 3600,
+    enabled: true,
+  });
+  const { context, getWrittenResources } = ctx("scanDns");
+  const { calls } = await withMockedFetch(
+    handler(c),
+    () => model.methods.scanDns.execute({}, context as never),
+  );
+  assertEquals(writes(calls), []);
+  const [res] = getWrittenResources();
+  assertEquals([res.specName, res.name], ["siteDnsRecords", "dns-Default"]);
+  assertEquals([res.data.recordCount, res.data.disabledCount], [2, 1]);
+  assertEquals(
+    (res.data.records as Obj[]).map((r) => [r.domain, r.value]),
+    [
+      ["host1.lan.example", "192.0.2.50"],
+      ["www.lan.example", "host1.lan.example"],
+    ],
+  );
+});
+
+Deno.test("scanDns: an empty site still writes a snapshot", async () => {
+  const { context, getWrittenResources } = ctx("scanDns");
+  await withMockedFetch(
+    handler(fakeConsole()),
+    () => model.methods.scanDns.execute({}, context as never),
+  );
+  const [res] = getWrittenResources();
+  assertEquals([res.data.recordCount, res.data.records], [0, []]);
+});
