@@ -1378,7 +1378,10 @@ Deno.test("reach ssh: privileges declares the default update as one sudo argv wi
   assertEquals(written.length, 1);
   assertEquals(written[0].specName, "privileges");
   assertEquals(written[0].data, {
-    commands: [{ argv: ["/usr/bin/update"], env: { PHS_SILENT: "1" } }],
+    commands: [
+      { argv: ["/usr/bin/update"], env: { PHS_SILENT: "1" } },
+      { argv: ["cat", "/usr/bin/update"] },
+    ],
     helpers: [],
     remoteCode: true,
     remoteSources: [
@@ -1400,7 +1403,10 @@ Deno.test("reach ssh: privileges leaves env out when the update command has no e
   const data = getWrittenResources()[0].data as {
     commands: Array<Record<string, unknown>>;
   };
-  assertEquals(data.commands, [{ argv: ["/usr/bin/update"] }]);
+  assertEquals(data.commands, [
+    { argv: ["/usr/bin/update"] },
+    { argv: ["cat", "/usr/bin/update"] },
+  ]);
   assertEquals("env" in data.commands[0], false);
 });
 
@@ -2034,4 +2040,69 @@ Deno.test("reach ssh: safeUpdate snapshot:false records a curl error as failed, 
   );
   assertStringIncludes(error?.message ?? "", "curl");
   assertEquals(result?.outcome, "failed");
+});
+
+Deno.test("reach ssh: an updater the login cannot read (0711) is read through sudo -n cat, the declared grant", async () => {
+  if (Deno.uid?.() === 0) return; // root reads any file: the sudo path is never taken
+  const dir = await Deno.makeTempDir();
+  try {
+    const bin = `${dir}/update`;
+    await Deno.writeTextFile(bin, GENERATED_HELPER + "\n");
+    await Deno.writeTextFile(`${dir}/copy`, GENERATED_HELPER + "\n");
+    await Deno.chmod(bin, 0o111); // like 0711: runnable, not readable by the login
+    // A stub sudo: `sudo -n <abs cat> <bin>` prints the root-readable copy; it logs its argv.
+    await Deno.writeTextFile(
+      `${dir}/sudo`,
+      `#!/bin/sh\necho "$*" >> "${dir}/sudo.log"\n[ "$1" = -n ] && [ "$2" = "$(command -v cat)" ] && [ "$3" = "${bin}" ] && [ "$SUDO_OK" = 1 ] && exec cat "${dir}/copy"\nexit 1\n`,
+    );
+    await Deno.chmod(`${dir}/sudo`, 0o755);
+    const sh = async (script: string, ok: boolean) => {
+      const out = await new Deno.Command("sh", {
+        args: ["-c", script],
+        env: { PATH: `${dir}:${Deno.env.get("PATH")}`, SUDO_OK: ok ? "1" : "0" },
+        stdout: "piped",
+      }).output();
+      return new TextDecoder().decode(out.stdout);
+    };
+    assertEquals(execFormatRefusal(bin, await sh(execFormatProbeShell(bin), true)), null);
+    assertEquals(
+      updateScriptUrls(bin, await sh(updateScriptProbeShell(bin), true)),
+      { ok: true, urls: [CORE_UPDATE, FORGEJO_CT], skipped: [] },
+    );
+    const log = await Deno.readTextFile(`${dir}/sudo.log`);
+    assertStringIncludes(log, `-n ${(await sh("command -v cat", true)).trim()} ${bin}`);
+    // Without the grant (sudo refuses): a clear refusal, not "no #! line".
+    const refused = execFormatRefusal(bin, await sh(execFormatProbeShell(bin), false)) ?? "";
+    assertStringIncludes(refused, "also not through sudo");
+    assertStringIncludes(refused, "provisionAccess");
+    const urls = updateScriptUrls(bin, await sh(updateScriptProbeShell(bin), false));
+    assertEquals(urls.ok, false);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("reach ssh: a readable updater is read with plain cat, never through sudo", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    const bin = `${dir}/update`;
+    await Deno.writeTextFile(bin, "#!/bin/sh\necho hi\n");
+    await Deno.writeTextFile(`${dir}/sudo`, `#!/bin/sh\necho called > "${dir}/sudo.log"\nexit 1\n`);
+    await Deno.chmod(`${dir}/sudo`, 0o755);
+    const out = await new Deno.Command("sh", {
+      args: ["-c", execFormatProbeShell(bin)],
+      env: { PATH: `${dir}:${Deno.env.get("PATH")}` },
+      stdout: "piped",
+    }).output();
+    assertEquals(execFormatRefusal(bin, new TextDecoder().decode(out.stdout)), null);
+    let called = true;
+    try {
+      await Deno.stat(`${dir}/sudo.log`);
+    } catch {
+      called = false;
+    }
+    assertEquals(called, false);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });

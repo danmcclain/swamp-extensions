@@ -204,11 +204,17 @@ update detection), optional `healthUrl` (end-to-end HTTP readiness probe).
   one
 - `privileges` — read-only, runs nothing: declares the root commands that the
   update needs, for the `@dmc/patch` plug-in contract. With `reach: ssh` it
-  declares the one `sudo` argv, with `remoteCode: true` and
+  declares two `sudo` argvs: the update, and the read-only `cat <update bin>`,
+  with `remoteCode: true` and
   `remoteSources: ["community-scripts/ProxmoxVE@main", "community-scripts/core@main"]`
-  (the helper fetches and runs code from both repositories as root). With
-  `reach: pct` it refuses: `pct` runs every command as root on the node, and no
-  sudo grant can limit that.
+  (the helper fetches and runs code from both repositories as root). The
+  pre-update checks (the bin's `#!` line, the URLs it fetches) read the bin
+  through that `cat` grant when the login cannot read it: the current
+  community-scripts helper writes `/usr/bin/update` as `0711`. Since 2026.11.27.1;
+  re-run `@dmc/patch provisionAccess` on community-script CTs to get the grant
+  (until then such an updater is refused with "could not read … also not through
+  sudo"). With `reach: pct` it refuses: `pct` runs every command as root on the
+  node, and no sudo grant can limit that.
 
 **Pre-flight checks** (run before the mutating methods; `status`, `discoverApp`,
 `previewInstall` and `checkUpdate` have none):

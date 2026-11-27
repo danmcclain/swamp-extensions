@@ -1240,15 +1240,31 @@ export function sudoUpdateShell(
  */
 export function execFormatProbeShell(bin: string): string {
   const q = shSingleQuote(bin);
-  return `if [ -f ${q} ]; then printf 'HEAD='; head -c 4 ${q} | od -An -tx1 | tr -d ' \\n'; echo; else echo MISSING; fi`;
+  return `${
+    readBinShell(bin)
+  }; if [ -f ${q} ]; then if $RD ${q} >/dev/null 2>&1; then printf 'HEAD='; $RD ${q} 2>/dev/null | head -c 4 | od -An -tx1 | tr -d ' \\n'; echo; else echo UNREADABLE; fi; else echo MISSING; fi`;
+}
+
+/**
+ * Shell text that sets RD to the command that reads the update's bin: `cat` when the login can
+ * read it (or is root), else `sudo -n <cat>` with cat's absolute path, the exact argv that
+ * privileges() declares (`cat <bin>`). The current community-scripts helper writes
+ * /usr/bin/update as 0711, which the patch login can run but not read.
+ */
+export function readBinShell(bin: string): string {
+  const q = shSingleQuote(bin);
+  return `if [ -r ${q} ] || [ "$(id -u)" = 0 ]; then RD=cat; else RD="sudo -n $(command -v cat)"; fi`;
 }
 
 /** The verdict on execFormatProbeShell's output: null when execve can run the bin, else why
  *  not (fail closed: output that does not parse is a refusal). */
 export function execFormatRefusal(bin: string, out: string): string | null {
   if (/^MISSING$/m.test(out)) return `${bin} is not a file on ctHost`;
+  if (/^UNREADABLE$/m.test(out)) {
+    return `could not read ${bin} on ctHost, also not through sudo: re-run @dmc/patch provisionAccess for this host, so the login gets the "cat ${bin}" grant that privileges() declares`;
+  }
   const m = out.match(/^HEAD=([0-9a-f]*)$/m);
-  if (!m) return `could not read the start of ${bin} on ctHost`;
+  if (!m || m[1] === "") return `could not read the start of ${bin} on ctHost`;
   if (m[1].startsWith("2321") || m[1] === "7f454c46") return null;
   return `${bin} has no #! line and is not an ELF binary, so sudo cannot run it through env (busybox env on Alpine gives "Exec format error"); make "#!/bin/sh" its first line on ctHost`;
 }
@@ -1262,19 +1278,24 @@ const UPDATE_SCRIPT_MAX_BYTES = 65536;
 const LITERAL_URL = /^https?:\/\/[A-Za-z0-9._~:/?#@!&+,;=%-]+$/;
 
 /**
- * The shell text that prints the update's bin for the pre-update URL check, as the login,
- * with no root: each line with `L:` in front, or `ELF` for a binary, `UNREADABLE` or
- * `TOOBIG` (over UPDATE_SCRIPT_MAX_BYTES), and `SCRIPT-END` last. updateScriptUrls reads it.
+ * The shell text that prints the update's bin for the pre-update URL check: each line with
+ * `L:` in front, or `ELF` for a binary, `UNREADABLE` or `TOOBIG` (over
+ * UPDATE_SCRIPT_MAX_BYTES), and `SCRIPT-END` last. updateScriptUrls reads it. The bin is read
+ * as the login, or through the declared `cat <bin>` grant when the login cannot read it
+ * (readBinShell); nothing else runs as root.
  */
 export function updateScriptProbeShell(bin: string): string {
   const q = shSingleQuote(bin);
   return [
-    `H=$(head -c 4 ${q} 2>/dev/null | od -An -tx1 | tr -d ' \\n')`,
-    `N=$(wc -c < ${q} 2>/dev/null | tr -d ' ')`,
+    readBinShell(bin),
+    `if $RD ${q} >/dev/null 2>&1; then`,
+    `  H=$($RD ${q} 2>/dev/null | head -c 4 | od -An -tx1 | tr -d ' \\n')`,
+    `  N=$($RD ${q} 2>/dev/null | wc -c | tr -d ' ')`,
+    `else H=""; N=""; fi`,
     `if [ "$H" = 7f454c46 ]; then echo ELF`,
     `elif [ -z "$N" ]; then echo UNREADABLE`,
     `elif [ "$N" -gt ${UPDATE_SCRIPT_MAX_BYTES} ]; then echo TOOBIG`,
-    `else sed 's/^/L:/' ${q}; echo; fi`,
+    `else $RD ${q} | sed 's/^/L:/'; echo; fi`,
     `echo SCRIPT-END`,
   ].join("\n");
 }
@@ -2688,15 +2709,18 @@ export const model = {
         const command = Object.keys(u.env).length > 0
           ? { argv: u.argv, env: u.env }
           : { argv: u.argv };
+        // Read-only: the pre-update checks read the bin (its #! line, the URLs it fetches)
+        // through this exact grant when the login cannot read it (0711, readBinShell).
+        const read = { argv: ["cat", u.argv[0]] };
         const handle = await context.writeResource("privileges", "privileges", {
-          commands: [command],
+          commands: [command, read],
           helpers: [],
           remoteCode: true,
           remoteSources: [...COMMUNITY_SCRIPTS_SOURCES],
         });
         context.logger.info(
-          "Declared one sudo command for {host}: {argv}",
-          { host: ga.ctHost, argv: u.argv.join(" ") },
+          "Declared two sudo commands for {host}: {argv}, and cat {bin} (read-only)",
+          { host: ga.ctHost, argv: u.argv.join(" "), bin: u.argv[0] },
         );
         return { dataHandles: [handle] };
       },
