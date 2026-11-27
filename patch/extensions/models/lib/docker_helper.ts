@@ -298,14 +298,16 @@ compose() {
   fi
 }
 
-# One line per container of the project: id|configImage|imageId|state|health.
+# One line per container of the project: id|configImage|imageId|state|<State as JSON>.
+# The health is read from the JSON by the caller: Docker 29 renders the template from a map,
+# where a test of .State.Health fails for a container without a healthcheck.
 inspect_project() {
   local ids id
   ids="$(compose ps -q)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     [[ $id =~ ^[0-9a-f]{12,64}$ ]] || die "docker printed a container id that is not hex"
-    docker inspect "$id" --format '{{.Id}}|{{.Config.Image}}|{{.Image}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
+    docker inspect "$id" --format '{{.Id}}|{{.Config.Image}}|{{.Image}}|{{.State.Status}}|{{json .State}}'
   done <<<"$ids"
 }
 

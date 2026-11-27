@@ -10944,3 +10944,42 @@ Deno.test("evalHealth: a proxmox-cluster check runs from the swamp host for the 
     { label: "pve seen", ok: false, detail: "node pve is offline" },
   ]);
 });
+
+// --- docker inspect health (Docker 29) -----------------------------------------
+
+Deno.test("inspectHealth: reads Health.Status from the State JSON, none without a healthcheck", () => {
+  assertEquals(fleet.inspectHealth('{"Status":"running","Health":{"Status":"healthy","FailingStreak":0}}'), "healthy");
+  assertEquals(fleet.inspectHealth('{"Status":"running","Health":{"Status":"starting"}}'), "starting");
+  // Docker 29: no healthcheck = no Health key (older Docker: Health null).
+  assertEquals(fleet.inspectHealth('{"Status":"running","Running":true}'), "none");
+  assertEquals(fleet.inspectHealth('{"Status":"running","Health":null}'), "none");
+  // A helper installed before this release prints the one word.
+  assertEquals(fleet.inspectHealth("healthy"), "healthy");
+  assertEquals(fleet.inspectHealth("none"), "none");
+  // Unreadable JSON is never healthy.
+  assertEquals(fleet.inspectHealth("{not json"), "unknown");
+});
+
+Deno.test("parseInspectRows: a State JSON last field, with | inside it, gives one row", () => {
+  const rows = fleet.parseInspectRows(
+    'warning: something\n' +
+      'abc123def456|traefik:v3|sha256:1111|running|{"Status":"running","Error":"a|b"}\n' +
+      'def456abc123|tsidp:latest|sha256:2222|running|{"Status":"running","Health":{"Status":"unhealthy"}}\n',
+  );
+  assertEquals(rows, [
+    { ref: "traefik:v3", imageId: "sha256:1111", status: "running", health: "none" },
+    { ref: "tsidp:latest", imageId: "sha256:2222", status: "running", health: "unhealthy" },
+  ]);
+  // The old helper's five plain fields still parse.
+  assertEquals(fleet.parseInspectRows("abc123def456|nginx:1|sha256:aa|running|none\n")[0].health, "none");
+});
+
+Deno.test("docker inspect: neither the helper nor the root path uses {{if .State.Health}}", async () => {
+  const helper = await Deno.readTextFile(new URL("./lib/docker_helper.ts", import.meta.url));
+  const fleetSrc = await Deno.readTextFile(new URL("./patch_fleet.ts", import.meta.url));
+  for (const src of [helper, fleetSrc]) {
+    assertEquals(src.includes("{{if .State.Health}}"), false);
+  }
+  assertStringIncludes(helper, "{{.State.Status}}|{{json .State}}");
+  assertEquals(fleet.INSPECT_FORMAT.endsWith("{{json .State}}"), true);
+});

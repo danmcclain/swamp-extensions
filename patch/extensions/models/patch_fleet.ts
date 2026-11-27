@@ -3901,18 +3901,48 @@ export interface DockerContainer {
 }
 
 /**
- * The rows of `swamp-patch-docker inspect`: one `id|configImage|imageId|state|health` line per
- * container. Any other line (docker's own warnings, merged into the output) is skipped; a row is
- * recognised by its hex container id.
+ * The docker inspect format of one container: `configImage|imageId|state|<State as JSON>`.
+ * The health is read from the State JSON, not with an `if` on `.State.Health`: Docker 29 renders
+ * inspect templates from a map, where a container without a healthcheck has no `Health`
+ * key and that template fails ("map has no entry for key"). `{{json .State}}` works on
+ * every version.
+ */
+export const INSPECT_FORMAT =
+  "{{.Config.Image}}|{{.Image}}|{{.State.Status}}|{{json .State}}";
+
+/** The health of a container from the last inspect field: the State JSON (its
+ *  Health.Status, or "none" without a healthcheck), or the one-word health of a helper
+ *  installed before 2026.11.27.1. Unreadable JSON is "unknown" (never healthy). */
+export function inspectHealth(field: string): string {
+  const f = field.trim();
+  if (!f.startsWith("{")) return f;
+  try {
+    const state = JSON.parse(f) as { Health?: { Status?: unknown } | null };
+    const s = state?.Health?.Status;
+    return typeof s === "string" && s ? s : "none";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * The rows of `swamp-patch-docker inspect`: one `id|configImage|imageId|state|<State JSON>` line
+ * per container (an older helper prints a one-word health last). Any other line (docker's own
+ * warnings, merged into the output) is skipped; a row is recognised by its hex container id.
  */
 export function parseInspectRows(out: string): DockerContainer[] {
   const rows: DockerContainer[] = [];
   for (const raw of out.split("\n")) {
     const m = raw.trim().match(
-      /^[0-9a-f]{12,64}\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)$/,
+      /^[0-9a-f]{12,64}\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$/,
     );
     if (m) {
-      rows.push({ ref: m[1], imageId: m[2], status: m[3], health: m[4] });
+      rows.push({
+        ref: m[1],
+        imageId: m[2],
+        status: m[3],
+        health: inspectHealth(m[4]),
+      });
     }
   }
   return rows;
@@ -5362,11 +5392,16 @@ export const model = {
           const rows: DockerContainer[] = [];
           for (const id of ids) {
             const r = await ex(
-              `docker inspect ${id} --format '{{.Config.Image}}|{{.Image}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'`,
+              `docker inspect ${id} --format '${INSPECT_FORMAT}'`,
             );
-            const [ref = "", imageId = "", status = "", health = ""] = r.out
+            const [ref = "", imageId = "", status = "", ...state] = r.out
               .trim().split("|");
-            rows.push({ ref, imageId, status, health });
+            rows.push({
+              ref,
+              imageId,
+              status,
+              health: inspectHealth(state.join("|")),
+            });
           }
           return rows;
         };
