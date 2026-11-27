@@ -642,6 +642,9 @@ Deno.test("schema: method arguments carry their documented defaults", () => {
     retentionHours: 168,
     rollbackOnFailure: true,
     healthGraceSec: 120,
+    ignoreBusy: false,
+    busyWaitSec: 0,
+    busyPollSec: 30,
   });
   assertThrows(() =>
     model.methods.safeOsUpdate.arguments.parse({
@@ -661,6 +664,9 @@ Deno.test("schema: method arguments carry their documented defaults", () => {
     wait: true,
     waitTimeoutSec: 300,
     healthGraceSec: 120,
+    ignoreBusy: false,
+    busyWaitSec: 0,
+    busyPollSec: 30,
   });
   assertEquals(model.methods.pruneSnapshots.arguments.parse({}), {
     dryRun: false,
@@ -675,6 +681,9 @@ Deno.test("schema: method arguments carry their documented defaults", () => {
     pollIntervalSec: 5,
     rollbackOnFailure: true,
     retentionHours: 168,
+    ignoreBusy: false,
+    busyWaitSec: 0,
+    busyPollSec: 30,
   });
   assertThrows(() =>
     model.methods.safeOsUpdate.arguments.parse({ host: "h", mode: "yolo" })
@@ -10945,6 +10954,244 @@ Deno.test("evalHealth: a proxmox-cluster check runs from the swamp host for the 
   ]);
 });
 
+// --- busy guards ----------------------------------------------------------------
+
+const BUSY_JOBS = JSON.stringify({
+  dataArtifacts: [{
+    attributes: {
+      busy: true,
+      reason: "1 Actions job running",
+      items: ["dmc/ai-infra#78 build"],
+    },
+  }],
+});
+const FREE = JSON.stringify({ dataArtifacts: [{ attributes: { busy: false } }] });
+
+/** The model + method of each runModel call, in order. */
+const callNames = (t: { calls: RunModelCall[] }) =>
+  t.calls.map((c) => `${c.definition} ${c.method}`);
+
+Deno.test("reboot: a busy guard keeps the machine as it is and records outcome busy", async () => {
+  await withFake({ FAKE_SWAMP_BUSY_1: BUSY_JOBS, FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      { sshModel: "ssh", machines: [{ host: "forgejo", busyGuards: [{ model: "ci" }] }] },
+      { stored: { forgejo: { needsReboot: true } } },
+    );
+    await model.methods.reboot.execute(
+      model.methods.reboot.arguments.parse({ host: "forgejo", wait: false }),
+      t.ctx,
+    );
+    const reboot = t.one("reboot");
+    assertEquals(reboot.outcome, "busy");
+    assertStringIncludes(String(reboot.logs), "dmc/ai-infra#78 build");
+    assertEquals(t.one("run").outcome, "busy");
+    assertEquals(t.one("run").action, "reboot");
+    // Only the guard was asked: no reboot command ran.
+    assertEquals(callNames(t), ["ci busy"]);
+    assertEquals(t.calls[0].arguments, { host: "forgejo" });
+  });
+});
+
+Deno.test("reboot: a drain guard is drained, asked, and resumed after the reboot", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      {
+        sshModel: "ssh",
+        machines: [{ host: "fort", busyGuards: [{ model: "ci", drain: true }] }],
+      },
+      { stored: { fort: { needsReboot: true } } },
+    );
+    await model.methods.reboot.execute(
+      model.methods.reboot.arguments.parse({ host: "fort", wait: false }),
+      t.ctx,
+    );
+    assertEquals(t.one("reboot").outcome, "rebooted");
+    assertEquals(callNames(t), ["ci drain", "ci busy", "ssh exec", "ci resume"]);
+  });
+});
+
+Deno.test("reboot: busy after busyWaitSec still resumes the drained guard", async () => {
+  await withFake({ FAKE_SWAMP_BUSY_1: BUSY_JOBS }, async () => {
+      const t = mkCtx(
+        { sshModel: "ssh", machines: [{ host: "fort", busyGuards: [{ model: "ci", drain: true }] }] },
+        { stored: { fort: { needsReboot: true } } },
+      );
+      await model.methods.reboot.execute(
+        model.methods.reboot.arguments.parse({ host: "fort", wait: false, busyWaitSec: 0 }),
+        t.ctx,
+      );
+      assertEquals(t.one("reboot").outcome, "busy");
+      assertEquals(callNames(t), ["ci drain", "ci busy", "ci resume"]);
+  });
+});
+
+Deno.test("reboot: busy, then free within busyWaitSec, reboots", async () => {
+  await withFake({ FAKE_SWAMP_BUSY_1: BUSY_JOBS, FAKE_SWAMP_BUSY_2: FREE, FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      { sshModel: "ssh", machines: [{ host: "fort", busyGuards: [{ model: "ci" }] }] },
+      { stored: { fort: { needsReboot: true } } },
+    );
+    const saved = fleet.busyPolling.timing;
+    let now = 0;
+    const sleeps: number[] = [];
+    fleet.busyPolling.timing = {
+      now: () => now,
+      sleep: (ms) => {
+        sleeps.push(ms);
+        now += ms;
+        return Promise.resolve();
+      },
+    };
+    try {
+      await model.methods.reboot.execute(
+        model.methods.reboot.arguments.parse({ host: "fort", wait: false, busyWaitSec: 600 }),
+        t.ctx,
+      );
+    } finally {
+      fleet.busyPolling.timing = saved;
+    }
+    assertEquals(sleeps, [30_000]);
+    assertEquals(t.one("reboot").outcome, "rebooted");
+    assertEquals(callNames(t), ["ci busy", "ci busy", "ssh exec"]);
+  });
+});
+
+Deno.test("reboot: a reboot the last scan says is not needed asks no guard", async () => {
+  const t = mkCtx(
+    { sshModel: "ssh", machines: [{ host: "fort", busyGuards: [{ model: "ci", drain: true }] }] },
+    { stored: { fort: { needsReboot: false } } },
+  );
+  await model.methods.reboot.execute(
+    model.methods.reboot.arguments.parse({ host: "fort" }),
+    t.ctx,
+  );
+  assertEquals(t.one("reboot").outcome, "skipped");
+  assertEquals(callNames(t), []);
+});
+
+Deno.test("reboot: ignoreBusy asks no guard", async () => {
+  await withFake({ FAKE_SWAMP_BUSY_1: BUSY_JOBS, FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      { sshModel: "ssh", machines: [{ host: "fort", busyGuards: [{ model: "ci", drain: true }] }] },
+      { stored: { fort: { needsReboot: true } } },
+    );
+    await model.methods.reboot.execute(
+      model.methods.reboot.arguments.parse({ host: "fort", wait: false, ignoreBusy: true }),
+      t.ctx,
+    );
+    assertEquals(t.one("reboot").outcome, "rebooted");
+    assertEquals(callNames(t), ["ssh exec"]);
+  });
+});
+
+Deno.test("reboot: a scan-only machine is refused before any guard is drained", async () => {
+  const t = mkCtx(
+    {
+      sshModel: "ssh",
+      machines: [{ host: "fort", osUpdatePolicy: "scan-only", busyGuards: [{ model: "ci", drain: true }] }],
+    },
+    { stored: { fort: { needsReboot: true } } },
+  );
+  await assertRejects(
+    () =>
+      model.methods.reboot.execute(
+        model.methods.reboot.arguments.parse({ host: "fort", force: true }),
+        t.ctx,
+      ),
+    Error,
+    "scan-only",
+  );
+  assertEquals(callNames(t), []);
+});
+
+Deno.test("reboot: a failed resume fails the run after the reboot is recorded", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0), FAKE_SWAMP_RESUME_RC: "1" }, async () => {
+    const t = mkCtx(
+      { sshModel: "ssh", machines: [{ host: "fort", busyGuards: [{ model: "ci", drain: true }] }] },
+      { stored: { fort: { needsReboot: true } } },
+    );
+    await assertRejects(
+      () =>
+        model.methods.reboot.execute(
+          model.methods.reboot.arguments.parse({ host: "fort", wait: false }),
+          t.ctx,
+        ),
+      Error,
+      "resume failed for busy guard(s) ci",
+    );
+    assertEquals(t.one("reboot").outcome, "rebooted");
+  });
+});
+
+Deno.test("reboot: a failed drain is busy, and nothing runs", async () => {
+  await withFake({ FAKE_SWAMP_DRAIN_RC: "1" }, async () => {
+    const t = mkCtx(
+      { sshModel: "ssh", machines: [{ host: "fort", busyGuards: [{ model: "ci", drain: true }] }] },
+      { stored: { fort: { needsReboot: true } } },
+    );
+    await model.methods.reboot.execute(
+      model.methods.reboot.arguments.parse({ host: "fort", wait: false }),
+      t.ctx,
+    );
+    const reboot = t.one("reboot");
+    assertEquals(reboot.outcome, "busy");
+    assertStringIncludes(String(reboot.logs), "could not drain: drain failed");
+    assertEquals(callNames(t), ["ci drain"]);
+  });
+});
+
+Deno.test("safeOsUpdate: a busy guard stops it before the scan and the snapshot", async () => {
+  await withFake({ FAKE_SWAMP_BUSY_1: BUSY_JOBS }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      proxmoxNodes: ["pve"],
+      machines: [{ host: "forgejo", vm: { proxmoxNode: "pve", vmid: 601 }, busyGuards: [{ model: "ci" }] }],
+    });
+    await model.methods.safeOsUpdate.execute(
+      model.methods.safeOsUpdate.arguments.parse({ host: "forgejo" }),
+      t.ctx,
+    );
+    const os = t.one("osUpdate");
+    assertEquals(os.outcome, "busy");
+    assertEquals(os.kind, "vm");
+    assertEquals(os.snapshot, null);
+    assertEquals(t.one("run").action, "osUpdate");
+    assertEquals(t.one("run").outcome, "busy");
+    assertEquals(callNames(t), ["ci busy"]);
+  });
+});
+
+Deno.test("safeUpdate: a busy guard stops the docker update before any docker call", async () => {
+  await withFake({ FAKE_SWAMP_BUSY_1: BUSY_JOBS }, async () => {
+    const t = mkCtx({
+      sshModel: "ssh",
+      machines: [{
+        host: "web1",
+        docker: { composePath: "/opt/app", service: "app" },
+        busyGuards: [{ model: "ci" }],
+      }],
+    });
+    await model.methods.safeUpdate.execute(
+      model.methods.safeUpdate.arguments.parse({ host: "web1" }),
+      t.ctx,
+    );
+    const u = t.one("update");
+    assertEquals(u.outcome, "busy");
+    assertEquals(u.service, "app");
+    assertEquals(t.one("run").action, "docker");
+    assertEquals(callNames(t), ["ci busy"]);
+  });
+});
+
+Deno.test("schema: busyGuards defaults to none, and drain to false", () => {
+  assertEquals(parseMachine({ host: "a" }).busyGuards, []);
+  assertEquals(parseMachine({ host: "a", busyGuards: [{ model: "ci" }] }).busyGuards, [
+    { model: "ci", drain: false, waitSec: 0 },
+  ]);
+  assertThrows(() => parseMachine({ host: "a", busyGuards: [{ model: "" }] }));
+  assertThrows(() => model.methods.reboot.arguments.parse({ host: "a", busyPollSec: 1 }));
+});
+
 // --- docker inspect health (Docker 29) -----------------------------------------
 
 Deno.test("inspectHealth: reads Health.Status from the State JSON, none without a healthcheck", () => {
@@ -10982,4 +11229,54 @@ Deno.test("docker inspect: neither the helper nor the root path uses {{if .State
   }
   assertStringIncludes(helper, "{{.State.Status}}|{{json .State}}");
   assertEquals(fleet.INSPECT_FORMAT.endsWith("{{json .State}}"), true);
+});
+
+Deno.test("reboot: a drained guard is asked busy with drained: true; a check-only guard is not", async () => {
+  await withFake({ FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      {
+        sshModel: "ssh",
+        machines: [{ host: "fort", busyGuards: [{ model: "ci", drain: true }, { model: "backup" }] }],
+      },
+      { stored: { fort: { needsReboot: true } } },
+    );
+    await model.methods.reboot.execute(
+      model.methods.reboot.arguments.parse({ host: "fort", wait: false }),
+      t.ctx,
+    );
+    const busy = t.calls.filter((c) => c.method === "busy");
+    assertEquals(busy.map((c) => [c.definition, c.arguments]), [
+      ["ci", { host: "fort", drained: true }],
+      ["backup", { host: "fort" }],
+    ]);
+  });
+});
+
+Deno.test("reboot: a guard's waitSec is the least wait, so a busy guard is asked again", async () => {
+  await withFake({ FAKE_SWAMP_BUSY_1: BUSY_JOBS, FAKE_SWAMP_BUSY_2: FREE, FAKE_SWAMP_EXEC: execOut("", 0) }, async () => {
+    const t = mkCtx(
+      { sshModel: "ssh", machines: [{ host: "fort", busyGuards: [{ model: "ci", waitSec: 600 }] }] },
+      { stored: { fort: { needsReboot: true } } },
+    );
+    const saved = fleet.busyPolling.timing;
+    let now = 0;
+    fleet.busyPolling.timing = {
+      now: () => now,
+      sleep: (ms) => {
+        now += ms;
+        return Promise.resolve();
+      },
+    };
+    try {
+      // No busyWaitSec argument: the guard's waitSec (600 s) applies.
+      await model.methods.reboot.execute(
+        model.methods.reboot.arguments.parse({ host: "fort", wait: false }),
+        t.ctx,
+      );
+    } finally {
+      fleet.busyPolling.timing = saved;
+    }
+    assertEquals(t.one("reboot").outcome, "rebooted");
+    assertEquals(callNames(t), ["ci busy", "ci busy", "ssh exec"]);
+  });
 });

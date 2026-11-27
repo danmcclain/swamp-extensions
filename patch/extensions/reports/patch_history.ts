@@ -132,6 +132,8 @@ const outcomeMark = (o: string): string =>
     ? `⏪ ${o}`
     : o === "failed" || o === "timeout" || o === "unhealthy"
     ? `❌ ${o}`
+    : o === "busy"
+    ? `⏳ ${o}`
     : o;
 const when = (ts: string): string =>
   new Date(ts).toISOString().slice(0, 16).replace("T", " ") + " UTC";

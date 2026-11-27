@@ -22,6 +22,7 @@ containers) through a single `@swamp/ssh` model.
   - [Accepted risks](#accepted-risks)
   - [Auditing access](#auditing-access)
   - [Recommended setup](#recommended-setup)
+  - [Upgrading from 2026.11.14.1](#upgrading-from-202611141)
   - [Upgrading from 2026.11.11.2](#upgrading-from-202611112)
   - [Upgrading from 2026.11.11.1](#upgrading-from-202611111)
   - [Upgrading from 2026.11.07.1](#upgrading-from-202611071)
@@ -35,6 +36,7 @@ containers) through a single `@swamp/ssh` model.
   - [Updater contract (`source`)](#updater-contract-source)
   - [Snapshotter contract (`snapshotter`)](#snapshotter-contract-snapshotter)
   - [OS updater contract (`osUpdater`)](#os-updater-contract-osupdater)
+  - [Busy guard contract (`busyGuards`)](#busy-guard-contract-busyguards)
   - [Plug-in privileges (`privileges`)](#plug-in-privileges-privileges)
   - [Example](#example)
 - [Methods](#methods)
@@ -489,6 +491,22 @@ are refused for docker). Private registry images show `updateAvailable: null`
 (the producer has no registry credentials). `osUpdatePolicy: auto` supports apt
 and dnf only.
 
+### Upgrading from 2026.11.14.1
+
+- **No migration.** `busyGuards` is a new optional machine decoration (default
+  none), and `safeOsUpdate`, `safeUpdate` and `reboot` take three new optional
+  arguments (`ignoreBusy`, `busyWaitSec`, `busyPollSec`). A fleet without
+  `busyGuards` runs as before. See
+  [Busy guard contract](#busy-guard-contract-busyguards).
+- **Re-run `provisionAccess` on docker hosts.** `safeUpdate` failed on Docker 29
+  for any container without a healthcheck: Docker 29 renders `docker inspect`
+  templates from a map, where the old health test failed with
+  `map has no entry for key "Health"`. The `swamp-patch-docker` helper (and the
+  root path) now print the container's State as JSON, and the fleet reads
+  `Health.Status` from it (`none` without a healthcheck). A helper installed
+  before this release still parses, but it fails on Docker 29 until you
+  re-provision; `auditAccess` reports `managed-file-drift` for it until then.
+
 ### Upgrading from 2026.11.11.2
 
 - **Re-run `provisionAccess` on docker hosts.** The root docker inventory producer
@@ -751,6 +769,10 @@ Notes:
   apt/dnf/apk/pacman upgrade with any model you write
   ([OS updater contract](#os-updater-contract-osupdater)). Health checks and
   reboots still reach the machine over its ssh / `pct` transport.
+- **`busyGuards`** lists models that say whether work depends on the machine
+  now (CI jobs, a backup). `safeOsUpdate`, `safeUpdate` and `reboot` ask them
+  before any change and record outcome `busy` instead of changing anything
+  ([busy guard contract](#busy-guard-contract-busyguards)).
 - The deprecated **`proxmox: { model }`** is a legacy field that supplied both a
   CT's location and its app updater from one reference; still honoured as a
   fallback, but prefer `ct` + `source`.
@@ -854,7 +876,7 @@ work without extra config, and you can override anytime.
 
 ## Extending `@dmc/patch` — your own updater, snapshotter and OS updater
 
-`@dmc/patch` has three extension points. Each one is a **contract**: you name a
+`@dmc/patch` has four extension points. Each one is a **contract**: you name a
 model instance on a machine, and the fleet calls that model's methods **by name**
 (through `runModel`). The fleet never needs the model's type. So you can add your
 own update or snapshot mechanism in your own repo, without changing or
@@ -865,10 +887,13 @@ upstreaming anything to `@dmc/patch`.
 | `source: { model }` | The app-update step, on top of the OS update | `checkUpdate`, `safeUpdate({ snapshot? })` |
 | `snapshotter: { model }` | The snapshot guard: snapshot → rollback → cleanup | `snapshot`, `rollback`, `deleteSnapshot`, `listSnapshots` |
 | `osUpdater: { model }` | The OS package layer: scan → upgrade → package list | `scanOs`, `upgradeOs`, `listPackages` |
+| `busyGuards: [{ model, drain? }]` | The "is it in use now?" gate before an update or reboot | `busy`; with `drain: true` also `drain`, `resume` |
 
-Every plugged model also answers `privileges({ host })`, so the restricted login
-can be granted the root commands it runs (see
-[Plug-in privileges](#plug-in-privileges-privileges)).
+Every plugged updater, snapshotter and OS updater also answers
+`privileges({ host })`, so the restricted login can be granted the root commands
+it runs (see [Plug-in privileges](#plug-in-privileges-privileges)). A busy guard
+runs where swamp runs, not on the machine, so it gets no grants and needs no
+`privileges`.
 
 The built-in behavior is the same code path: the Proxmox VM and CT snapshots are
 two snapshotter implementations inside the fleet, the bundled collector with
@@ -1033,6 +1058,55 @@ export const model = {
     },
   },
 };
+```
+
+### Busy guard contract (`busyGuards`)
+
+A busy guard knows whether work depends on a machine right now: CI jobs on a
+build server or its runners, a backup, an operator session. Before
+`safeOsUpdate`, `safeUpdate` or `reboot` changes anything, the fleet asks every
+guard of the machine. `rollback` is never guarded: it is the recovery.
+
+| Method | Arguments | Your model must |
+| ------ | --------- | --------------- |
+| `busy` | `host`; `drained: true` after this run drained the guard | Write one resource whose attributes hold `busy` (boolean), and optionally `reason` (string) and `items` (string[], e.g. the running jobs). With `drained: true`, also say busy until the drain has taken effect (for CI: while an idle runner could still take a job). |
+| `drain` | `host` | Only with `drain: true`. Stop new work that would depend on `host` from starting (for CI: stop giving jobs to runners). Work that arrives meanwhile must wait in your queue, not be lost. |
+| `resume` | `host` | Only with `drain: true`. Undo `drain`. Must succeed when nothing is drained. |
+
+The flow, per method run:
+
+1. A machine without `busyGuards`, or a run with `ignoreBusy: true`, skips all of
+   this. A `scan-only` machine is refused first, and a `reboot` that the last
+   scan says is not needed is skipped first, so neither drains anything.
+2. `drain` on each guard with `drain: true`. A failed drain resumes the guards
+   drained before it and ends the run as `busy`.
+3. `busy` on every guard. While one says busy, ask again every `busyPollSec`
+   (default 30 s, min 5) until the wait has passed: the longest of the run's
+   `busyWaitSec` (default 0 = ask once) and the guards' `waitSec` (default 0).
+   A long wait gets a longer interval, so it stays under 40 rounds (swamp caps a
+   run at 100 `runModel` calls). A drained guard is asked with `drained: true`.
+   A drain can take effect after `drain` returns, so give a draining guard a
+   `waitSec` long enough for that and for the work it waits for: then a
+   scheduled run needs no argument.
+4. Still busy: the method changes nothing, writes its result record (`os-update-`,
+   `update-` or `reboot-<host>`) and a `run` record with outcome **`busy`**, the
+   reasons in `logs`, and **succeeds**, so a schedule just tries again later.
+   Free: the method runs as usual.
+5. `resume` on every drained guard, whatever the outcome, also when the method
+   throws. A failed resume fails the run (new work would stay stopped).
+
+A guard **fails closed**: a failed `busy` run, or an answer without a boolean
+`busy`, counts as busy. To change a machine whose guard is broken (e.g. the CI
+server the guard asks), pass `ignoreBusy: true`.
+
+```yaml
+machines:
+  - host: forgejo
+    ct: { nodeModel: pve-api, ctid: 601 }
+    busyGuards:
+      - model: ci-guard      # busy while CI jobs run
+        drain: true          # and holds new jobs in the queue meanwhile
+        waitSec: 1800        # wait up to 30 min for running jobs to end
 ```
 
 ### Plug-in privileges (`privileges`)

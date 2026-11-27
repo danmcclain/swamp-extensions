@@ -38,6 +38,10 @@
 #                                           plug-in); exit FAKE_SWAMP_PRIVS_RC__<M>, else
 #                                           FAKE_SWAMP_PRIVS_RC (0). <M> is the model name with every
 #                                           character outside A-Z a-z 0-9 as _.
+#   model method run M busy ...         (a busy guard) prints FAKE_SWAMP_BUSY_1, then _2; when unset a
+#                                           free answer ({busy:false}); exit FAKE_SWAMP_BUSY_RC (0)
+#   model method run M drain|resume ... (a busy guard with drain) exit FAKE_SWAMP_DRAIN_RC /
+#                                           FAKE_SWAMP_RESUME_RC (0), "drain failed" / "resume failed" on stderr
 #   model method run M <other> ...    prints nothing, exit FAKE_SWAMP_METHOD_RC (0)
 #
 # FAKE_SWAMP_MODEL_GET / FAKE_SWAMP_GET_RC are not read here: the model reads
@@ -170,6 +174,19 @@ if [ "$1" = "model" ] && [ "$2" = "method" ] && [ "$3" = "run" ]; then
     listPackages)
       seq_out OSPKGS
       exit "${FAKE_SWAMP_OSPKGS_RC:-0}"
+      ;;
+    busy)
+      # A busy guard: FAKE_SWAMP_BUSY_1 on the first call, then _2 (or _1); a free answer when unset.
+      if [ -n "${FAKE_SWAMP_BUSY_1-}" ]; then seq_out BUSY; else printf "%s\n" "{\"dataArtifacts\":[{\"attributes\":{\"busy\":false}}]}"; fi
+      exit "${FAKE_SWAMP_BUSY_RC:-0}"
+      ;;
+    drain)
+      [ "${FAKE_SWAMP_DRAIN_RC:-0}" -eq 0 ] || printf "%s\n" "drain failed" >&2
+      exit "${FAKE_SWAMP_DRAIN_RC:-0}"
+      ;;
+    resume)
+      [ "${FAKE_SWAMP_RESUME_RC:-0}" -eq 0 ] || printf "%s\n" "resume failed" >&2
+      exit "${FAKE_SWAMP_RESUME_RC:-0}"
       ;;
     privileges)
       # The model name is sanitized before eval, so it cannot inject anything.

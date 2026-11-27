@@ -69,6 +69,12 @@ import {
   PendingUpdate,
 } from "./lib/pending_updates.ts";
 import type { PendingUpdateT } from "./lib/pending_updates.ts";
+import {
+  type GateResult,
+  type GuardTiming,
+  REAL_TIMING,
+  withBusyGuards,
+} from "./lib/busy_guard.ts";
 
 // The swamp CLI, used only by `checkSwamp` (pre-flight checks get no runModel).
 const SWAMP_BIN = Deno.env.get("SWAMP_BIN") ?? "swamp";
@@ -708,6 +714,33 @@ const Machine = z.object({
       "apt/dnf/apk/pacman upgrade. Health checks and reboots still use the machine's " +
       "ssh / pct transport.",
   ),
+  // ── Pluggable busy guards ───────────────────────────────────────────────
+  // Models that know whether work depends on this machine now (CI jobs, a backup).
+  // safeOsUpdate, safeUpdate and reboot ask them before any change; see
+  // lib/busy_guard.ts for the contract: busy({ host }) → { busy, reason?, items? },
+  // and with drain: true also drain({ host }) / resume({ host }).
+  busyGuards: z.array(z.object({
+    model: z.string().min(1).describe(
+      "The busy guard model instance. ANY model that implements the busy guard " +
+        "contract works: busy({ host }) writing a resource with `busy` (boolean), " +
+        "optionally `reason` and `items`.",
+    ),
+    drain: z.boolean().default(false).describe(
+      "The model also has drain({ host }) and resume({ host }): drain stops new work " +
+        "before the first busy question, resume runs when the method ends (whatever " +
+        "the outcome), so work that arrives meanwhile waits in the guard's queue.",
+    ),
+    waitSec: z.number().int().min(0).max(86_400).default(0).describe(
+      "The least busyWaitSec for this machine: a run waits for the longest of its " +
+        "busyWaitSec and its guards' waitSec. Give a draining guard the time its drain " +
+        "and the work it waits for take, so a scheduled run needs no argument.",
+    ),
+  })).default([]).describe(
+    "Optional busy guards for safeOsUpdate, safeUpdate and reboot. While one says busy " +
+      "the method waits up to busyWaitSec, then changes nothing and records outcome " +
+      "`busy`. A guard that fails or gives no boolean answer counts as busy. " +
+      "rollback is never guarded. ignoreBusy skips them.",
+  ),
   unsafe: Unsafe.optional().describe(
     "Explicitly accepted unsafe paths for this machine. Each present key is an acceptance " +
       "record (reason, acceptedBy, acceptedAt, reviewBy) and is reported as an accepted risk. " +
@@ -880,6 +913,7 @@ const UpdateResult = z.object({
     "rolled-back",
     "unhealthy",
     "skipped",
+    "busy",
   ]),
   imageChanged: z.boolean(),
   healthyAfter: z.boolean(),
@@ -906,6 +940,7 @@ const OsUpdateResult = z.object({
     "failed",
     "delegated",
     "skipped-unhealthy",
+    "busy",
   ]),
   snapshot: z.string().nullable(),
   snapshotKept: z.boolean(),
@@ -921,7 +956,14 @@ const OsUpdateResult = z.object({
 const RebootResult = z.object({
   host: z.string(),
   via: z.enum(["ssh", "pct"]),
-  outcome: z.enum(["rebooted", "skipped", "failed", "timeout", "unhealthy"]),
+  outcome: z.enum([
+    "rebooted",
+    "skipped",
+    "failed",
+    "timeout",
+    "unhealthy",
+    "busy",
+  ]),
   neededReboot: z.boolean().nullable(),
   confirmed: z.boolean(),
   needsRebootAfter: z.boolean().nullable(),
@@ -2475,6 +2517,9 @@ export const healthPolling: {
   sleep: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
   now: () => Date.now(),
 };
+
+/** Clock of the busy-guard waits. Tests replace it; the default is real time. */
+export const busyPolling: { timing: GuardTiming } = { timing: REAL_TIMING };
 
 /** Evaluate health, and while it is unhealthy re-evaluate every `intervalMs` (10 s)
  *  until it is healthy or `graceSec` has elapsed. Returns the final result. Each failed
@@ -4507,10 +4552,184 @@ export async function checkPrivilegesDeclared(
   );
 }
 
+// ---------------------------------------------------------------------------
+// Busy guards around safeOsUpdate, safeUpdate and reboot (lib/busy_guard.ts).
+
+/** The method arguments every guarded method takes. */
+const BUSY_ARGS = {
+  ignoreBusy: z.boolean().default(false).describe(
+    "Do not ask the machine's busyGuards (and do not drain them). For a deliberate change while work depends on the machine, e.g. to repair a broken CI server.",
+  ),
+  busyWaitSec: z.number().int().min(0).max(86_400).default(0).describe(
+    "While a busy guard says busy, ask again every busyPollSec until this many seconds have passed. 0 = ask once. After the wait the method changes nothing and records outcome busy.",
+  ),
+  busyPollSec: z.number().int().min(5).default(30).describe(
+    "Seconds between busy questions (made longer for a long busyWaitSec, so a wait stays within swamp's runModel cap).",
+  ),
+};
+
+type BusyArgs = {
+  ignoreBusy: boolean;
+  busyWaitSec: number;
+  busyPollSec: number;
+};
+type GuardedMethod = "safeOsUpdate" | "safeUpdate" | "reboot";
+type MethodResult = { dataHandles: Array<{ name: string }> };
+
+/** Write a guarded method's records for a `busy` outcome: its result record and the
+ *  append-only run record. Nothing on the machine changed. */
+async function writeBusyRecords(
+  method: GuardedMethod,
+  machine: Machine,
+  args: { host: string; mode?: "safe" | "full"; service?: string },
+  context: Ctx,
+  gate: GateResult,
+): Promise<MethodResult> {
+  const ts = new Date().toISOString();
+  const logs = gate.logs.join("\n");
+  const host = args.host;
+  const run = (action: "osUpdate" | "docker" | "reboot") =>
+    context.writeResource("run", runName(action, host, ts), {
+      runId: `${action}-${host}-${ts.replace(/[:.]/g, "-")}`,
+      action,
+      host,
+      outcome: "busy",
+      beforeUpdates: null,
+      afterUpdates: null,
+      packages: null,
+      packagesChanged: null,
+      images: null,
+      imagesChanged: null,
+      snapshot: null,
+      rolledBack: false,
+      needsReboot: null,
+      acceptedRisksUsed: [],
+      timestamp: ts,
+    });
+  let result: { name: string };
+  let action: "osUpdate" | "docker" | "reboot";
+  if (method === "safeOsUpdate") {
+    action = "osUpdate";
+    result = await context.writeResource("osUpdate", `os-update-${host}`, {
+      host,
+      kind: machine.vm ? "vm" : isCtMachine(machine) ? "ct" : "bare-metal",
+      mode: args.mode ?? "safe",
+      outcome: "busy",
+      snapshot: null,
+      snapshotKept: false,
+      beforeUpdates: null,
+      afterUpdates: null,
+      healthyAfter: false,
+      rolledBack: false,
+      needsReboot: false,
+      logs,
+      timestamp: ts,
+    });
+  } else if (method === "safeUpdate") {
+    action = "docker";
+    result = await context.writeResource("update", `update-${host}`, {
+      host,
+      service: args.service ?? machine.docker?.service ?? null,
+      outcome: "busy",
+      imageChanged: false,
+      healthyAfter: false,
+      rolledBack: false,
+      containers: [],
+      logs,
+      timestamp: ts,
+    });
+  } else {
+    action = "reboot";
+    result = await context.writeResource("reboot", `reboot-${host}`, {
+      host,
+      via: transportVia(machine),
+      outcome: "busy",
+      neededReboot: null,
+      confirmed: false,
+      needsRebootAfter: null,
+      waited: false,
+      logs,
+      timestamp: ts,
+    });
+  }
+  context.logger.info(
+    "{method} of {host} finished: outcome=busy — nothing changed",
+    {
+      method,
+      host,
+    },
+  );
+  return { dataHandles: [result, await run(action)] };
+}
+
+/**
+ * Put a method behind the machine's busy guards. A machine without guards runs the
+ * method as it is. Otherwise the policy refusals that need no host run first (so a
+ * refused method never drains anything), then the gate: drain, ask until free or
+ * busyWaitSec, then the method or the busy records, then resume.
+ */
+export function guardedExecute<
+  A extends BusyArgs & { host: string; force?: boolean },
+>(
+  method: GuardedMethod,
+  inner: (args: A, context: Ctx) => Promise<MethodResult>,
+): (args: A, context: Ctx) => Promise<MethodResult> {
+  return async (args, context) => {
+    const machine = context.globalArgs.machines.find((m) =>
+      m.host === args.host
+    );
+    const guards = machine?.busyGuards ?? [];
+    if (!machine || !guards.length) return inner(args, context);
+    if (method !== "safeUpdate") {
+      const refusal = osRefusal(method, machine, context.globalArgs);
+      if (refusal) throw new Error(refusal);
+    }
+    // A reboot the last scan says is not needed is skipped by the method itself:
+    // do not stop new work for it.
+    if (method === "reboot" && !args.force) {
+      const inv = await context.readResource(args.host);
+      if (inv && inv.needsReboot === false) return inner(args, context);
+    }
+    const swamp = methodSwamp(context);
+    const log = (m: string) =>
+      context.logger.info("[{method} {host}] {message}", {
+        method,
+        host: args.host,
+        message: m,
+      });
+    // The guards' waitSec is a floor under the run's own busyWaitSec.
+    const busyWaitSec = Math.max(
+      args.busyWaitSec,
+      ...guards.map((g) => g.waitSec),
+    );
+    return withBusyGuards(
+      guards,
+      args.host,
+      { ...args, busyWaitSec },
+      (model, m, a) => swamp.run(model, m, a),
+      log,
+      (gate) =>
+        writeBusyRecords(
+          method,
+          machine,
+          args as unknown as {
+            host: string;
+            mode?: "safe" | "full";
+            service?: string;
+          },
+          context,
+          gate,
+        ),
+      () => inner(args, context),
+      busyPolling.timing,
+    );
+  };
+}
+
 /** @dmc/patch/fleet model. */
 export const model = {
   type: "@dmc/patch/fleet",
-  version: "2026.11.11.3",
+  version: "2026.11.27.1",
   upgrades: [
     {
       toVersion: "2026.10.01.1",
@@ -4580,6 +4799,16 @@ export const model = {
         "Version bump, no globalArguments schema change. The root docker inventory producer " +
         "gives buildx a temporary DOCKER_CONFIG, so the registry check works under the " +
         "unit's ProtectHome=yes. Re-run provisionAccess on docker hosts to install it.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.27.1",
+      description:
+        "Additive globalArguments change, no migration needed: machines take an optional " +
+        "`busyGuards` list (default none), asked by safeOsUpdate, safeUpdate and reboot, " +
+        "which also take ignoreBusy / busyWaitSec / busyPollSec. The swamp-patch-docker " +
+        "helper reads container health from the State JSON (Docker 29): re-run " +
+        "provisionAccess on docker hosts to install it.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -5295,15 +5524,19 @@ export const model = {
           .describe(
             "How long the previous image is kept as a rollback point before pruneImages may delete it (default 7 days). Old images are never pruned inline.",
           ),
+        ...BUSY_ARGS,
       }),
-      execute: async (args: {
-        host: string;
-        service?: string;
-        healthTimeoutSec: number;
-        pollIntervalSec: number;
-        rollbackOnFailure: boolean;
-        retentionHours: number;
-      }, context: Ctx) => {
+      execute: guardedExecute("safeUpdate", async (
+        args: {
+          host: string;
+          service?: string;
+          healthTimeoutSec: number;
+          pollIntervalSec: number;
+          rollbackOnFailure: boolean;
+          retentionHours: number;
+        } & BusyArgs,
+        context: Ctx,
+      ) => {
         const { sshModel, machines } = context.globalArgs;
         const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
@@ -5638,7 +5871,7 @@ export const model = {
           { host: args.host, outcome, rolledBack },
         );
         return { dataHandles };
-      },
+      }),
     },
     safeOsUpdate: {
       description:
@@ -5674,14 +5907,18 @@ export const model = {
         healthGraceSec: z.number().int().min(0).default(120).describe(
           "Grace window for the post-update health check. While the machine is unhealthy, re-check every 10 s until healthy or this many seconds have passed (a docker-ce upgrade restarts every container). 0 = check once.",
         ),
+        ...BUSY_ARGS,
       }),
-      execute: async (args: {
-        host: string;
-        mode: "safe" | "full";
-        retentionHours: number;
-        rollbackOnFailure: boolean;
-        healthGraceSec: number;
-      }, context: Ctx) => {
+      execute: guardedExecute("safeOsUpdate", async (
+        args: {
+          host: string;
+          mode: "safe" | "full";
+          retentionHours: number;
+          rollbackOnFailure: boolean;
+          healthGraceSec: number;
+        } & BusyArgs,
+        context: Ctx,
+      ) => {
         const { sshModel, machines } = context.globalArgs;
         const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
@@ -5987,7 +6224,7 @@ export const model = {
           { host: args.host, outcome, rolledBack },
         );
         return { dataHandles };
-      },
+      }),
     },
     reboot: {
       description:
@@ -6004,14 +6241,18 @@ export const model = {
         healthGraceSec: z.number().int().min(0).default(120).describe(
           "Grace window for the post-reboot health detection. While the machine is unhealthy, re-check every 10 s until healthy or this many seconds have passed. 0 = check once.",
         ),
+        ...BUSY_ARGS,
       }),
-      execute: async (args: {
-        host: string;
-        force: boolean;
-        wait: boolean;
-        waitTimeoutSec: number;
-        healthGraceSec: number;
-      }, context: Ctx) => {
+      execute: guardedExecute("reboot", async (
+        args: {
+          host: string;
+          force: boolean;
+          wait: boolean;
+          waitTimeoutSec: number;
+          healthGraceSec: number;
+        } & BusyArgs,
+        context: Ctx,
+      ) => {
         const { sshModel, machines } = context.globalArgs;
         const swamp = methodSwamp(context);
         const machine = machines.find((m) => m.host === args.host);
@@ -6263,7 +6504,7 @@ export const model = {
           { host: args.host, outcome, confirmed },
         );
         return { dataHandles: dh };
-      },
+      }),
     },
     rollback: {
       description:
