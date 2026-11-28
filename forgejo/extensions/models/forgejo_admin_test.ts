@@ -56,6 +56,7 @@ class FakeForgejo {
       owner: string;
       archived?: boolean;
       mirror?: boolean;
+      [field: string]: unknown;
     }
   >();
   collaborators = new Map<string, Map<string, string>>();
@@ -204,11 +205,7 @@ class FakeForgejo {
     if ((m = path.match(/^\/repos\/([^/]+)\/([^/]+)$/))) {
       const r = this.repos.get(`${m[1]}/${m[2]}`);
       if (!r) return json(404);
-      if (method === "PATCH") {
-        const b = body as { private: boolean; has_actions: boolean };
-        r.private = b.private;
-        r.has_actions = b.has_actions;
-      }
+      if (method === "PATCH") Object.assign(r, body as object);
       return json(200, { ...r, name: m[2], owner: { login: r.owner } });
     }
     if (method === "GET" && (m = path.match(/^\/users\/([^/]+)\/repos$/))) {
@@ -801,13 +798,22 @@ function withRepo(
   fj: FakeForgejo,
   owner: string,
   name: string,
-  extra: { archived?: boolean; mirror?: boolean } = {},
+  extra: Record<string, unknown> = {},
 ) {
   fj.repos.set(`${owner}/${name}`, {
     id: fj.nextId++,
     private: true,
     has_actions: true,
     owner,
+    has_pull_requests: true,
+    allow_merge_commits: true,
+    allow_rebase: true,
+    allow_rebase_explicit: true,
+    allow_squash_merge: true,
+    allow_fast_forward_only_merge: true,
+    allow_rebase_update: true,
+    default_delete_branch_after_merge: false,
+    default_merge_style: "merge",
     ...extra,
   });
 }
@@ -1310,6 +1316,152 @@ Deno.test("ensureBranchProtection fails when Forgejo drops allowlist users", asy
       ),
     Error,
     "mergeAllowlist still differ",
+  );
+  assertEquals(getWrittenResources(), []);
+});
+
+// ---------------------------------------------------------- ensureMergeStyles
+
+const mergeArgs = {
+  owner: "dmc",
+  repos: "all" as const,
+  exclude: [] as string[],
+  styles: ["fast-forward-only" as const],
+  defaultStyle: "fast-forward-only" as const,
+  allowRebaseUpdate: false,
+  deleteBranchAfterMerge: true,
+};
+
+const FF_ONLY = {
+  allow_merge_commits: false,
+  allow_rebase: false,
+  allow_rebase_explicit: false,
+  allow_squash_merge: false,
+  allow_fast_forward_only_merge: true,
+  allow_rebase_update: false,
+  default_delete_branch_after_merge: true,
+  default_merge_style: "fast-forward-only",
+};
+
+Deno.test("ensureMergeStyles turns every style but fast-forward off on all repos", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "runner-pool", FF_ONLY);
+  withRepo(fj, "dmc", "notes", { has_pull_requests: false });
+  await model.methods.ensureMergeStyles.execute(
+    { ...mergeArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  const w = fj.writes();
+  assertEquals(w.map((c) => `${c.method} ${c.path}`), [
+    "PATCH /repos/dmc/ai-infra",
+  ]);
+  assertEquals(w[0].body, FF_ONLY);
+  const r = fj.repos.get("dmc/ai-infra")!;
+  assertEquals(r.allow_merge_commits, false);
+  assertEquals(r.default_merge_style, "fast-forward-only");
+  const d = getWrittenResources()[0];
+  assertEquals(d.name, "dmc-merge-styles");
+  assertEquals(d.data.status, "applied");
+  const rows = d.data.repos as Record<string, unknown>[];
+  assertEquals(rows.map((x) => `${x.repo}:${x.state}`), [
+    "ai-infra:applied",
+    "runner-pool:present",
+  ]);
+  assertEquals(d.data.skipped, [{
+    repo: "notes",
+    reason: "pull requests off",
+  }]);
+});
+
+Deno.test("ensureMergeStyles leaves rebase update and branch delete when not given", async () => {
+  const { fj, context } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  await model.methods.ensureMergeStyles.execute(
+    {
+      ...mergeArgs,
+      allowRebaseUpdate: undefined,
+      deleteBranchAfterMerge: undefined,
+      dryRun: false,
+      _fetch: fj.fetcher,
+    },
+    context,
+  );
+  const body = fj.writes()[0].body as Record<string, unknown>;
+  assertFalse("allow_rebase_update" in body);
+  assertFalse("default_delete_branch_after_merge" in body);
+  assertEquals(fj.repos.get("dmc/ai-infra")!.allow_rebase_update, true);
+});
+
+Deno.test("ensureMergeStyles reports matching repos unchanged", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra", FF_ONLY);
+  await model.methods.ensureMergeStyles.execute(
+    { ...mergeArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.writes(), []);
+  assertEquals(getWrittenResources()[0].data.status, "unchanged");
+});
+
+Deno.test("ensureMergeStyles dry run plans and writes nothing", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  await model.methods.ensureMergeStyles.execute(
+    { ...mergeArgs, dryRun: true, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.writes(), []);
+  const d = getWrittenResources()[0].data;
+  assertEquals(d.status, "planned");
+  const rows = d.repos as Record<string, unknown>[];
+  assertEquals(rows[0].changes, [
+    "allow_merge_commits",
+    "allow_rebase",
+    "allow_rebase_explicit",
+    "allow_squash_merge",
+    "default_merge_style",
+    "allow_rebase_update",
+    "default_delete_branch_after_merge",
+  ]);
+});
+
+Deno.test("ensureMergeStyles blocks a default style that is not allowed", async () => {
+  const { fj, context } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  await assertRejects(
+    () =>
+      model.methods.ensureMergeStyles.execute(
+        {
+          ...mergeArgs,
+          defaultStyle: "merge",
+          dryRun: false,
+          _fetch: fj.fetcher,
+        },
+        context,
+      ),
+    Error,
+    "defaultStyle merge is not in styles",
+  );
+  assertEquals(fj.writes(), []);
+});
+
+Deno.test("ensureMergeStyles fails when a repo does not take the change", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  const orig = fj.fetcher;
+  fj.fetcher = (input, init) =>
+    init.method === "PATCH"
+      ? Promise.resolve(new Response("{}", { status: 200 }))
+      : orig(input, init);
+  await assertRejects(
+    () =>
+      model.methods.ensureMergeStyles.execute(
+        { ...mergeArgs, dryRun: false, _fetch: fj.fetcher },
+        context,
+      ),
+    Error,
+    "still differ",
   );
   assertEquals(getWrittenResources(), []);
 });

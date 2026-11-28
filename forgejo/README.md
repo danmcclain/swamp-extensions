@@ -18,6 +18,7 @@ token of a separate account, so it never holds the token of the main account.
 | `ensureCollaborator`     | Adds a user as a collaborator with a permission to many repositories of one owner (`repos`: a list, or `all` with `exclude`), or changes its permission. The repositories may belong to a site administrator; the collaborator must not be one. Reads every repository first and changes none while any blocker exists. Never removes a collaborator.                                                                                                                                                                                      |
 | `ensureUserKey`          | Adds one SSH public key (ed25519 or ECDSA) to an account, for git over SSH and SSH commit signing. Refuses a private key, RSA and multi-line text. A key the account already has is reported unchanged. Data keeps the fingerprint and the `verified` flag, never the key. Never removes a key.                                                                                                                                                                                                                                            |
 | `ensureBranchProtection` | Makes or changes the protection rule of one branch on many repositories of one owner (`repos`: a list, or `all` with `exclude`): direct push `denied` (pull requests only), limited to a push allowlist, or `allowed`; a merge allowlist (an empty list lets any writer merge); and, when given, dismiss stale approvals. Keeps status checks and all other settings. Each allowlist user must be the owner or have write access, because Forgejo silently drops other users; each rule is read back and must match. Never deletes a rule. |
+| `ensureMergeStyles`      | Sets the merge styles of many repositories of one owner (`repos`: a list, or `all` with `exclude`): the allowed styles (every other style is turned off), the default style, and, when given, rebase update and delete-branch-after-merge. Repositories with pull requests off are skipped. Each repository is read back and must match.                                                                                                                                                                                                   |
 
 All methods:
 
@@ -59,6 +60,7 @@ password from every error message.
 | `collaborator` | `{owner}--{collaborator}-collaborator` | One row per repository (permission before, state), skipped repositories and blockers of `ensureCollaborator`                                 |
 | `key`          | `{username}--{title}-key`              | Plan, key type, key ID, fingerprint and `verified` of `ensureUserKey`                                                                        |
 | `protection`   | `{owner}--{rule}-protection`           | One row per repository (created, changed settings, kept status checks, state), skipped repositories and blockers of `ensureBranchProtection` |
+| `mergeStyles`  | `{owner}-merge-styles`                 | One row per repository (changed settings, state), skipped repositories and blockers of `ensureMergeStyles`                                   |
 
 Usernames, repository names and token names must be lowercase letters and digits
 in groups joined by single hyphens. So `--` in a data name separates the owner
@@ -110,6 +112,26 @@ directPush: denied # every change comes through a merged pull request
 mergeAllowlist: [dmc] # only dmc may merge
 dismissStaleApprovals: true
 ```
+
+## Merge styles and signatures
+
+Only a fast-forward merge keeps the commits of a pull request as they are.
+Rebase, rebase-merge and squash make new commits on the server, and a merge
+commit is made by the server too, so the signatures of the author are lost. To
+keep them:
+
+```yaml
+repos: all
+styles: [fast-forward-only]
+defaultStyle: fast-forward-only
+allowRebaseUpdate: false
+```
+
+The "Update branch" button of a pull request can still update by merge (Forgejo
+has no setting to turn that off), which adds an unsigned merge commit to the
+branch. Rebase and sign the branch locally instead. Branch protection with
+`require_signed_commits` would refuse such a commit, but it also needs every
+author's signing key in Forgejo.
 
 ## SSH commit signing
 

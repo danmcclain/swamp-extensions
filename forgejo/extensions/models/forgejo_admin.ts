@@ -1443,12 +1443,236 @@ async function ensureBranchProtection(
   return { dataHandles: [h] };
 }
 
+// --------------------------------------------------------- ensureMergeStyles
+
+/** Merge styles of a Forgejo pull request, as default_merge_style names them. */
+const MERGE_STYLES = [
+  "merge",
+  "rebase",
+  "rebase-merge",
+  "squash",
+  "fast-forward-only",
+] as const;
+type MergeStyle = typeof MERGE_STYLES[number];
+
+/** The repository field that allows each merge style. */
+const MERGE_STYLE_FIELD: Record<MergeStyle, string> = {
+  "merge": "allow_merge_commits",
+  "rebase": "allow_rebase",
+  "rebase-merge": "allow_rebase_explicit",
+  "squash": "allow_squash_merge",
+  "fast-forward-only": "allow_fast_forward_only_merge",
+};
+
+const EnsureMergeStylesArgs = z.object({
+  owner: Username.describe(
+    "Owner of the repositories (may be a site administrator)",
+  ),
+  repos: RepoSelection,
+  exclude: Exclude,
+  styles: z.array(z.enum(MERGE_STYLES)).min(1).describe(
+    "The merge styles to allow; every other style is turned off",
+  ),
+  defaultStyle: z.enum(MERGE_STYLES).describe(
+    "The style the merge button offers first; must be in styles",
+  ),
+  allowRebaseUpdate: z.boolean().optional().describe(
+    "Allow updating a pull request branch by rebase; left as is when not given",
+  ),
+  deleteBranchAfterMerge: z.boolean().optional().describe(
+    "Delete the head branch after a merge by default; left as is when not given",
+  ),
+  dryRun: DryRun,
+});
+type EnsureMergeStylesArgsT = z.infer<typeof EnsureMergeStylesArgs>;
+
+const MergeStylesRecord = z.object({
+  dryRun: z.boolean(),
+  status: Status,
+  owner: z.string(),
+  styles: z.array(z.string()),
+  defaultStyle: z.string(),
+  allowRebaseUpdate: z.boolean().nullable(),
+  deleteBranchAfterMerge: z.boolean().nullable(),
+  repos: z.array(z.object({
+    repo: z.string(),
+    changes: z.array(z.string()).describe("Settings that differ (or differed)"),
+    state: z.enum(["present", "planned", "applied"]),
+  })),
+  skipped: Skipped,
+  blockers: z.array(z.string()),
+  checkedAt: z.string(),
+});
+
+const ApiMergeSettings = z.object({
+  has_pull_requests: z.boolean(),
+  allow_merge_commits: z.boolean().optional().default(false),
+  allow_rebase: z.boolean().optional().default(false),
+  allow_rebase_explicit: z.boolean().optional().default(false),
+  allow_squash_merge: z.boolean().optional().default(false),
+  allow_fast_forward_only_merge: z.boolean().optional().default(false),
+  allow_rebase_update: z.boolean().optional().default(false),
+  default_delete_branch_after_merge: z.boolean().optional().default(false),
+  default_merge_style: z.string().optional().default(""),
+});
+type ApiMergeSettingsT = z.infer<typeof ApiMergeSettings>;
+
+async function getMergeSettings(
+  c: ForgejoClient,
+  owner: string,
+  repo: string,
+): Promise<ApiMergeSettingsT> {
+  const a = await c.expect({
+    method: "GET",
+    path: `/repos/${seg(owner)}/${seg(repo)}`,
+  }, [200]);
+  return ApiMergeSettings.parse(a.body);
+}
+
+/** The repository fields that differ from the wanted merge settings. */
+function mergeChanges(
+  have: ApiMergeSettingsT,
+  want: EnsureMergeStylesArgsT,
+): string[] {
+  const out: string[] = [];
+  const h = have as unknown as Record<string, unknown>;
+  for (const style of MERGE_STYLES) {
+    const field = MERGE_STYLE_FIELD[style];
+    if (h[field] !== want.styles.includes(style)) out.push(field);
+  }
+  if (have.default_merge_style !== want.defaultStyle) {
+    out.push("default_merge_style");
+  }
+  if (
+    want.allowRebaseUpdate !== undefined &&
+    have.allow_rebase_update !== want.allowRebaseUpdate
+  ) out.push("allow_rebase_update");
+  if (
+    want.deleteBranchAfterMerge !== undefined &&
+    have.default_delete_branch_after_merge !== want.deleteBranchAfterMerge
+  ) out.push("default_delete_branch_after_merge");
+  return out;
+}
+
+/** The PATCH body: every merge style field, the default, and the optional ones. */
+function mergeBody(want: EnsureMergeStylesArgsT): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    default_merge_style: want.defaultStyle,
+  };
+  for (const style of MERGE_STYLES) {
+    body[MERGE_STYLE_FIELD[style]] = want.styles.includes(style);
+  }
+  if (want.allowRebaseUpdate !== undefined) {
+    body.allow_rebase_update = want.allowRebaseUpdate;
+  }
+  if (want.deleteBranchAfterMerge !== undefined) {
+    body.default_delete_branch_after_merge = want.deleteBranchAfterMerge;
+  }
+  return body;
+}
+
+async function ensureMergeStyles(
+  args: EnsureMergeStylesArgsT & TestHooks,
+  ctx: Ctx,
+): Promise<{ dataHandles: { name: string }[] }> {
+  const target = `${args.owner}/${
+    args.repos === "all" ? "*" : args.repos.join(",")
+  }`;
+  log(ctx, "ensureMergeStyles {target}: checking ({mode})", {
+    target,
+    mode: args.dryRun ? "dry run" : "live",
+  });
+  const c = client(ctx, args);
+  const blockers = await callerBlockers(c);
+  if (!args.styles.includes(args.defaultStyle)) {
+    blockers.push(`defaultStyle ${args.defaultStyle} is not in styles`);
+  }
+  if (new Set(args.styles).size !== args.styles.length) {
+    blockers.push("styles lists a style twice");
+  }
+  const sel = await selectRepos(c, args.owner, args.repos, args.exclude);
+  blockers.push(...sel.blockers);
+  const skipped = [...sel.skipped];
+
+  type Row = z.infer<typeof MergeStylesRecord>["repos"][number];
+  const rows: Row[] = [];
+  for (const repo of sel.names) {
+    const have = await getMergeSettings(c, args.owner, repo);
+    if (!have.has_pull_requests) {
+      // Merge settings live in the pull request unit; a repository without
+      // it has none to set, and turning the unit on is not this method's job.
+      skipped.push({ repo, reason: "pull requests off" });
+      continue;
+    }
+    const changes = mergeChanges(have, args);
+    rows.push({ repo, changes, state: changes.length ? "planned" : "present" });
+  }
+  const changed = rows.some((r) => r.state === "planned");
+  const dataName = `${args.owner}-merge-styles`;
+  const record = (status: z.infer<typeof Status>) => ({
+    dryRun: args.dryRun,
+    status,
+    owner: args.owner,
+    styles: [...args.styles],
+    defaultStyle: args.defaultStyle,
+    allowRebaseUpdate: args.allowRebaseUpdate ?? null,
+    deleteBranchAfterMerge: args.deleteBranchAfterMerge ?? null,
+    repos: rows,
+    skipped,
+    blockers,
+    checkedAt: new Date().toISOString(),
+  });
+
+  if (blockers.length || args.dryRun || !changed) {
+    const status = runStatus(blockers.length > 0, true, changed);
+    const h = await ctx.writeResource("mergeStyles", dataName, record(status));
+    if (blockers.length) {
+      throw new Error(
+        `ensureMergeStyles ${target} blocked: ${blockers.join("; ")}`,
+      );
+    }
+    log(ctx, "ensureMergeStyles {target}: {status} ({n} repositories)", {
+      target,
+      status,
+      n: rows.length,
+    });
+    return { dataHandles: [h] };
+  }
+
+  for (const row of rows) {
+    if (row.state !== "planned") continue;
+    await c.expect({
+      method: "PATCH",
+      path: `/repos/${seg(args.owner)}/${seg(row.repo)}`,
+      body: mergeBody(args),
+    }, [200]);
+    const left = mergeChanges(
+      await getMergeSettings(c, args.owner, row.repo),
+      args,
+    );
+    if (left.length) {
+      throw new Error(
+        `${args.owner}/${row.repo} check failed: ${
+          left.join(", ")
+        } still differ`,
+      );
+    }
+    row.state = "applied";
+  }
+  const h = await ctx.writeResource("mergeStyles", dataName, record("applied"));
+  log(ctx, "ensureMergeStyles {target}: applied ({n} repositories)", {
+    target,
+    n: rows.length,
+  });
+  return { dataHandles: [h] };
+}
+
 // --------------------------------------------------------------------- model
 
 /** The `@dmc/forgejo/admin` model. */
 export const model = {
   type: "@dmc/forgejo/admin",
-  version: "2026.11.28.2",
+  version: "2026.11.28.3",
   globalArguments: ForgejoConnectionArgs,
   upgrades: [
     {
@@ -1461,6 +1685,12 @@ export const model = {
       toVersion: "2026.11.28.2",
       description:
         'New method ensureBranchProtection (direct push denied, allowlist or allowed; push and merge allowlists; dismiss stale approvals; status checks kept) with the protection resource. Breaking for ensureCollaborator: it fans out over repos (a list or "all", with exclude) in place of one repo, and its collaborator record holds one row per repository. Global arguments do not change',
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.28.3",
+      description:
+        "Additive: new method ensureMergeStyles (allowed merge styles, default style, rebase update and delete-branch-after-merge on many repositories) with the mergeStyles resource. No argument changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1499,6 +1729,12 @@ export const model = {
     collaborator: {
       description: "Plan and check of an ensureCollaborator run",
       schema: CollaboratorRecord,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    mergeStyles: {
+      description: "Plan, changes and check of an ensureMergeStyles run",
+      schema: MergeStylesRecord,
       lifetime: "infinite",
       garbageCollection: 20,
     },
@@ -1600,6 +1836,16 @@ export const model = {
       arguments: EnsureBranchProtectionArgs,
       execute: (args: EnsureBranchProtectionArgsT & TestHooks, context: Ctx) =>
         ensureBranchProtection(args, context),
+    },
+    ensureMergeStyles: {
+      description:
+        "Set the merge styles of many repositories of one owner (a list, or all with exclude; archived repositories, mirrors and repositories with pull requests off are skipped and reported): the allowed styles (every other style is turned off), the default style, and, when given, rebase update and delete-branch-after-merge. Fast-forward only keeps the commits of a pull request as they are, so their signatures stay valid. " +
+        "Each repository is read back and must match. Reads every repository first and changes none while any blocker exists. One record per run. " +
+        "Dry run by default; a blocker fails the run. " +
+        "Needs: a token with admin access to the repositories (a site administrator's token with write:repository and read:user).",
+      arguments: EnsureMergeStylesArgs,
+      execute: (args: EnsureMergeStylesArgsT & TestHooks, context: Ctx) =>
+        ensureMergeStyles(args, context),
     },
   },
 };
