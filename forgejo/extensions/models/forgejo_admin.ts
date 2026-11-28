@@ -730,13 +730,128 @@ async function ensureUserToken(
   return { dataHandles: [recHandle, tokenHandle] };
 }
 
+// ------------------------------------------------------- repository fan-out
+
+/** Which repositories of the owner a fan-out method works on. */
+const RepoSelection = z.union([z.literal("all"), z.array(Slug).min(1)])
+  .describe(
+    'Repository names of the owner, or "all": every repository the owner owns (archived repositories and mirrors are skipped and reported)',
+  );
+const Exclude = z.array(z.string().min(1)).default([]).describe(
+  'Repository names to leave out (with "all")',
+);
+
+const Skipped = z.array(z.object({ repo: z.string(), reason: z.string() }));
+
+const ApiOwnedRepo = z.object({
+  name: z.string(),
+  archived: z.boolean().optional().default(false),
+  mirror: z.boolean().optional().default(false),
+  owner: z.object({ login: z.string() }),
+});
+
+/** Every repository the user owns (an admin sees private ones too). */
+async function listOwnedRepos(c: ForgejoClient, owner: string) {
+  const all: z.infer<typeof ApiOwnedRepo>[] = [];
+  const limit = 50;
+  for (let page = 1; page <= 40; page++) {
+    const a = await c.expect({
+      method: "GET",
+      path: `/users/${seg(owner)}/repos?page=${page}&limit=${limit}`,
+    }, [200]);
+    const items = z.array(ApiOwnedRepo).parse(a.body ?? []);
+    all.push(...items.filter((r) => r.owner.login === owner));
+    if (items.length < limit) return all;
+  }
+  throw new Error(`more than 2000 repositories for ${owner}`);
+}
+
+/**
+ * Resolve the repositories a fan-out run works on. With "all", archived
+ * repositories and mirrors are skipped (Forgejo refuses changes to an
+ * archived repository; a mirror takes no pushes), and a name this extension
+ * cannot use blocks unless it is excluded: no repository is left out
+ * silently. A listed repository must exist and not be archived.
+ */
+async function selectRepos(
+  c: ForgejoClient,
+  owner: string,
+  repos: "all" | string[],
+  exclude: string[],
+): Promise<
+  { names: string[]; skipped: z.infer<typeof Skipped>; blockers: string[] }
+> {
+  const names: string[] = [];
+  const skipped: z.infer<typeof Skipped> = [];
+  const blockers: string[] = [];
+  const excluded = new Set(exclude);
+  if (repos === "all") {
+    for (const r of await listOwnedRepos(c, owner)) {
+      if (excluded.has(r.name)) {
+        skipped.push({ repo: r.name, reason: "excluded" });
+      } else if (r.archived) skipped.push({ repo: r.name, reason: "archived" });
+      else if (r.mirror) skipped.push({ repo: r.name, reason: "mirror" });
+      else if (!SLUG_RE.test(r.name)) {
+        blockers.push(
+          `repository ${owner}/${r.name} has a name this extension cannot use; add it to exclude`,
+        );
+      } else names.push(r.name);
+    }
+    if (names.length === 0 && blockers.length === 0) {
+      blockers.push(`no repository of ${owner} is left to work on`);
+    }
+  } else {
+    if (new Set(repos).size !== repos.length) {
+      blockers.push("repos lists a repository twice");
+    }
+    for (const name of new Set(repos)) {
+      if (excluded.has(name)) {
+        skipped.push({ repo: name, reason: "excluded" });
+        continue;
+      }
+      const a = await c.call({
+        method: "GET",
+        path: `/repos/${seg(owner)}/${seg(name)}`,
+      });
+      if (a.status === 404) {
+        blockers.push(`repository ${owner}/${name} does not exist`);
+        continue;
+      }
+      if (a.status !== 200) {
+        throw new Error(`GET /repos/${owner}/${name}: HTTP ${a.status}`);
+      }
+      const r = ApiOwnedRepo.parse(a.body);
+      if (r.owner.login !== owner) {
+        blockers.push(
+          `${owner}/${name} redirects to ${r.owner.login}; give the real owner`,
+        );
+      } else if (r.archived) {
+        blockers.push(`repository ${owner}/${name} is archived`);
+      } else names.push(name);
+    }
+  }
+  return { names: names.sort(), skipped, blockers };
+}
+
+/** The overall status of a fan-out run from its per-repository states. */
+function runStatus(
+  blocked: boolean,
+  dryRun: boolean,
+  changed: boolean,
+): z.infer<typeof Status> {
+  if (blocked) return "blocked";
+  if (!changed) return "unchanged";
+  return dryRun ? "planned" : "applied";
+}
+
 // -------------------------------------------------------- ensureCollaborator
 
 const EnsureCollaboratorArgs = z.object({
   owner: Username.describe(
-    "Owner of an existing repository (may be a site administrator)",
+    "Owner of the repositories (may be a site administrator)",
   ),
-  repo: Slug.describe("Name of the existing repository"),
+  repos: RepoSelection,
+  exclude: Exclude,
   collaborator: Username.describe(
     "The user to add; must not be a site administrator",
   ),
@@ -749,12 +864,16 @@ const CollaboratorRecord = z.object({
   dryRun: z.boolean(),
   status: Status,
   owner: z.string(),
-  repo: z.string(),
   collaborator: z.string(),
   permission: z.string(),
-  previousPermission: z.string().nullable().describe(
-    "The collaborator's permission before the run; null when not a collaborator",
-  ),
+  repos: z.array(z.object({
+    repo: z.string(),
+    previousPermission: z.string().nullable().describe(
+      "Permission before the run; null when not a collaborator",
+    ),
+    state: z.enum(["present", "planned", "applied"]),
+  })),
+  skipped: Skipped,
   blockers: z.array(z.string()),
   checkedAt: z.string(),
 });
@@ -782,7 +901,9 @@ async function ensureCollaborator(
   args: EnsureCollaboratorArgsT & TestHooks,
   ctx: Ctx,
 ): Promise<{ dataHandles: { name: string }[] }> {
-  const target = `${args.owner}/${args.repo}`;
+  const target = `${args.owner}/${
+    args.repos === "all" ? "*" : args.repos.join(",")
+  }`;
   log(ctx, "ensureCollaborator {target} {collaborator}: checking ({mode})", {
     target,
     collaborator: args.collaborator,
@@ -794,70 +915,86 @@ async function ensureCollaborator(
   if (!user) blockers.push(`user ${args.collaborator} does not exist`);
   else blockers.push(...managedUserBlockers(user));
   if (args.collaborator === args.owner) {
-    blockers.push(`${args.collaborator} is the owner of ${target}`);
+    blockers.push(`${args.collaborator} is the owner`);
   }
-  const repo = await getRepo(c, args.owner, args.repo);
-  if (!repo) blockers.push(`repository ${target} does not exist`);
-  const before = repo && user
-    ? await collaboratorPermission(c, args.owner, args.repo, args.collaborator)
-    : null;
+  const sel = await selectRepos(c, args.owner, args.repos, args.exclude);
+  blockers.push(...sel.blockers);
 
-  const dataName =
-    `${args.owner}--${args.repo}--${args.collaborator}-collaborator`;
+  type Row = z.infer<typeof CollaboratorRecord>["repos"][number];
+  const rows: Row[] = [];
+  for (const repo of sel.names) {
+    const before = user
+      ? await collaboratorPermission(c, args.owner, repo, args.collaborator)
+      : null;
+    rows.push({
+      repo,
+      previousPermission: before,
+      state: before === args.permission ? "present" : "planned",
+    });
+  }
+  const changed = rows.some((r) => r.state === "planned");
+  const dataName = `${args.owner}--${args.collaborator}-collaborator`;
   const record = (status: z.infer<typeof Status>) => ({
     dryRun: args.dryRun,
     status,
     owner: args.owner,
-    repo: args.repo,
     collaborator: args.collaborator,
     permission: args.permission,
-    previousPermission: before,
+    repos: rows,
+    skipped: sel.skipped,
     blockers,
     checkedAt: new Date().toISOString(),
   });
 
-  const same = before === args.permission;
-  if (blockers.length || args.dryRun || same) {
-    const status = blockers.length ? "blocked" : same ? "unchanged" : "planned";
+  if (blockers.length || args.dryRun || !changed) {
+    const status = runStatus(blockers.length > 0, true, changed);
     const h = await ctx.writeResource("collaborator", dataName, record(status));
     if (blockers.length) {
       throw new Error(
         `ensureCollaborator ${dataName} blocked: ${blockers.join("; ")}`,
       );
     }
-    log(ctx, "ensureCollaborator {target}: {status}", {
+    log(ctx, "ensureCollaborator {target}: {status} ({n} repositories)", {
       target: dataName,
       status,
+      n: rows.length,
     });
     return { dataHandles: [h] };
   }
 
-  await c.expect({
-    method: "PUT",
-    path: `/repos/${seg(args.owner)}/${seg(args.repo)}/collaborators/${
-      seg(args.collaborator)
-    }`,
-    body: { permission: args.permission },
-  }, [204]);
-  const after = await collaboratorPermission(
-    c,
-    args.owner,
-    args.repo,
-    args.collaborator,
-  );
-  if (after !== args.permission) {
-    throw new Error(
-      `${args.collaborator} on ${target} check failed: permission is ${
-        after ?? "none"
-      }, not ${args.permission}`,
+  for (const row of rows) {
+    if (row.state !== "planned") continue;
+    await c.expect({
+      method: "PUT",
+      path: `/repos/${seg(args.owner)}/${seg(row.repo)}/collaborators/${
+        seg(args.collaborator)
+      }`,
+      body: { permission: args.permission },
+    }, [204]);
+    const after = await collaboratorPermission(
+      c,
+      args.owner,
+      row.repo,
+      args.collaborator,
     );
+    if (after !== args.permission) {
+      throw new Error(
+        `${args.collaborator} on ${args.owner}/${row.repo} check failed: permission is ${
+          after ?? "none"
+        }, not ${args.permission}`,
+      );
+    }
+    row.state = "applied";
   }
   const h = await ctx.writeResource(
     "collaborator",
     dataName,
     record("applied"),
   );
-  log(ctx, "ensureCollaborator {target}: applied", { target: dataName });
+  log(ctx, "ensureCollaborator {target}: applied ({n} repositories)", {
+    target: dataName,
+    n: rows.length,
+  });
   return { dataHandles: [h] };
 }
 
@@ -1038,18 +1175,292 @@ async function ensureUserKey(
   return { dataHandles: [h] };
 }
 
+// ---------------------------------------------------- ensureBranchProtection
+
+const EnsureBranchProtectionArgs = z.object({
+  owner: Username.describe(
+    "Owner of the repositories (may be a site administrator)",
+  ),
+  repos: RepoSelection,
+  exclude: Exclude,
+  rule: Slug.describe("Branch name the rule protects, e.g. main (no globs)"),
+  directPush: z.enum(["denied", "allowlist", "allowed"]).describe(
+    "denied: changes only through merged pull requests; allowlist: only pushAllowlist may push; allowed: any writer may push",
+  ),
+  pushAllowlist: z.array(Username).default([]).describe(
+    "Users who may push directly (directPush allowlist only)",
+  ),
+  mergeAllowlist: z.array(Username).describe(
+    "Users who may merge pull requests; an empty list lets any writer merge",
+  ),
+  dismissStaleApprovals: z.boolean().optional().describe(
+    "Dismiss approvals when new commits are pushed; left as is when not given",
+  ),
+  dryRun: DryRun,
+});
+type EnsureBranchProtectionArgsT = z.infer<typeof EnsureBranchProtectionArgs>;
+
+const ProtectionRecord = z.object({
+  dryRun: z.boolean(),
+  status: Status,
+  owner: z.string(),
+  rule: z.string(),
+  directPush: z.string(),
+  pushAllowlist: z.array(z.string()),
+  mergeAllowlist: z.array(z.string()),
+  dismissStaleApprovals: z.boolean().nullable(),
+  repos: z.array(z.object({
+    repo: z.string(),
+    created: z.boolean().describe("True when the rule did not exist before"),
+    changes: z.array(z.string()).describe("Settings that differ (or differed)"),
+    statusCheckContexts: z.array(z.string()).describe(
+      "Status checks of the rule, read and kept as they are",
+    ),
+    state: z.enum(["present", "planned", "applied"]),
+  })),
+  skipped: Skipped,
+  blockers: z.array(z.string()),
+  checkedAt: z.string(),
+});
+
+const ApiProtection = z.object({
+  rule_name: z.string(),
+  enable_push: z.boolean(),
+  enable_push_whitelist: z.boolean(),
+  push_whitelist_usernames: z.array(z.string()).nullable().optional(),
+  enable_merge_whitelist: z.boolean(),
+  merge_whitelist_usernames: z.array(z.string()).nullable().optional(),
+  dismiss_stale_approvals: z.boolean().optional().default(false),
+  status_check_contexts: z.array(z.string()).nullable().optional(),
+});
+type ApiProtectionT = z.infer<typeof ApiProtection>;
+
+async function getProtection(
+  c: ForgejoClient,
+  owner: string,
+  repo: string,
+  rule: string,
+): Promise<ApiProtectionT | null> {
+  const path = `/repos/${seg(owner)}/${seg(repo)}/branch_protections/${
+    seg(rule)
+  }`;
+  const a = await c.call({ method: "GET", path });
+  if (a.status === 404) return null;
+  if (a.status !== 200) throw new Error(`GET ${path}: HTTP ${a.status}`);
+  return ApiProtection.parse(a.body);
+}
+
+function sameSet(a: string[] | null | undefined, b: string[]): boolean {
+  return sameScopes(a ?? [], b);
+}
+
+/** The settings that differ between Forgejo's rule and the wanted one. */
+function protectionChanges(
+  have: ApiProtectionT | null,
+  want: EnsureBranchProtectionArgsT,
+): string[] {
+  if (!have) return ["createRule"];
+  const out: string[] = [];
+  const push = !have.enable_push
+    ? "denied"
+    : have.enable_push_whitelist
+    ? "allowlist"
+    : "allowed";
+  if (push !== want.directPush) out.push("directPush");
+  if (
+    want.directPush === "allowlist" &&
+    !sameSet(have.push_whitelist_usernames, want.pushAllowlist)
+  ) out.push("pushAllowlist");
+  const mergeOn = want.mergeAllowlist.length > 0;
+  if (have.enable_merge_whitelist !== mergeOn) out.push("mergeAllowlistOn");
+  if (
+    mergeOn && !sameSet(have.merge_whitelist_usernames, want.mergeAllowlist)
+  ) {
+    out.push("mergeAllowlist");
+  }
+  if (
+    want.dismissStaleApprovals !== undefined &&
+    have.dismiss_stale_approvals !== want.dismissStaleApprovals
+  ) out.push("dismissStaleApprovals");
+  return out;
+}
+
+/** The Forgejo body for the wanted rule. Forgejo's API names the allowlists
+ *  "whitelist"; this extension does not. Status checks are not sent, so
+ *  Forgejo keeps them. */
+function protectionBody(want: EnsureBranchProtectionArgsT) {
+  const mergeOn = want.mergeAllowlist.length > 0;
+  const body: Record<string, unknown> = {
+    enable_push: want.directPush !== "denied",
+    enable_push_whitelist: want.directPush === "allowlist",
+    push_whitelist_usernames: want.directPush === "allowlist"
+      ? want.pushAllowlist
+      : [],
+    push_whitelist_deploy_keys: false,
+    enable_merge_whitelist: mergeOn,
+    merge_whitelist_usernames: want.mergeAllowlist,
+  };
+  if (want.dismissStaleApprovals !== undefined) {
+    body.dismiss_stale_approvals = want.dismissStaleApprovals;
+  }
+  return body;
+}
+
+async function ensureBranchProtection(
+  args: EnsureBranchProtectionArgsT & TestHooks,
+  ctx: Ctx,
+): Promise<{ dataHandles: { name: string }[] }> {
+  const target = `${args.owner}/${
+    args.repos === "all" ? "*" : args.repos.join(",")
+  }:${args.rule}`;
+  log(ctx, "ensureBranchProtection {target}: checking ({mode})", {
+    target,
+    mode: args.dryRun ? "dry run" : "live",
+  });
+  const c = client(ctx, args);
+  const blockers = await callerBlockers(c);
+  if (args.directPush === "allowlist" && args.pushAllowlist.length === 0) {
+    blockers.push(
+      "directPush allowlist needs at least one user in pushAllowlist",
+    );
+  }
+  if (args.directPush !== "allowlist" && args.pushAllowlist.length > 0) {
+    blockers.push("pushAllowlist is given, but directPush is not allowlist");
+  }
+  const sel = await selectRepos(c, args.owner, args.repos, args.exclude);
+  blockers.push(...sel.blockers);
+  // Forgejo silently drops an allowlist user without write access, so each
+  // one must exist and be the owner or a writer, on every repository.
+  const listed = [...new Set([...args.pushAllowlist, ...args.mergeAllowlist])]
+    .filter((u) => u !== args.owner);
+  const known = new Set<string>();
+  for (const u of listed) {
+    if (await getUser(c, u)) known.add(u);
+    else blockers.push(`allowlist user ${u} does not exist`);
+  }
+
+  type Row = z.infer<typeof ProtectionRecord>["repos"][number];
+  const rows: Row[] = [];
+  const before = new Map<string, ApiProtectionT | null>();
+  for (const repo of sel.names) {
+    for (const u of known) {
+      const p = await collaboratorPermission(c, args.owner, repo, u);
+      if (p !== "write" && p !== "admin" && p !== "owner") {
+        blockers.push(
+          `allowlist user ${u} has no write access to ${args.owner}/${repo}`,
+        );
+      }
+    }
+    const have = await getProtection(c, args.owner, repo, args.rule);
+    before.set(repo, have);
+    const changes = protectionChanges(have, args);
+    rows.push({
+      repo,
+      created: false,
+      changes,
+      statusCheckContexts: have?.status_check_contexts ?? [],
+      state: changes.length ? "planned" : "present",
+    });
+  }
+  const changed = rows.some((r) => r.state === "planned");
+  const dataName = `${args.owner}--${args.rule}-protection`;
+  const record = (status: z.infer<typeof Status>) => ({
+    dryRun: args.dryRun,
+    status,
+    owner: args.owner,
+    rule: args.rule,
+    directPush: args.directPush,
+    pushAllowlist: args.pushAllowlist,
+    mergeAllowlist: args.mergeAllowlist,
+    dismissStaleApprovals: args.dismissStaleApprovals ?? null,
+    repos: rows,
+    skipped: sel.skipped,
+    blockers,
+    checkedAt: new Date().toISOString(),
+  });
+
+  if (blockers.length || args.dryRun || !changed) {
+    const status = runStatus(blockers.length > 0, true, changed);
+    const h = await ctx.writeResource("protection", dataName, record(status));
+    if (blockers.length) {
+      throw new Error(
+        `ensureBranchProtection ${target} blocked: ${blockers.join("; ")}`,
+      );
+    }
+    log(ctx, "ensureBranchProtection {target}: {status} ({n} repositories)", {
+      target,
+      status,
+      n: rows.length,
+    });
+    return { dataHandles: [h] };
+  }
+
+  for (const row of rows) {
+    if (row.state !== "planned") continue;
+    const have = before.get(row.repo) ?? null;
+    const base = `/repos/${seg(args.owner)}/${
+      seg(row.repo)
+    }/branch_protections`;
+    if (!have) {
+      await c.expect({
+        method: "POST",
+        path: base,
+        body: { rule_name: args.rule, ...protectionBody(args) },
+      }, [201]);
+    } else {
+      await c.expect({
+        method: "PATCH",
+        path: `${base}/${seg(args.rule)}`,
+        body: protectionBody(args),
+      }, [200]);
+    }
+    const after = await getProtection(c, args.owner, row.repo, args.rule);
+    const where = `${args.owner}/${row.repo}:${args.rule}`;
+    if (!after) throw new Error(`${where} rule is missing after the write`);
+    const left = protectionChanges(after, args);
+    if (left.length) {
+      throw new Error(
+        `${where} check failed: ${
+          left.join(", ")
+        } still differ (Forgejo drops allowlist users without write access)`,
+      );
+    }
+    if (
+      have &&
+      !sameSet(after.status_check_contexts, have.status_check_contexts ?? [])
+    ) {
+      throw new Error(`${where} check failed: the status checks changed`);
+    }
+    row.created = !have;
+    row.statusCheckContexts = after.status_check_contexts ?? [];
+    row.state = "applied";
+  }
+  const h = await ctx.writeResource("protection", dataName, record("applied"));
+  log(ctx, "ensureBranchProtection {target}: applied ({n} repositories)", {
+    target,
+    n: rows.length,
+  });
+  return { dataHandles: [h] };
+}
+
 // --------------------------------------------------------------------- model
 
 /** The `@dmc/forgejo/admin` model. */
 export const model = {
   type: "@dmc/forgejo/admin",
-  version: "2026.11.28.1",
+  version: "2026.11.28.2",
   globalArguments: ForgejoConnectionArgs,
   upgrades: [
     {
       toVersion: "2026.11.28.1",
       description:
         "Additive: new methods ensureCollaborator (add a non-admin user to an existing repository, also one an admin owns) and ensureUserKey (add an SSH public key to a non-admin account), with the collaborator and key resources. No argument changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.28.2",
+      description:
+        'New method ensureBranchProtection (direct push denied, allowlist or allowed; push and merge allowlists; dismiss stale approvals; status checks kept) with the protection resource. Breaking for ensureCollaborator: it fans out over repos (a list or "all", with exclude) in place of one repo, and its collaborator record holds one row per repository. Global arguments do not change',
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1088,6 +1499,12 @@ export const model = {
     collaborator: {
       description: "Plan and check of an ensureCollaborator run",
       schema: CollaboratorRecord,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    protection: {
+      description: "Plan, changes and check of an ensureBranchProtection run",
+      schema: ProtectionRecord,
       lifetime: "infinite",
       garbageCollection: 20,
     },
@@ -1157,7 +1574,7 @@ export const model = {
     },
     ensureCollaborator: {
       description:
-        "Add a user to an existing repository as a collaborator with a permission, or change its permission. The repository may belong to a site administrator; the collaborator must not be one. An equal permission is reported unchanged. Never removes a collaborator. " +
+        "Add a user as a collaborator with a permission to many repositories of one owner (a list, or all with exclude; archived repositories and mirrors are skipped and reported), or change its permission. The repositories may belong to a site administrator; the collaborator must not be one. Reads every repository first and changes none while any blocker exists. An equal permission is reported present. Never removes a collaborator. One record per run. " +
         "Dry run by default; a blocker fails the run. " +
         "Needs: a site-administrator token with write:repository and read:user.",
       arguments: EnsureCollaboratorArgs,
@@ -1173,6 +1590,16 @@ export const model = {
       arguments: EnsureUserKeyArgs,
       execute: (args: EnsureUserKeyArgsT & TestHooks, context: Ctx) =>
         ensureUserKey(args, context),
+    },
+    ensureBranchProtection: {
+      description:
+        "Make or change the protection rule of one branch on many repositories of one owner (a list, or all with exclude; archived repositories and mirrors are skipped and reported): direct push denied (pull requests only), limited to a push allowlist, or allowed; a merge allowlist (an empty list lets any writer merge); and, when given, dismiss stale approvals. " +
+        "Status checks and all other settings are kept. Each allowlist user must be the owner or have write access, because Forgejo silently drops other users; each rule is read back and must match. Reads every repository first and changes none while any blocker exists. Repository admins still bypass the rule (apply_to_admins is not changed). Never deletes a rule. One record per run. " +
+        "Dry run by default; a blocker fails the run. " +
+        "Needs: a token with admin access to the repository (a site administrator's token with write:repository and read:user).",
+      arguments: EnsureBranchProtectionArgs,
+      execute: (args: EnsureBranchProtectionArgsT & TestHooks, context: Ctx) =>
+        ensureBranchProtection(args, context),
     },
   },
 };

@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@dmc/forgejo"
-version: "2026.11.28.1"
-description: "Forgejo site-administrator work over the API, dry run first: make a limited service account (restricted, private, repository limit) with a generated password, give it a repository with Actions and collaborators, make an access token with exact non-admin scopes, checked with GET /user, add a user as a collaborator to an existing repository, and add an SSH public key for push and commit signing. New passwords and tokens are sensitive outputs stored in the vault, never in data"
+version: "2026.11.28.2"
+description: "Forgejo site-administrator work over the API, dry run first: make a limited service account (restricted, private, repository limit) with a generated password, give it a repository with Actions and collaborators, make an access token with exact non-admin scopes, checked with GET /user, add a user as a collaborator to an existing repository, add an SSH public key for push and commit signing, and protect a branch with push and merge allowlists. New passwords and tokens are sensitive outputs stored in the vault, never in data"
 repository: "https://github.com/danmcclain/swamp-extensions"
 license: MIT
 labels:

@@ -10,13 +10,14 @@ token of a separate account, so it never holds the token of the main account.
 
 ## Methods
 
-| Method               | What it does                                                                                                                                                                                                                                                                                                                        |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ensureUser`         | Makes a local account with a generated password, or sets the limits of an existing account: `restricted`, `visibility`, `maxRepoCreation` and `allowCreateOrganization`. Never changes the password, email or admin flag of an existing account.                                                                                    |
-| `ensureRepo`         | Makes a repository for a user (as admin, with a README on `main`), sets it private or not, turns the Actions unit on or off, and adds collaborators with a permission. Never deletes a repository and never removes a collaborator.                                                                                                 |
-| `ensureUserToken`    | Makes an access token for an account, with exact scopes and no admin scope. It checks the new token with `GET /user`: the token must belong to that account, and the account must not be an admin. If a check fails, or the vault cannot store the token, the method deletes the token. Never changes or deletes an existing token. |
-| `ensureCollaborator` | Adds a user to an existing repository as a collaborator with a permission, or changes its permission. The repository may belong to a site administrator; the collaborator must not be one. An equal permission is reported unchanged. Never removes a collaborator.                                                                 |
-| `ensureUserKey`      | Adds one SSH public key (ed25519 or ECDSA) to an account, for git over SSH and SSH commit signing. Refuses a private key, RSA and multi-line text. A key the account already has is reported unchanged. Data keeps the fingerprint and the `verified` flag, never the key. Never removes a key.                                     |
+| Method                   | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ensureUser`             | Makes a local account with a generated password, or sets the limits of an existing account: `restricted`, `visibility`, `maxRepoCreation` and `allowCreateOrganization`. Never changes the password, email or admin flag of an existing account.                                                                                                                                                                                                                                                                                           |
+| `ensureRepo`             | Makes a repository for a user (as admin, with a README on `main`), sets it private or not, turns the Actions unit on or off, and adds collaborators with a permission. Never deletes a repository and never removes a collaborator.                                                                                                                                                                                                                                                                                                        |
+| `ensureUserToken`        | Makes an access token for an account, with exact scopes and no admin scope. It checks the new token with `GET /user`: the token must belong to that account, and the account must not be an admin. If a check fails, or the vault cannot store the token, the method deletes the token. Never changes or deletes an existing token.                                                                                                                                                                                                        |
+| `ensureCollaborator`     | Adds a user as a collaborator with a permission to many repositories of one owner (`repos`: a list, or `all` with `exclude`), or changes its permission. The repositories may belong to a site administrator; the collaborator must not be one. Reads every repository first and changes none while any blocker exists. Never removes a collaborator.                                                                                                                                                                                      |
+| `ensureUserKey`          | Adds one SSH public key (ed25519 or ECDSA) to an account, for git over SSH and SSH commit signing. Refuses a private key, RSA and multi-line text. A key the account already has is reported unchanged. Data keeps the fingerprint and the `verified` flag, never the key. Never removes a key.                                                                                                                                                                                                                                            |
+| `ensureBranchProtection` | Makes or changes the protection rule of one branch on many repositories of one owner (`repos`: a list, or `all` with `exclude`): direct push `denied` (pull requests only), limited to a push allowlist, or `allowed`; a merge allowlist (an empty list lets any writer merge); and, when given, dismiss stale approvals. Keeps status checks and all other settings. Each allowlist user must be the owner or have write access, because Forgejo silently drops other users; each rule is read back and must match. Never deletes a rule. |
 
 All methods:
 
@@ -48,15 +49,16 @@ password from every error message.
 
 ## Data
 
-| Resource       | Data name                                      | Content                                                                     |
-| -------------- | ---------------------------------------------- | --------------------------------------------------------------------------- |
-| `user`         | `{username}-user`                              | Plan, actions, blockers and check of `ensureUser`                           |
-| `password`     | `{username}-password`                          | The generated password (sensitive), only when `ensureUser` made the account |
-| `repo`         | `{owner}--{repo}-repo`                         | Plan, actions, blockers and check of `ensureRepo`                           |
-| `tokenAccess`  | `{username}--{tokenName}-token-access`         | Plan, token ID, scopes and check of `ensureUserToken`                       |
-| `token`        | `{username}--{tokenName}-token`                | The token (sensitive), only when `ensureUserToken` made it                  |
-| `collaborator` | `{owner}--{repo}--{collaborator}-collaborator` | Plan, permission before and after, and blockers of `ensureCollaborator`     |
-| `key`          | `{username}--{title}-key`                      | Plan, key type, key ID, fingerprint and `verified` of `ensureUserKey`       |
+| Resource       | Data name                              | Content                                                                                                                                      |
+| -------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `user`         | `{username}-user`                      | Plan, actions, blockers and check of `ensureUser`                                                                                            |
+| `password`     | `{username}-password`                  | The generated password (sensitive), only when `ensureUser` made the account                                                                  |
+| `repo`         | `{owner}--{repo}-repo`                 | Plan, actions, blockers and check of `ensureRepo`                                                                                            |
+| `tokenAccess`  | `{username}--{tokenName}-token-access` | Plan, token ID, scopes and check of `ensureUserToken`                                                                                        |
+| `token`        | `{username}--{tokenName}-token`        | The token (sensitive), only when `ensureUserToken` made it                                                                                   |
+| `collaborator` | `{owner}--{collaborator}-collaborator` | One row per repository (permission before, state), skipped repositories and blockers of `ensureCollaborator`                                 |
+| `key`          | `{username}--{title}-key`              | Plan, key type, key ID, fingerprint and `verified` of `ensureUserKey`                                                                        |
+| `protection`   | `{owner}--{rule}-protection`           | One row per repository (created, changed settings, kept status checks, state), skipped repositories and blockers of `ensureBranchProtection` |
 
 Usernames, repository names and token names must be lowercase letters and digits
 in groups joined by single hyphens. So `--` in a data name separates the owner
@@ -82,6 +84,32 @@ A workflow usually runs the three methods in order: `ensureUser`, then
 `ensureRepo` (with the main account as a collaborator), then `ensureUserToken`
 with `scopes: ["write:user"]` (the scope that lets the account manage its own
 user-level Actions runners).
+
+## Fan-out over repositories
+
+`ensureCollaborator` and `ensureBranchProtection` take `repos`: a list of
+repository names, or `all` for every repository the owner owns. With `all`,
+archived repositories and mirrors are skipped and listed in the record, and a
+name the extension cannot use in data names (uppercase, dots, underscores)
+blocks the run until it is added to `exclude`, so no repository is left out
+silently. Each run reads every repository first, changes none while any blocker
+exists, and writes one record. Forgejo has no protection rule above the
+repository (no user, organization or server rules), so a fan-out run is how one
+policy covers many repositories; run it again after you make a repository.
+
+## Branch protection
+
+Forgejo's API calls the allowlists `push_whitelist_*` and `merge_whitelist_*`;
+`ensureBranchProtection` uses the words push allowlist and merge allowlist.
+Repository admins (and site administrators) still bypass a rule, because the
+method does not set `apply_to_admins`. A typical rule for a repository where a
+service account may only open pull requests:
+
+```yaml
+directPush: denied # every change comes through a merged pull request
+mergeAllowlist: [dmc] # only dmc may merge
+dismissStaleApprovals: true
+```
 
 ## SSH commit signing
 

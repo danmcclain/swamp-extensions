@@ -49,9 +49,19 @@ class FakeForgejo {
   tokens: FakeToken[] = [];
   repos = new Map<
     string,
-    { id: number; private: boolean; has_actions: boolean; owner: string }
+    {
+      id: number;
+      private: boolean;
+      has_actions: boolean;
+      owner: string;
+      archived?: boolean;
+      mirror?: boolean;
+    }
   >();
   collaborators = new Map<string, Map<string, string>>();
+  protections = new Map<string, Record<string, unknown>>();
+  /** Fault switch: drop merge allowlist users on write. */
+  dropMergeAllowlist = false;
   keys = new Map<
     string,
     {
@@ -199,7 +209,18 @@ class FakeForgejo {
         r.private = b.private;
         r.has_actions = b.has_actions;
       }
-      return json(200, { ...r, owner: { login: r.owner } });
+      return json(200, { ...r, name: m[2], owner: { login: r.owner } });
+    }
+    if (method === "GET" && (m = path.match(/^\/users\/([^/]+)\/repos$/))) {
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const list = [...this.repos.entries()]
+        .filter(([k]) => k.startsWith(`${m![1]}/`))
+        .map(([k, r]) => ({
+          ...r,
+          name: k.split("/")[1],
+          owner: { login: r.owner },
+        }));
+      return json(200, page === 1 ? list : []);
     }
     if (
       method === "GET" &&
@@ -209,6 +230,41 @@ class FakeForgejo {
     ) {
       const p = this.collaborators.get(`${m[1]}/${m[2]}`)?.get(m[3]);
       return json(200, { permission: p ?? "none" });
+    }
+    if (
+      (m = path.match(
+        /^\/repos\/([^/]+)\/([^/]+)\/branch_protections(?:\/([^/]+))?$/,
+      ))
+    ) {
+      const key = `${m[1]}/${m[2]}`;
+      if (!this.repos.has(key)) return json(404);
+      const b = (body ?? {}) as Record<string, unknown>;
+      const fix = (r: Record<string, unknown>) => {
+        if (this.dropMergeAllowlist) r.merge_whitelist_usernames = [];
+        if (r.enable_push === false) r.enable_push_whitelist = false;
+        return r;
+      };
+      if (method === "POST" && !m[3]) {
+        const r = fix({
+          enable_push: true,
+          enable_push_whitelist: false,
+          push_whitelist_usernames: [],
+          enable_merge_whitelist: false,
+          merge_whitelist_usernames: [],
+          dismiss_stale_approvals: false,
+          status_check_contexts: [],
+          ...b,
+        });
+        this.protections.set(`${key}:${b.rule_name}`, r);
+        return json(201, r);
+      }
+      const r = this.protections.get(`${key}:${m[3]}`);
+      if (!r) return json(404);
+      if (method === "PATCH") {
+        Object.assign(r, b);
+        fix(r);
+      }
+      return json(200, r);
     }
     if (method === "GET" && (m = path.match(/^\/users\/([^/]+)\/keys$/))) {
       const page = Number(url.searchParams.get("page") ?? 1);
@@ -741,46 +797,109 @@ Deno.test("ensureUserToken dry run plans and writes nothing", async () => {
 
 // --------------------------------------------------------- ensureCollaborator
 
-function withRepo(fj: FakeForgejo, owner: string, name: string) {
+function withRepo(
+  fj: FakeForgejo,
+  owner: string,
+  name: string,
+  extra: { archived?: boolean; mirror?: boolean } = {},
+) {
   fj.repos.set(`${owner}/${name}`, {
     id: fj.nextId++,
     private: true,
     has_actions: true,
     owner,
+    ...extra,
   });
 }
 
 const collabArgs = {
   owner: "dmc",
-  repo: "ai-infra",
+  repos: ["ai-infra", "swamp-extensions"],
+  exclude: [] as string[],
   collaborator: "r00k",
   permission: "write" as const,
 };
 
-Deno.test("ensureCollaborator adds a user to an admin-owned repo", async () => {
+Deno.test("ensureCollaborator adds a user to each listed admin-owned repo", async () => {
   const { fj, context, getWrittenResources } = setup();
   fj.addUser("r00k");
   withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
   await model.methods.ensureCollaborator.execute(
     { ...collabArgs, dryRun: false, _fetch: fj.fetcher },
     context,
   );
   assertEquals(
     fj.writes().map((c) => `${c.method} ${c.path}`),
-    ["PUT /repos/dmc/ai-infra/collaborators/r00k"],
+    [
+      "PUT /repos/dmc/ai-infra/collaborators/r00k",
+      "PUT /repos/dmc/swamp-extensions/collaborators/r00k",
+    ],
   );
-  assertEquals(fj.collaborators.get("dmc/ai-infra")!.get("r00k"), "write");
-  const w = getWrittenResources()[0];
-  assertEquals(w.name, "dmc--ai-infra--r00k-collaborator");
-  assertEquals(w.data.status, "applied");
-  assertEquals(w.data.previousPermission, null);
+  const w = getWrittenResources();
+  assertEquals(w.length, 1);
+  assertEquals(w[0].name, "dmc--r00k-collaborator");
+  assertEquals(w[0].data.status, "applied");
+  assertEquals(
+    (w[0].data.repos as { repo: string; state: string }[]).map((r) =>
+      `${r.repo}:${r.state}`
+    ),
+    ["ai-infra:applied", "swamp-extensions:applied"],
+  );
 });
 
-Deno.test("ensureCollaborator reports an equal permission unchanged", async () => {
+Deno.test("ensureCollaborator with all skips archived repos and mirrors", async () => {
   const { fj, context, getWrittenResources } = setup();
   fj.addUser("r00k");
   withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "old", { archived: true });
+  withRepo(fj, "dmc", "upstream", { mirror: true });
+  withRepo(fj, "dmc", "notes");
+  await model.methods.ensureCollaborator.execute(
+    {
+      ...collabArgs,
+      repos: "all",
+      exclude: ["notes"],
+      dryRun: false,
+      _fetch: fj.fetcher,
+    },
+    context,
+  );
+  assertEquals(
+    fj.writes().map((c) => c.path),
+    ["/repos/dmc/ai-infra/collaborators/r00k"],
+  );
+  assertEquals(getWrittenResources()[0].data.skipped, [
+    { repo: "old", reason: "archived" },
+    { repo: "upstream", reason: "mirror" },
+    { repo: "notes", reason: "excluded" },
+  ]);
+});
+
+Deno.test("ensureCollaborator with all blocks on a name it cannot use", async () => {
+  const { fj, context } = setup();
+  fj.addUser("r00k");
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "My.Repo");
+  await assertRejects(
+    () =>
+      model.methods.ensureCollaborator.execute(
+        { ...collabArgs, repos: "all", dryRun: false, _fetch: fj.fetcher },
+        context,
+      ),
+    Error,
+    "add it to exclude",
+  );
+  assertEquals(fj.writes(), []);
+});
+
+Deno.test("ensureCollaborator reports equal permissions unchanged", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k");
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
   fj.collaborators.set("dmc/ai-infra", new Map([["r00k", "write"]]));
+  fj.collaborators.set("dmc/swamp-extensions", new Map([["r00k", "write"]]));
   await model.methods.ensureCollaborator.execute(
     { ...collabArgs, dryRun: false, _fetch: fj.fetcher },
     context,
@@ -789,23 +908,30 @@ Deno.test("ensureCollaborator reports an equal permission unchanged", async () =
   assertEquals(getWrittenResources()[0].data.status, "unchanged");
 });
 
-Deno.test("ensureCollaborator changes another permission", async () => {
+Deno.test("ensureCollaborator changes only the repos that differ", async () => {
   const { fj, context, getWrittenResources } = setup();
   fj.addUser("r00k");
   withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
   fj.collaborators.set("dmc/ai-infra", new Map([["r00k", "read"]]));
+  fj.collaborators.set("dmc/swamp-extensions", new Map([["r00k", "write"]]));
   await model.methods.ensureCollaborator.execute(
     { ...collabArgs, dryRun: false, _fetch: fj.fetcher },
     context,
   );
-  assertEquals(fj.collaborators.get("dmc/ai-infra")!.get("r00k"), "write");
-  assertEquals(getWrittenResources()[0].data.previousPermission, "read");
+  assertEquals(fj.writes().map((c) => c.path), [
+    "/repos/dmc/ai-infra/collaborators/r00k",
+  ]);
+  const rows = getWrittenResources()[0].data.repos as Record<string, unknown>[];
+  assertEquals(rows[0].previousPermission, "read");
+  assertEquals(rows[1].state, "present");
 });
 
 Deno.test("ensureCollaborator dry run plans and writes nothing", async () => {
   const { fj, context, getWrittenResources } = setup();
   fj.addUser("r00k");
   withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
   await model.methods.ensureCollaborator.execute(
     { ...collabArgs, dryRun: true, _fetch: fj.fetcher },
     context,
@@ -814,9 +940,10 @@ Deno.test("ensureCollaborator dry run plans and writes nothing", async () => {
   assertEquals(getWrittenResources()[0].data.status, "planned");
 });
 
-Deno.test("ensureCollaborator refuses an admin collaborator and a missing repo", async () => {
+Deno.test("ensureCollaborator changes nothing when one listed repo is missing", async () => {
   const { fj, context, getWrittenResources } = setup();
-  fj.addUser("r00k", { is_admin: true });
+  fj.addUser("r00k");
+  withRepo(fj, "dmc", "ai-infra");
   await assertRejects(
     () =>
       model.methods.ensureCollaborator.execute(
@@ -827,9 +954,27 @@ Deno.test("ensureCollaborator refuses an admin collaborator and a missing repo",
     "blocked",
   );
   assertEquals(fj.writes(), []);
-  const b = String(getWrittenResources()[0].data.blockers);
-  assertStringIncludes(b, "site administrator");
-  assertStringIncludes(b, "repository dmc/ai-infra does not exist");
+  assertStringIncludes(
+    String(getWrittenResources()[0].data.blockers),
+    "repository dmc/swamp-extensions does not exist",
+  );
+});
+
+Deno.test("ensureCollaborator refuses an admin collaborator", async () => {
+  const { fj, context } = setup();
+  fj.addUser("r00k", { is_admin: true });
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
+  await assertRejects(
+    () =>
+      model.methods.ensureCollaborator.execute(
+        { ...collabArgs, dryRun: false, _fetch: fj.fetcher },
+        context,
+      ),
+    Error,
+    "site administrator",
+  );
+  assertEquals(fj.writes(), []);
 });
 
 // -------------------------------------------------------------- ensureUserKey
@@ -966,4 +1111,205 @@ Deno.test("ensureUserKey refuses an admin account", async () => {
     "blocked",
   );
   assertEquals(fj.writes(), []);
+});
+
+// ----------------------------------------------------- ensureBranchProtection
+
+const protArgs = {
+  owner: "dmc",
+  repos: ["ai-infra", "swamp-extensions"],
+  exclude: [] as string[],
+  rule: "main",
+  directPush: "denied" as const,
+  pushAllowlist: [] as string[],
+  mergeAllowlist: ["dmc"],
+  dismissStaleApprovals: true,
+};
+
+function existingRule(fj: FakeForgejo, repo: string, extra = {}) {
+  fj.protections.set(`dmc/${repo}:main`, {
+    rule_name: "main",
+    enable_push: false,
+    enable_push_whitelist: false,
+    push_whitelist_usernames: [],
+    enable_merge_whitelist: false,
+    merge_whitelist_usernames: [],
+    dismiss_stale_approvals: false,
+    status_check_contexts: ["test / test (pull_request)"],
+    ...extra,
+  });
+}
+
+Deno.test("ensureBranchProtection makes a missing rule and updates an existing one", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
+  existingRule(fj, "swamp-extensions");
+  await model.methods.ensureBranchProtection.execute(
+    { ...protArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  const writes = fj.writes();
+  assertEquals(writes.map((c) => `${c.method} ${c.path}`), [
+    "POST /repos/dmc/ai-infra/branch_protections",
+    "PATCH /repos/dmc/swamp-extensions/branch_protections/main",
+  ]);
+  assertEquals(writes[0].body, {
+    rule_name: "main",
+    enable_push: false,
+    enable_push_whitelist: false,
+    push_whitelist_usernames: [],
+    push_whitelist_deploy_keys: false,
+    enable_merge_whitelist: true,
+    merge_whitelist_usernames: ["dmc"],
+    dismiss_stale_approvals: true,
+  });
+  // Status checks are never sent, so Forgejo keeps them.
+  assertFalse("status_check_contexts" in (writes[1].body as object));
+  assertFalse("enable_status_check" in (writes[1].body as object));
+  assertEquals(
+    fj.protections.get("dmc/swamp-extensions:main")!.status_check_contexts,
+    ["test / test (pull_request)"],
+  );
+  const w = getWrittenResources();
+  assertEquals(w.length, 1);
+  assertEquals(w[0].name, "dmc--main-protection");
+  const rows = w[0].data.repos as Record<string, unknown>[];
+  assertEquals(rows[0].created, true);
+  assertEquals(rows[0].changes, ["createRule"]);
+  assertEquals(rows[1].created, false);
+  assertEquals(rows[1].changes, [
+    "mergeAllowlistOn",
+    "mergeAllowlist",
+    "dismissStaleApprovals",
+  ]);
+  assertEquals(rows[1].statusCheckContexts, ["test / test (pull_request)"]);
+});
+
+Deno.test("ensureBranchProtection with all covers every owned repo", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "runner-pool");
+  withRepo(fj, "dmc", "old", { archived: true });
+  await model.methods.ensureBranchProtection.execute(
+    { ...protArgs, repos: "all", dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.writes().map((c) => c.path), [
+    "/repos/dmc/ai-infra/branch_protections",
+    "/repos/dmc/runner-pool/branch_protections",
+  ]);
+  assertEquals(getWrittenResources()[0].data.skipped, [
+    { repo: "old", reason: "archived" },
+  ]);
+});
+
+Deno.test("ensureBranchProtection reports matching rules unchanged", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
+  const same = {
+    enable_merge_whitelist: true,
+    merge_whitelist_usernames: ["dmc"],
+    dismiss_stale_approvals: true,
+  };
+  existingRule(fj, "ai-infra", same);
+  existingRule(fj, "swamp-extensions", same);
+  await model.methods.ensureBranchProtection.execute(
+    { ...protArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.writes(), []);
+  assertEquals(getWrittenResources()[0].data.status, "unchanged");
+});
+
+Deno.test("ensureBranchProtection dry run plans and writes nothing", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
+  await model.methods.ensureBranchProtection.execute(
+    { ...protArgs, dryRun: true, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.writes(), []);
+  assertEquals(getWrittenResources()[0].data.status, "planned");
+});
+
+Deno.test("ensureBranchProtection changes no repo when an allowlist user lacks write on one", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
+  fj.addUser("r00k");
+  fj.collaborators.set("dmc/ai-infra", new Map([["r00k", "write"]]));
+  await assertRejects(
+    () =>
+      model.methods.ensureBranchProtection.execute(
+        {
+          ...protArgs,
+          mergeAllowlist: ["dmc", "r00k"],
+          dryRun: false,
+          _fetch: fj.fetcher,
+        },
+        context,
+      ),
+    Error,
+    "blocked",
+  );
+  assertEquals(fj.writes(), []);
+  assertStringIncludes(
+    String(getWrittenResources()[0].data.blockers),
+    "r00k has no write access to dmc/swamp-extensions",
+  );
+});
+
+Deno.test("ensureBranchProtection blocks a push allowlist that does not match directPush", async () => {
+  const { fj, context } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
+  await assertRejects(
+    () =>
+      model.methods.ensureBranchProtection.execute(
+        {
+          ...protArgs,
+          directPush: "allowlist",
+          dryRun: false,
+          _fetch: fj.fetcher,
+        },
+        context,
+      ),
+    Error,
+    "needs at least one user",
+  );
+  await assertRejects(
+    () =>
+      model.methods.ensureBranchProtection.execute(
+        {
+          ...protArgs,
+          pushAllowlist: ["dmc"],
+          dryRun: false,
+          _fetch: fj.fetcher,
+        },
+        context,
+      ),
+    Error,
+    "directPush is not allowlist",
+  );
+  assertEquals(fj.writes(), []);
+});
+
+Deno.test("ensureBranchProtection fails when Forgejo drops allowlist users", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  withRepo(fj, "dmc", "ai-infra");
+  withRepo(fj, "dmc", "swamp-extensions");
+  fj.dropMergeAllowlist = true;
+  await assertRejects(
+    () =>
+      model.methods.ensureBranchProtection.execute(
+        { ...protArgs, dryRun: false, _fetch: fj.fetcher },
+        context,
+      ),
+    Error,
+    "mergeAllowlist still differ",
+  );
+  assertEquals(getWrittenResources(), []);
 });
