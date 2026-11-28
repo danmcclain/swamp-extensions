@@ -10,11 +10,13 @@ token of a separate account, so it never holds the token of the main account.
 
 ## Methods
 
-| Method            | What it does                                                                                                                                                                                                                                                                                                                        |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ensureUser`      | Makes a local account with a generated password, or sets the limits of an existing account: `restricted`, `visibility`, `maxRepoCreation` and `allowCreateOrganization`. Never changes the password, email or admin flag of an existing account.                                                                                    |
-| `ensureRepo`      | Makes a repository for a user (as admin, with a README on `main`), sets it private or not, turns the Actions unit on or off, and adds collaborators with a permission. Never deletes a repository and never removes a collaborator.                                                                                                 |
-| `ensureUserToken` | Makes an access token for an account, with exact scopes and no admin scope. It checks the new token with `GET /user`: the token must belong to that account, and the account must not be an admin. If a check fails, or the vault cannot store the token, the method deletes the token. Never changes or deletes an existing token. |
+| Method               | What it does                                                                                                                                                                                                                                                                                                                        |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ensureUser`         | Makes a local account with a generated password, or sets the limits of an existing account: `restricted`, `visibility`, `maxRepoCreation` and `allowCreateOrganization`. Never changes the password, email or admin flag of an existing account.                                                                                    |
+| `ensureRepo`         | Makes a repository for a user (as admin, with a README on `main`), sets it private or not, turns the Actions unit on or off, and adds collaborators with a permission. Never deletes a repository and never removes a collaborator.                                                                                                 |
+| `ensureUserToken`    | Makes an access token for an account, with exact scopes and no admin scope. It checks the new token with `GET /user`: the token must belong to that account, and the account must not be an admin. If a check fails, or the vault cannot store the token, the method deletes the token. Never changes or deletes an existing token. |
+| `ensureCollaborator` | Adds a user to an existing repository as a collaborator with a permission, or changes its permission. The repository may belong to a site administrator; the collaborator must not be one. An equal permission is reported unchanged. Never removes a collaborator.                                                                 |
+| `ensureUserKey`      | Adds one SSH public key (ed25519 or ECDSA) to an account, for git over SSH and SSH commit signing. Refuses a private key, RSA and multi-line text. A key the account already has is reported unchanged. Data keeps the fingerprint and the `verified` flag, never the key. Never removes a key.                                     |
 
 All methods:
 
@@ -46,13 +48,15 @@ password from every error message.
 
 ## Data
 
-| Resource      | Data name                              | Content                                                                     |
-| ------------- | -------------------------------------- | --------------------------------------------------------------------------- |
-| `user`        | `{username}-user`                      | Plan, actions, blockers and check of `ensureUser`                           |
-| `password`    | `{username}-password`                  | The generated password (sensitive), only when `ensureUser` made the account |
-| `repo`        | `{owner}--{repo}-repo`                 | Plan, actions, blockers and check of `ensureRepo`                           |
-| `tokenAccess` | `{username}--{tokenName}-token-access` | Plan, token ID, scopes and check of `ensureUserToken`                       |
-| `token`       | `{username}--{tokenName}-token`        | The token (sensitive), only when `ensureUserToken` made it                  |
+| Resource       | Data name                                      | Content                                                                     |
+| -------------- | ---------------------------------------------- | --------------------------------------------------------------------------- |
+| `user`         | `{username}-user`                              | Plan, actions, blockers and check of `ensureUser`                           |
+| `password`     | `{username}-password`                          | The generated password (sensitive), only when `ensureUser` made the account |
+| `repo`         | `{owner}--{repo}-repo`                         | Plan, actions, blockers and check of `ensureRepo`                           |
+| `tokenAccess`  | `{username}--{tokenName}-token-access`         | Plan, token ID, scopes and check of `ensureUserToken`                       |
+| `token`        | `{username}--{tokenName}-token`                | The token (sensitive), only when `ensureUserToken` made it                  |
+| `collaborator` | `{owner}--{repo}--{collaborator}-collaborator` | Plan, permission before and after, and blockers of `ensureCollaborator`     |
+| `key`          | `{username}--{title}-key`                      | Plan, key type, key ID, fingerprint and `verified` of `ensureUserKey`       |
 
 Usernames, repository names and token names must be lowercase letters and digits
 in groups joined by single hyphens. So `--` in a data name separates the owner
@@ -78,6 +82,19 @@ A workflow usually runs the three methods in order: `ensureUser`, then
 `ensureRepo` (with the main account as a collaborator), then `ensureUserToken`
 with `scopes: ["write:user"]` (the scope that lets the account manage its own
 user-level Actions runners).
+
+## SSH commit signing
+
+Forgejo shows an SSH-signed commit as verified only when all of these hold
+(`models/asymkey/ssh_key_object_verification.go`):
+
+- the key belongs to the committer's account and is **verified**;
+- the commit's committer email is an activated email of that account.
+
+Only the account's own user can verify a key, in the web UI (Settings, SSH / GPG
+keys, Verify: sign the shown token with the key). There is no API for it
+(`routers/web/user/setting/keys.go`), so `ensureUserKey` reports `verified` but
+cannot set it.
 
 ## Facts from the Forgejo source
 

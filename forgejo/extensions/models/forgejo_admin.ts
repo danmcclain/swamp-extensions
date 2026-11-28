@@ -730,13 +730,329 @@ async function ensureUserToken(
   return { dataHandles: [recHandle, tokenHandle] };
 }
 
+// -------------------------------------------------------- ensureCollaborator
+
+const EnsureCollaboratorArgs = z.object({
+  owner: Username.describe(
+    "Owner of an existing repository (may be a site administrator)",
+  ),
+  repo: Slug.describe("Name of the existing repository"),
+  collaborator: Username.describe(
+    "The user to add; must not be a site administrator",
+  ),
+  permission: z.enum(["read", "write", "admin"]),
+  dryRun: DryRun,
+});
+type EnsureCollaboratorArgsT = z.infer<typeof EnsureCollaboratorArgs>;
+
+const CollaboratorRecord = z.object({
+  dryRun: z.boolean(),
+  status: Status,
+  owner: z.string(),
+  repo: z.string(),
+  collaborator: z.string(),
+  permission: z.string(),
+  previousPermission: z.string().nullable().describe(
+    "The collaborator's permission before the run; null when not a collaborator",
+  ),
+  blockers: z.array(z.string()),
+  checkedAt: z.string(),
+});
+
+/** A collaborator's permission on a repository; null when not a collaborator. */
+async function collaboratorPermission(
+  c: ForgejoClient,
+  owner: string,
+  repo: string,
+  user: string,
+): Promise<string | null> {
+  const base = `/repos/${seg(owner)}/${seg(repo)}/collaborators/${seg(user)}`;
+  const is = await c.call({ method: "GET", path: base });
+  if (is.status === 404) return null;
+  if (is.status !== 204) {
+    throw new Error(`GET ${base}: HTTP ${is.status}`);
+  }
+  const a = await c.expect({ method: "GET", path: `${base}/permission` }, [
+    200,
+  ]);
+  return z.object({ permission: z.string() }).parse(a.body).permission;
+}
+
+async function ensureCollaborator(
+  args: EnsureCollaboratorArgsT & TestHooks,
+  ctx: Ctx,
+): Promise<{ dataHandles: { name: string }[] }> {
+  const target = `${args.owner}/${args.repo}`;
+  log(ctx, "ensureCollaborator {target} {collaborator}: checking ({mode})", {
+    target,
+    collaborator: args.collaborator,
+    mode: args.dryRun ? "dry run" : "live",
+  });
+  const c = client(ctx, args);
+  const blockers = await callerBlockers(c);
+  const user = await getUser(c, args.collaborator);
+  if (!user) blockers.push(`user ${args.collaborator} does not exist`);
+  else blockers.push(...managedUserBlockers(user));
+  if (args.collaborator === args.owner) {
+    blockers.push(`${args.collaborator} is the owner of ${target}`);
+  }
+  const repo = await getRepo(c, args.owner, args.repo);
+  if (!repo) blockers.push(`repository ${target} does not exist`);
+  const before = repo && user
+    ? await collaboratorPermission(c, args.owner, args.repo, args.collaborator)
+    : null;
+
+  const dataName =
+    `${args.owner}--${args.repo}--${args.collaborator}-collaborator`;
+  const record = (status: z.infer<typeof Status>) => ({
+    dryRun: args.dryRun,
+    status,
+    owner: args.owner,
+    repo: args.repo,
+    collaborator: args.collaborator,
+    permission: args.permission,
+    previousPermission: before,
+    blockers,
+    checkedAt: new Date().toISOString(),
+  });
+
+  const same = before === args.permission;
+  if (blockers.length || args.dryRun || same) {
+    const status = blockers.length ? "blocked" : same ? "unchanged" : "planned";
+    const h = await ctx.writeResource("collaborator", dataName, record(status));
+    if (blockers.length) {
+      throw new Error(
+        `ensureCollaborator ${dataName} blocked: ${blockers.join("; ")}`,
+      );
+    }
+    log(ctx, "ensureCollaborator {target}: {status}", {
+      target: dataName,
+      status,
+    });
+    return { dataHandles: [h] };
+  }
+
+  await c.expect({
+    method: "PUT",
+    path: `/repos/${seg(args.owner)}/${seg(args.repo)}/collaborators/${
+      seg(args.collaborator)
+    }`,
+    body: { permission: args.permission },
+  }, [204]);
+  const after = await collaboratorPermission(
+    c,
+    args.owner,
+    args.repo,
+    args.collaborator,
+  );
+  if (after !== args.permission) {
+    throw new Error(
+      `${args.collaborator} on ${target} check failed: permission is ${
+        after ?? "none"
+      }, not ${args.permission}`,
+    );
+  }
+  const h = await ctx.writeResource(
+    "collaborator",
+    dataName,
+    record("applied"),
+  );
+  log(ctx, "ensureCollaborator {target}: applied", { target: dataName });
+  return { dataHandles: [h] };
+}
+
+// ------------------------------------------------------------- ensureUserKey
+
+/** Public SSH key types ensureUserKey accepts. */
+const SSH_KEY_TYPES = [
+  "ssh-ed25519",
+  "sk-ssh-ed25519@openssh.com",
+  "ecdsa-sha2-nistp256",
+  "ecdsa-sha2-nistp384",
+  "ecdsa-sha2-nistp521",
+  "sk-ecdsa-sha2-nistp256@openssh.com",
+] as const;
+
+/** One public key line: type, base64 body, optional comment. One line only. */
+const PUBLIC_KEY_RE = /^([a-z0-9@.-]+) ([A-Za-z0-9+/]+={0,3})(?: [^\r\n]*)?$/;
+
+const EnsureUserKeyArgs = z.object({
+  username: Username.describe(
+    "The account that gets the key; must not be a site administrator",
+  ),
+  title: Slug.describe("Key title in Forgejo"),
+  publicKey: z.string().max(2000).describe(
+    "One OpenSSH public key line (ssh-ed25519 or ECDSA; no RSA, never a private key)",
+  ),
+  dryRun: DryRun,
+});
+type EnsureUserKeyArgsT = z.infer<typeof EnsureUserKeyArgs>;
+
+const KeyRecord = z.object({
+  dryRun: z.boolean(),
+  status: Status,
+  username: z.string(),
+  title: z.string(),
+  keyType: z.string(),
+  keyId: z.number().nullable(),
+  fingerprint: z.string().nullable(),
+  verified: z.boolean().describe(
+    "Forgejo marks SSH-signed commits verified only for a verified key; a key is verified only in the web UI, by its user",
+  ),
+  blockers: z.array(z.string()),
+  checkedAt: z.string(),
+});
+
+const ApiKey = z.object({
+  id: z.number(),
+  key: z.string(),
+  title: z.string().optional().default(""),
+  fingerprint: z.string().optional().default(""),
+  verified: z.boolean().optional().default(false),
+});
+
+/** Parse one public key line; throws with the reason (never echoes the text). */
+export function parsePublicKey(text: string): { type: string; body: string } {
+  const line = text.trim();
+  if (/PRIVATE KEY/.test(line)) {
+    throw new Error("publicKey holds a private key; give the public key only");
+  }
+  const m = line.match(PUBLIC_KEY_RE);
+  if (!m) {
+    throw new Error(
+      "publicKey must be one OpenSSH public key line: <type> <base64> [comment]",
+    );
+  }
+  if (!(SSH_KEY_TYPES as readonly string[]).includes(m[1])) {
+    throw new Error(
+      `publicKey type ${m[1]} is not accepted; use ${SSH_KEY_TYPES.join(", ")}`,
+    );
+  }
+  return { type: m[1], body: m[2] };
+}
+
+async function listKeys(c: ForgejoClient, username: string) {
+  const all: z.infer<typeof ApiKey>[] = [];
+  const limit = 50;
+  for (let page = 1; page <= 20; page++) {
+    const a = await c.expect({
+      method: "GET",
+      path: `/users/${seg(username)}/keys?page=${page}&limit=${limit}`,
+    }, [200]);
+    const items = z.array(ApiKey).parse(a.body ?? []);
+    all.push(...items);
+    if (items.length < limit) return all;
+  }
+  throw new Error(`more than 1000 keys for ${username}`);
+}
+
+function sameKey(apiKey: string, body: string): boolean {
+  const parts = apiKey.trim().split(/\s+/);
+  return parts[1] === body;
+}
+
+async function ensureUserKey(
+  args: EnsureUserKeyArgsT & TestHooks,
+  ctx: Ctx,
+): Promise<{ dataHandles: { name: string }[] }> {
+  log(ctx, "ensureUserKey {target}: checking ({mode})", {
+    target: `${args.username}/${args.title}`,
+    mode: args.dryRun ? "dry run" : "live",
+  });
+  const parsed = parsePublicKey(args.publicKey);
+  const c = client(ctx, args);
+  const blockers = await callerBlockers(c);
+  const user = await getUser(c, args.username);
+  if (!user) blockers.push(`user ${args.username} does not exist`);
+  else blockers.push(...managedUserBlockers(user));
+  const keys = user && !user.is_admin ? await listKeys(c, args.username) : [];
+  const existing = keys.find((k) => sameKey(k.key, parsed.body));
+  const titled = keys.find((k) => k.title === args.title);
+  if (!existing && titled) {
+    blockers.push(
+      `${args.username} has another key titled ${args.title}; remove it or pick another title`,
+    );
+  }
+
+  const dataName = `${args.username}--${args.title}-key`;
+  const record = (
+    status: z.infer<typeof Status>,
+    k: z.infer<typeof ApiKey> | undefined,
+  ) => ({
+    dryRun: args.dryRun,
+    status,
+    username: args.username,
+    title: args.title,
+    keyType: parsed.type,
+    keyId: k?.id ?? null,
+    fingerprint: k?.fingerprint || null,
+    verified: k?.verified ?? false,
+    blockers,
+    checkedAt: new Date().toISOString(),
+  });
+
+  if (blockers.length || args.dryRun || existing) {
+    const status = blockers.length
+      ? "blocked"
+      : existing
+      ? "unchanged"
+      : "planned";
+    const h = await ctx.writeResource(
+      "key",
+      dataName,
+      record(status, existing),
+    );
+    if (blockers.length) {
+      throw new Error(
+        `ensureUserKey ${dataName} blocked: ${blockers.join("; ")}`,
+      );
+    }
+    log(ctx, "ensureUserKey {target}: {status} (verified {verified})", {
+      target: dataName,
+      status,
+      verified: existing?.verified ?? false,
+    });
+    return { dataHandles: [h] };
+  }
+
+  // Forgejo refuses a key that any user already has (a key is unique on the
+  // server), so this cannot take over another account's key.
+  await c.expect({
+    method: "POST",
+    path: `/admin/users/${seg(args.username)}/keys`,
+    body: {
+      title: args.title,
+      key: `${parsed.type} ${parsed.body}`,
+      read_only: false,
+    },
+  }, [201]);
+  const after = (await listKeys(c, args.username)).find((k) =>
+    sameKey(k.key, parsed.body)
+  );
+  if (!after) throw new Error(`${dataName} is missing after the create`);
+  const h = await ctx.writeResource("key", dataName, record("applied", after));
+  log(ctx, "ensureUserKey {target}: applied (verified {verified})", {
+    target: dataName,
+    verified: after.verified,
+  });
+  return { dataHandles: [h] };
+}
+
 // --------------------------------------------------------------------- model
 
 /** The `@dmc/forgejo/admin` model. */
 export const model = {
   type: "@dmc/forgejo/admin",
-  version: "2026.11.27.1",
+  version: "2026.11.28.1",
   globalArguments: ForgejoConnectionArgs,
+  upgrades: [
+    {
+      toVersion: "2026.11.28.1",
+      description:
+        "Additive: new methods ensureCollaborator (add a non-admin user to an existing repository, also one an admin owns) and ensureUserKey (add an SSH public key to a non-admin account), with the collaborator and key resources. No argument changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     user: {
       description: "Plan, actions and check of an ensureUser run",
@@ -768,6 +1084,18 @@ export const model = {
       schema: UserToken,
       lifetime: "infinite",
       garbageCollection: 5,
+    },
+    collaborator: {
+      description: "Plan and check of an ensureCollaborator run",
+      schema: CollaboratorRecord,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    key: {
+      description: "Plan and check of an ensureUserKey run (no key material)",
+      schema: KeyRecord,
+      lifetime: "infinite",
+      garbageCollection: 20,
     },
   },
   checks: {
@@ -826,6 +1154,25 @@ export const model = {
       arguments: EnsureUserTokenArgs,
       execute: (args: EnsureUserTokenArgsT & TestHooks, context: Ctx) =>
         ensureUserToken(args, context),
+    },
+    ensureCollaborator: {
+      description:
+        "Add a user to an existing repository as a collaborator with a permission, or change its permission. The repository may belong to a site administrator; the collaborator must not be one. An equal permission is reported unchanged. Never removes a collaborator. " +
+        "Dry run by default; a blocker fails the run. " +
+        "Needs: a site-administrator token with write:repository and read:user.",
+      arguments: EnsureCollaboratorArgs,
+      execute: (args: EnsureCollaboratorArgsT & TestHooks, context: Ctx) =>
+        ensureCollaborator(args, context),
+    },
+    ensureUserKey: {
+      description:
+        "Add one SSH public key (ed25519 or ECDSA) to a non-admin account, for git over SSH and SSH commit signing. Refuses a private key, RSA and multi-line text. A key the account already has is reported unchanged; another key with the same title blocks. Data keeps the fingerprint and the verified flag, never the key. " +
+        "Forgejo shows SSH-signed commits as verified only for a verified key, and only the account's own user can verify a key, in the web UI (Settings, SSH keys, Verify). " +
+        "Dry run by default; a blocker fails the run. Never removes a key. " +
+        "Needs: a site-administrator token with write:admin and read:user.",
+      arguments: EnsureUserKeyArgs,
+      execute: (args: EnsureUserKeyArgsT & TestHooks, context: Ctx) =>
+        ensureUserKey(args, context),
     },
   },
 };

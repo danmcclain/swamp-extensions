@@ -52,6 +52,16 @@ class FakeForgejo {
     { id: number; private: boolean; has_actions: boolean; owner: string }
   >();
   collaborators = new Map<string, Map<string, string>>();
+  keys = new Map<
+    string,
+    {
+      id: number;
+      key: string;
+      title: string;
+      fingerprint: string;
+      verified: boolean;
+    }[]
+  >();
   calls: Call[] = [];
   nextId = 100;
   /** Fault switches for tests. */
@@ -190,6 +200,38 @@ class FakeForgejo {
         r.has_actions = b.has_actions;
       }
       return json(200, { ...r, owner: { login: r.owner } });
+    }
+    if (
+      method === "GET" &&
+      (m = path.match(
+        /^\/repos\/([^/]+)\/([^/]+)\/collaborators\/([^/]+)\/permission$/,
+      ))
+    ) {
+      const p = this.collaborators.get(`${m[1]}/${m[2]}`)?.get(m[3]);
+      return json(200, { permission: p ?? "none" });
+    }
+    if (method === "GET" && (m = path.match(/^\/users\/([^/]+)\/keys$/))) {
+      const page = Number(url.searchParams.get("page") ?? 1);
+      return json(200, page === 1 ? this.keys.get(m[1]) ?? [] : []);
+    }
+    if (
+      method === "POST" && (m = path.match(/^\/admin\/users\/([^/]+)\/keys$/))
+    ) {
+      const b = body as { title: string; key: string };
+      const all = [...this.keys.values()].flat();
+      if (all.some((k) => k.key.split(" ")[1] === b.key.split(" ")[1])) {
+        return json(422, { message: "key already exists" });
+      }
+      const list = this.keys.get(m[1]) ?? [];
+      list.push({
+        id: this.nextId++,
+        key: b.key,
+        title: b.title,
+        fingerprint: "SHA256:fake" + list.length,
+        verified: false,
+      });
+      this.keys.set(m[1], list);
+      return json(201, list.at(-1));
     }
     if (
       (m = path.match(/^\/repos\/([^/]+)\/([^/]+)\/collaborators\/([^/]+)$/))
@@ -695,4 +737,233 @@ Deno.test("ensureUserToken dry run plans and writes nothing", async () => {
   );
   assertEquals(fj.writes(), []);
   assertEquals(getWrittenResources()[0].data.status, "planned");
+});
+
+// --------------------------------------------------------- ensureCollaborator
+
+function withRepo(fj: FakeForgejo, owner: string, name: string) {
+  fj.repos.set(`${owner}/${name}`, {
+    id: fj.nextId++,
+    private: true,
+    has_actions: true,
+    owner,
+  });
+}
+
+const collabArgs = {
+  owner: "dmc",
+  repo: "ai-infra",
+  collaborator: "r00k",
+  permission: "write" as const,
+};
+
+Deno.test("ensureCollaborator adds a user to an admin-owned repo", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k");
+  withRepo(fj, "dmc", "ai-infra");
+  await model.methods.ensureCollaborator.execute(
+    { ...collabArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(
+    fj.writes().map((c) => `${c.method} ${c.path}`),
+    ["PUT /repos/dmc/ai-infra/collaborators/r00k"],
+  );
+  assertEquals(fj.collaborators.get("dmc/ai-infra")!.get("r00k"), "write");
+  const w = getWrittenResources()[0];
+  assertEquals(w.name, "dmc--ai-infra--r00k-collaborator");
+  assertEquals(w.data.status, "applied");
+  assertEquals(w.data.previousPermission, null);
+});
+
+Deno.test("ensureCollaborator reports an equal permission unchanged", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k");
+  withRepo(fj, "dmc", "ai-infra");
+  fj.collaborators.set("dmc/ai-infra", new Map([["r00k", "write"]]));
+  await model.methods.ensureCollaborator.execute(
+    { ...collabArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.writes(), []);
+  assertEquals(getWrittenResources()[0].data.status, "unchanged");
+});
+
+Deno.test("ensureCollaborator changes another permission", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k");
+  withRepo(fj, "dmc", "ai-infra");
+  fj.collaborators.set("dmc/ai-infra", new Map([["r00k", "read"]]));
+  await model.methods.ensureCollaborator.execute(
+    { ...collabArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.collaborators.get("dmc/ai-infra")!.get("r00k"), "write");
+  assertEquals(getWrittenResources()[0].data.previousPermission, "read");
+});
+
+Deno.test("ensureCollaborator dry run plans and writes nothing", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k");
+  withRepo(fj, "dmc", "ai-infra");
+  await model.methods.ensureCollaborator.execute(
+    { ...collabArgs, dryRun: true, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.writes(), []);
+  assertEquals(getWrittenResources()[0].data.status, "planned");
+});
+
+Deno.test("ensureCollaborator refuses an admin collaborator and a missing repo", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k", { is_admin: true });
+  await assertRejects(
+    () =>
+      model.methods.ensureCollaborator.execute(
+        { ...collabArgs, dryRun: false, _fetch: fj.fetcher },
+        context,
+      ),
+    Error,
+    "blocked",
+  );
+  assertEquals(fj.writes(), []);
+  const b = String(getWrittenResources()[0].data.blockers);
+  assertStringIncludes(b, "site administrator");
+  assertStringIncludes(b, "repository dmc/ai-infra does not exist");
+});
+
+// -------------------------------------------------------------- ensureUserKey
+
+const PUB =
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyBodyOnly0123456789abcdefABCDEF";
+
+const keyArgs = {
+  username: "r00k",
+  title: "commit-signing",
+  publicKey: `${PUB} r00k@example.com`,
+};
+
+Deno.test("ensureUserKey adds the public key and keeps no key in data", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k");
+  await model.methods.ensureUserKey.execute(
+    { ...keyArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  const post = fj.writes().find((c) => c.method === "POST")!;
+  assertEquals(post.path, "/admin/users/r00k/keys");
+  assertEquals((post.body as { key: string }).key, PUB);
+  assertEquals((post.body as { read_only: boolean }).read_only, false);
+  const w = getWrittenResources()[0];
+  assertEquals(w.name, "r00k--commit-signing-key");
+  assertEquals(w.data.status, "applied");
+  assertEquals(w.data.keyType, "ssh-ed25519");
+  assertEquals(w.data.verified, false);
+  assertFalse(JSON.stringify(w.data).includes("ExampleKeyBody"));
+});
+
+Deno.test("ensureUserKey reports a key the account has unchanged", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k");
+  fj.keys.set("r00k", [{
+    id: 9,
+    key: `${PUB} other comment`,
+    title: "old-title",
+    fingerprint: "SHA256:x",
+    verified: true,
+  }]);
+  await model.methods.ensureUserKey.execute(
+    { ...keyArgs, dryRun: false, _fetch: fj.fetcher },
+    context,
+  );
+  assertEquals(fj.writes(), []);
+  const d = getWrittenResources()[0].data;
+  assertEquals(d.status, "unchanged");
+  assertEquals(d.verified, true);
+  assertEquals(d.keyId, 9);
+});
+
+Deno.test("ensureUserKey blocks on another key with the same title", async () => {
+  const { fj, context } = setup();
+  fj.addUser("r00k");
+  fj.keys.set("r00k", [{
+    id: 9,
+    key: "ssh-ed25519 AAAAOtherBody",
+    title: "commit-signing",
+    fingerprint: "SHA256:y",
+    verified: false,
+  }]);
+  await assertRejects(
+    () =>
+      model.methods.ensureUserKey.execute(
+        { ...keyArgs, dryRun: false, _fetch: fj.fetcher },
+        context,
+      ),
+    Error,
+    "another key titled",
+  );
+  assertEquals(fj.writes(), []);
+});
+
+Deno.test("ensureUserKey fails when another account has the key", async () => {
+  const { fj, context, getWrittenResources } = setup();
+  fj.addUser("r00k");
+  fj.keys.set("dmc", [{
+    id: 3,
+    key: PUB,
+    title: "laptop",
+    fingerprint: "SHA256:z",
+    verified: true,
+  }]);
+  await assertRejects(
+    () =>
+      model.methods.ensureUserKey.execute(
+        { ...keyArgs, dryRun: false, _fetch: fj.fetcher },
+        context,
+      ),
+    Error,
+    "HTTP 422",
+  );
+  assertEquals(getWrittenResources(), []);
+});
+
+Deno.test("ensureUserKey refuses private keys, RSA and bad text without echoing it", async () => {
+  const { fj, context } = setup();
+  fj.addUser("r00k");
+  const cases: [string, string][] = [
+    [
+      "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----",
+      "private key",
+    ],
+    ["ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB", "not accepted"],
+    [`${PUB}\n${PUB}`, "one OpenSSH public key line"],
+    ["hello", "one OpenSSH public key line"],
+  ];
+  for (const [publicKey, msg] of cases) {
+    const err = await assertRejects(
+      () =>
+        model.methods.ensureUserKey.execute(
+          { ...keyArgs, publicKey, dryRun: false, _fetch: fj.fetcher },
+          context,
+        ),
+      Error,
+      msg,
+    );
+    assertFalse(err.message.includes("b3BlbnNzaC1rZXk"));
+  }
+  assertEquals(fj.calls, []);
+});
+
+Deno.test("ensureUserKey refuses an admin account", async () => {
+  const { fj, context } = setup();
+  await assertRejects(
+    () =>
+      model.methods.ensureUserKey.execute(
+        { ...keyArgs, username: "dmc", dryRun: false, _fetch: fj.fetcher },
+        context,
+      ),
+    Error,
+    "blocked",
+  );
+  assertEquals(fj.writes(), []);
 });
