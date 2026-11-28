@@ -42,6 +42,10 @@ jobs:
         working-directory: fastmail
         run: deno test -A
 
+      - name: forgejo
+        working-directory: forgejo
+        run: deno test -A
+
       - name: patch
         working-directory: patch
         run: deno test -A
